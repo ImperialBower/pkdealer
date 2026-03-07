@@ -4,5 +4,14 @@ version = "0.1.0"
 edition = "2024"
 authors = ["electronicpanopticon <gaoler@electronicpanopticon.com>"]
 license = "GPL-3.0-or-later"
+description = "gRPC service for poker dealer functionality"
+repository = "https://github.com/ImperialBower/pkgrpc"
+keywords = ["poker", "grpc", "dealer", "service"]
+categories = ["games"]
+rust-version = "1.85.0"
+
+[[bin]]
+name = "pkdealer_service"
+path = "src/main.rs"
 
 [dependencies]
