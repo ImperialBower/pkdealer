@@ -50,10 +50,6 @@ test-verbose:
 	@echo "Running workspace tests (verbose)..."
 	cargo test --workspace --all-features -- --nocapture
 
-# Run doc tests
-test-doc:
-	@echo "Running doc tests..."
-	cargo test --workspace --all-features --doc
 
 # Test individual crates
 test-service:
@@ -133,7 +129,7 @@ unused-deps:
 ci-quick: fmt-check check test
 
 # Run full CI checks locally
-ci-local: fmt-check clippy-pedantic test test-doc doc
+ci-local: fmt-check clippy-pedantic test doc
 	@echo ""
 	@echo "✓ All CI checks passed!"
 	@echo ""

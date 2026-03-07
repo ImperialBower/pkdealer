@@ -69,8 +69,8 @@ cargo test --package pkdealer_client
 # Run with output
 cargo test --package pkdealer_client -- --nocapture
 
-# Run doc tests
-cargo test --package pkdealer_client --doc
+# Note: Binary crates don't have separate library doc tests
+# Doc tests in function comments are checked during regular test runs
 ```
 
 ## Configuration

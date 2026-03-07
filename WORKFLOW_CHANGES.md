@@ -115,8 +115,7 @@ cargo test --workspace && cargo clippy --workspace
 # Full CI emulation
 cargo fmt --all -- --check && \
 cargo clippy --workspace --all-features --all-targets -- -Dclippy::all -Dclippy::pedantic && \
-cargo test --workspace --all-features && \
-cargo test --workspace --all-features --doc
+cargo test --workspace --all-features
 ```
 
 ## Adding New Crates

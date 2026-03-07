@@ -65,8 +65,9 @@ cargo test --workspace
 # Test with output
 cargo test --workspace -- --nocapture
 
-# Run doc tests
-cargo test --workspace --doc
+# Test specific crate
+cargo test -p pkdealer_service
+cargo test -p pkdealer_client
 
 # Using Makefile
 make test

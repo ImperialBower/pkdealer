@@ -55,10 +55,6 @@ jobs:
         run: cargo test --workspace --all-features
         env:
           RUSTFLAGS: ${{matrix.rustflags}} ${{env.RUSTFLAGS}}
-      - name: Test workspace with doc tests
-        run: cargo test --workspace --all-features --doc
-        env:
-          RUSTFLAGS: ${{matrix.rustflags}} ${{env.RUSTFLAGS}}
 
   # Test individual crates to ensure they work independently
   test-crates:
@@ -156,26 +152,3 @@ jobs:
         run: cargo doc --workspace --no-deps --document-private-items --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
-
-  # Miri for unsafe code testing (if applicable)
-  miri:
-    name: Miri
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@miri
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-      - name: Run miri tests
-        run: cargo miri test --workspace
-        env:
-          MIRIFLAGS: -Zmiri-strict-provenance

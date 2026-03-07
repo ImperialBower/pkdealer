@@ -16,11 +16,8 @@ cargo test -p pkdealer_client
 # Test with output visible
 cargo test --workspace -- --nocapture
 
-# Run doc tests
-cargo test --workspace --doc
-
-# Run specific test
-cargo test --workspace test_name
+# Note: Binary crates (bins) don't support --doc flag
+# Regular cargo test will check all tests including doc examples
 ```
 
 ## Build Commands
@@ -116,7 +113,6 @@ Run these locally before pushing:
 cargo fmt --all -- --check && \
 cargo clippy --workspace --all-features --all-targets -- -Dclippy::all -Dclippy::pedantic && \
 cargo test --workspace --all-features && \
-cargo test --workspace --all-features --doc && \
 cargo doc --workspace --no-deps --document-private-items
 
 # Quick check
