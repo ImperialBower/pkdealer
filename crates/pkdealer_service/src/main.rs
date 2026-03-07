@@ -30,7 +30,7 @@ use std::process;
 fn main() {
     // Initialize the service
     if let Err(e) = run() {
-        eprintln!("Application error: {}", e);
+        eprintln!("Application error: {e}");
         process::exit(1);
     }
 }
@@ -52,6 +52,7 @@ fn main() {
 /// # Ok(())
 /// # }
 /// ```
+#[allow(clippy::unnecessary_wraps)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Poker Dealer Service v{}", env!("CARGO_PKG_VERSION"));
     println!("Starting gRPC server...");

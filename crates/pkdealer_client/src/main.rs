@@ -32,7 +32,7 @@ use std::process;
 fn main() {
     // Initialize and run the client
     if let Err(e) = run() {
-        eprintln!("Application error: {}", e);
+        eprintln!("Application error: {e}");
         process::exit(1);
     }
 }
@@ -56,6 +56,7 @@ fn main() {
 /// # Ok(())
 /// # }
 /// ```
+#[allow(clippy::unnecessary_wraps)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Poker Dealer Client v{}", env!("CARGO_PKG_VERSION"));
     println!("Connecting to service...");
