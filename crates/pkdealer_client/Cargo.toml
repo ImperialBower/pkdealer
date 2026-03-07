@@ -2,5 +2,7 @@
 name = "pkdealer_client"
 version = "0.1.0"
 edition = "2024"
+authors = ["electronicpanopticon <gaoler@electronicpanopticon.com>"]
+license = "GPL-3.0-or-later"
 
 [dependencies]
