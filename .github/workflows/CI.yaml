@@ -2,22 +2,26 @@ name: CI
 
 on:
   push:
+    branches: [main, master, develop]
   pull_request:
+    branches: [main, master, develop]
 
 permissions:
   contents: read
 
 env:
   RUSTFLAGS: -Dwarnings
+  CARGO_TERM_COLOR: always
 
 jobs:
+  # Workspace-wide tests across multiple Rust versions
   test:
-    name: Rust ${{matrix.rust}}
+    name: Test (Rust ${{matrix.rust}})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        rust: [beta, stable, 1.85.0]
+        rust: [stable, beta, 1.85.0]
         include:
           - rust: nightly
             rustflags: --cfg thiserror_nightly_testing
@@ -28,50 +32,132 @@ jobs:
         with:
           toolchain: ${{matrix.rust}}
           components: rust-src
-      - run: cargo test --all
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build workspace
+        run: cargo build --workspace --all-features --all-targets
+        env:
+          RUSTFLAGS: ${{matrix.rustflags}} ${{env.RUSTFLAGS}}
+      - name: Test workspace
+        run: cargo test --workspace --all-features
+        env:
+          RUSTFLAGS: ${{matrix.rustflags}} ${{env.RUSTFLAGS}}
+      - name: Test workspace with doc tests
+        run: cargo test --workspace --all-features --doc
         env:
           RUSTFLAGS: ${{matrix.rustflags}} ${{env.RUSTFLAGS}}
 
+  # Test individual crates to ensure they work independently
+  test-crates:
+    name: Test ${{matrix.crate}} (Rust stable)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - pkdealer_service
+          - pkdealer_client
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-src
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-crate-${{ matrix.crate }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build crate
+        run: cargo build --package ${{matrix.crate}} --all-features
+      - name: Test crate
+        run: cargo test --package ${{matrix.crate}} --all-features
+
+  # Clippy linting for the entire workspace
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           components: clippy, rust-src
-      - run: cargo clippy -- -Dclippy::all -Dclippy::pedantic
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run clippy on workspace
+        run: cargo clippy --workspace --all-features --all-targets -- -Dclippy::all -Dclippy::pedantic
 
+  # Format check for all code
   fmt:
-    name: Fmt
+    name: Format
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           components: rustfmt, rust-src
-      - run: cargo fmt --all -- --check
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
+  # Documentation generation for all crates
   doc:
-    name: Doc
+    name: Documentation
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           components: rust-docs, rust-src
-      - run: cargo doc --no-deps --document-private-items
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+      - name: Generate documentation
+        run: cargo doc --workspace --no-deps --document-private-items --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  # Miri for unsafe code testing (if applicable)
   miri:
     name: Miri
     runs-on: ubuntu-latest
@@ -79,6 +165,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@miri
-      - run: cargo miri test
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run miri tests
+        run: cargo miri test --workspace
         env:
           MIRIFLAGS: -Zmiri-strict-provenance

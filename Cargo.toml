@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/pkdealer_service",
+    "crates/pkdealer_client",
+]
+resolver = "2"
