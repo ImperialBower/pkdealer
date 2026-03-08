@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 pkdealer_proto = { version = "0.1.0", path = "../pkdealer_proto" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
 
 [dev-dependencies]
-tokio-stream = { version = "0.1", features = ["net"] }

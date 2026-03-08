@@ -48,7 +48,13 @@ mod tests {
     use super::*;
 
     use pkdealer_proto::dealer::{
-        PingReply, PingRequest,
+        ActRequest, ActResponse, AdvanceStreetRequest, AdvanceStreetResponse, EndHandRequest,
+        EndHandResponse, GetBoardRequest, GetBoardResponse, GetChipsRequest, GetChipsResponse,
+        GetEventLogRequest, GetEventLogResponse, GetNextToActRequest, GetNextToActResponse,
+        GetPotRequest, GetPotResponse, GetStatusRequest, GetStatusResponse, PingReply, PingRequest,
+        RemovePlayerRequest, RemovePlayerResponse, SeatPlayerAtRequest, SeatPlayerAtResponse,
+        SeatPlayerRequest, SeatPlayerResponse, StartHandRequest, StartHandResponse,
+        StreamEventsRequest, TableEvent,
         dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
     };
     use tokio::net::TcpListener;
@@ -65,6 +71,107 @@ mod tests {
             Ok(Response::new(PingReply {
                 message: format!("pong:{client_id}"),
             }))
+        }
+
+        async fn seat_player(
+            &self,
+            _request: Request<SeatPlayerRequest>,
+        ) -> Result<Response<SeatPlayerResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn seat_player_at(
+            &self,
+            _request: Request<SeatPlayerAtRequest>,
+        ) -> Result<Response<SeatPlayerAtResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn remove_player(
+            &self,
+            _request: Request<RemovePlayerRequest>,
+        ) -> Result<Response<RemovePlayerResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn start_hand(
+            &self,
+            _request: Request<StartHandRequest>,
+        ) -> Result<Response<StartHandResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn advance_street(
+            &self,
+            _request: Request<AdvanceStreetRequest>,
+        ) -> Result<Response<AdvanceStreetResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn end_hand(
+            &self,
+            _request: Request<EndHandRequest>,
+        ) -> Result<Response<EndHandResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn act(
+            &self,
+            _request: Request<ActRequest>,
+        ) -> Result<Response<ActResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_status(
+            &self,
+            _request: Request<GetStatusRequest>,
+        ) -> Result<Response<GetStatusResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_next_to_act(
+            &self,
+            _request: Request<GetNextToActRequest>,
+        ) -> Result<Response<GetNextToActResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_board(
+            &self,
+            _request: Request<GetBoardRequest>,
+        ) -> Result<Response<GetBoardResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_chips(
+            &self,
+            _request: Request<GetChipsRequest>,
+        ) -> Result<Response<GetChipsResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_pot(
+            &self,
+            _request: Request<GetPotRequest>,
+        ) -> Result<Response<GetPotResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_event_log(
+            &self,
+            _request: Request<GetEventLogRequest>,
+        ) -> Result<Response<GetEventLogResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        type StreamEventsStream =
+            tokio_stream::wrappers::ReceiverStream<Result<TableEvent, Status>>;
+
+        async fn stream_events(
+            &self,
+            _request: Request<StreamEventsRequest>,
+        ) -> Result<Response<Self::StreamEventsStream>, Status> {
+            Err(Status::unimplemented("not used in tests"))
         }
     }
 
