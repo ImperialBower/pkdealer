@@ -138,7 +138,7 @@ ci-local: fmt-check clippy-pedantic test doc
 	@echo ""
 
 # Run everything
-ayce: build test clippy doc
+ayce: fmt build test clippy doc
 
 # Install required tools
 install-tools:
