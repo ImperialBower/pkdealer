@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, beta, 1.85.0]
+        rust: [stable, beta, 1.94.0]
         include:
           - rust: nightly
             rustflags: --cfg thiserror_nightly_testing
@@ -113,7 +113,7 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
       - name: Run clippy on workspace
-        run: cargo clippy --workspace 
+        run: cargo clippy --workspace
 
   # Format check for all code
   fmt:

@@ -8,7 +8,7 @@ description = "gRPC service for poker dealer functionality"
 repository = "https://github.com/ImperialBower/pkgrpc"
 keywords = ["poker", "grpc", "dealer", "service"]
 categories = ["games"]
-rust-version = "1.85.0"
+rust-version = "1.94.0"
 
 [[bin]]
 name = "pkdealer_service"
