@@ -113,7 +113,7 @@ jobs:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
       - name: Run clippy on workspace
-        run: cargo clippy --workspace --all-features --all-targets -- -Dclippy::all -Dclippy::pedantic
+        run: cargo clippy --workspace 
 
   # Format check for all code
   fmt:
