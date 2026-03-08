@@ -33,7 +33,7 @@ allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "MIT AND Unicode-3.0",
+    "MIT WITH Unicode-3.0",
     "MIT AND BSD-3-Clause",
 ]
 
