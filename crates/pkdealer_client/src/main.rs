@@ -21,8 +21,10 @@ async fn main() {
 }
 
 async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    let endpoint = std::env::var("PKDEALER_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned());
-    let client_id = std::env::var("PKDEALER_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_owned());
+    let endpoint =
+        std::env::var("PKDEALER_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned());
+    let client_id =
+        std::env::var("PKDEALER_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_owned());
 
     println!("Poker Dealer Client v{}", env!("CARGO_PKG_VERSION"));
     println!("Connecting to service at {endpoint}...");

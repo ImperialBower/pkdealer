@@ -52,4 +52,3 @@ mod tests {
         assert!(request.client_id.is_empty());
     }
 }
-

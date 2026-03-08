@@ -106,7 +106,8 @@ async fn wait_for_service_ready(endpoint: &str, timeout: Duration) -> bool {
 }
 
 #[tokio::test]
-async fn service_binary_and_client_binary_ping_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+async fn service_binary_and_client_binary_ping_round_trip() -> Result<(), Box<dyn std::error::Error>>
+{
     let service_path = service_bin_path()?;
     let client_path = client_bin_path(&service_path)?;
     ensure_client_binary(&client_path)?;
@@ -144,8 +145,8 @@ async fn service_binary_and_client_binary_ping_round_trip() -> Result<(), Box<dy
 }
 
 #[tokio::test]
-async fn service_binary_and_client_binary_ping_round_trip_empty_client_id(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn service_binary_and_client_binary_ping_round_trip_empty_client_id()
+-> Result<(), Box<dyn std::error::Error>> {
     let service_path = service_bin_path()?;
     let client_path = client_bin_path(&service_path)?;
     ensure_client_binary(&client_path)?;
