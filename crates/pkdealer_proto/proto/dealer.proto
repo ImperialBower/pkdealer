@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package pkdealer.v1;
+package pkdealer.dealer.v1;
 
-service Dealer {
+service DealerService {
   rpc Ping(PingRequest) returns (PingReply);
 }
 

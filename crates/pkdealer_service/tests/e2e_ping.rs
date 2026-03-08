@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pkdealer_proto::{dealer::dealer_client::DealerClient, new_ping_request};
+use pkdealer_proto::{dealer::dealer_service_client::DealerServiceClient, new_ping_request};
 
 struct ChildProcessGuard {
     child: Child,
@@ -83,7 +83,7 @@ async fn wait_for_service_ready(endpoint: &str, timeout: Duration) -> bool {
     let start = Instant::now();
 
     loop {
-        let mut client = match DealerClient::connect(endpoint.to_owned()).await {
+        let mut client = match DealerServiceClient::connect(endpoint.to_owned()).await {
             Ok(client) => client,
             Err(_) if start.elapsed() < timeout => {
                 tokio::time::sleep(Duration::from_millis(100)).await;

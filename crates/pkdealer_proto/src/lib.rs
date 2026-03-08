@@ -4,11 +4,11 @@
 //! the same generated Rust messages and gRPC service/client stubs.
 
 /// The protobuf package name used by generated gRPC types.
-pub const DEALER_PROTO_PACKAGE: &str = "pkdealer.v1";
+pub const DEALER_PROTO_PACKAGE: &str = "pkdealer.dealer.v1";
 
 /// Generated protobuf messages and gRPC definitions for the dealer API.
 pub mod dealer {
-    tonic::include_proto!("pkdealer.v1");
+    tonic::include_proto!("pkdealer.dealer.v1");
 }
 
 /// Creates a basic ping request used for connectivity checks.
@@ -28,7 +28,7 @@ pub mod dealer {
 ///
 /// let request = new_ping_request("client-1");
 /// assert_eq!(request.client_id, "client-1");
-/// assert_eq!(DEALER_PROTO_PACKAGE, "pkdealer.v1");
+/// assert_eq!(DEALER_PROTO_PACKAGE, "pkdealer.dealer.v1");
 /// ```
 pub fn new_ping_request(client_id: impl Into<String>) -> dealer::PingRequest {
     dealer::PingRequest {

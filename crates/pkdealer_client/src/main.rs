@@ -6,7 +6,7 @@
 
 use std::process;
 
-use pkdealer_proto::{dealer::dealer_client::DealerClient, new_ping_request};
+use pkdealer_proto::{dealer::dealer_service_client::DealerServiceClient, new_ping_request};
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
 const DEFAULT_CLIENT_ID: &str = "pkdealer-client";
@@ -36,7 +36,7 @@ async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn ping(endpoint: &str, client_id: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mut client = DealerClient::connect(endpoint.to_owned()).await?;
+    let mut client = DealerServiceClient::connect(endpoint.to_owned()).await?;
     let request = tonic::Request::new(new_ping_request(client_id));
     let response = client.ping(request).await?;
 
@@ -49,7 +49,7 @@ mod tests {
 
     use pkdealer_proto::dealer::{
         PingReply, PingRequest,
-        dealer_server::{Dealer, DealerServer},
+        dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
     };
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -59,7 +59,7 @@ mod tests {
     struct TestDealerService;
 
     #[tonic::async_trait]
-    impl Dealer for TestDealerService {
+    impl DealerServiceTrait for TestDealerService {
         async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
             let client_id = request.into_inner().client_id;
             Ok(Response::new(PingReply {
@@ -76,7 +76,7 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             Server::builder()
-                .add_service(DealerServer::new(TestDealerService))
+                .add_service(DealerServiceServer::new(TestDealerService))
                 .serve_with_incoming(incoming)
                 .await
         });

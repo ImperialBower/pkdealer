@@ -8,7 +8,7 @@ use std::{env, net::SocketAddr, process};
 
 use pkdealer_proto::dealer::{
     PingReply, PingRequest,
-    dealer_server::{Dealer, DealerServer},
+    dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
 };
 use tonic::{Request, Response, Status, transport::Server};
 
@@ -18,7 +18,7 @@ const DEFAULT_SERVICE_ADDR: &str = "127.0.0.1:50051";
 struct DealerService;
 
 #[tonic::async_trait]
-impl Dealer for DealerService {
+impl DealerServiceTrait for DealerService {
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
         let client_id = request.into_inner().client_id;
         let message = if client_id.is_empty() {
@@ -52,7 +52,7 @@ async fn run(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting gRPC server on {socket_addr}...");
 
     Server::builder()
-        .add_service(DealerServer::new(DealerService))
+        .add_service(DealerServiceServer::new(DealerService))
         .serve(socket_addr)
         .await?;
 
