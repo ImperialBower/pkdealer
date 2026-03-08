@@ -3,65 +3,58 @@
 //! # Poker Dealer Service
 //!
 //! A gRPC service that provides poker dealer functionality.
-//!
-//! This service handles poker game operations such as:
-//! - Shuffling and dealing cards
-//! - Managing game state
-//! - Enforcing poker rules
-//!
-//! ## Usage
-//!
-//! Run the service:
-//! ```bash
-//! cargo run --bin pkdealer_service
-//! ```
 
-use std::process;
+use std::{env, net::SocketAddr, process};
 
-/// Main entry point for the poker dealer service.
-///
-/// Initializes the gRPC server and starts listening for client connections.
-///
-/// # Examples
-///
-/// ```bash
-/// cargo run --bin pkdealer_service
-/// ```
-fn main() {
-    // Initialize the service
-    if let Err(e) = run() {
-        eprintln!("Application error: {e}");
+use pkdealer_proto::dealer::{
+    PingReply, PingRequest,
+    dealer_server::{Dealer, DealerServer},
+};
+use tonic::{Request, Response, Status, transport::Server};
+
+const DEFAULT_SERVICE_ADDR: &str = "127.0.0.1:50051";
+
+#[derive(Debug, Default)]
+struct DealerService;
+
+#[tonic::async_trait]
+impl Dealer for DealerService {
+    async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
+        let client_id = request.into_inner().client_id;
+        let message = if client_id.is_empty() {
+            "pong".to_owned()
+        } else {
+            format!("pong:{client_id}")
+        };
+
+        Ok(Response::new(PingReply { message }))
+    }
+}
+
+/// Main entry point for the poker dealer service binary.
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run_from_env().await {
+        eprintln!("Application error: {error}");
         process::exit(1);
     }
 }
 
-/// Runs the poker dealer service.
-///
-/// Sets up the gRPC server and handles incoming requests.
-///
-/// # Errors
-///
-/// Returns an error if the service fails to start or encounters
-/// a critical error during operation.
-///
-/// # Examples
-///
-/// ```no_run
-/// # fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// // Service initialization and operation
-/// # Ok(())
-/// # }
-/// ```
-#[allow(clippy::unnecessary_wraps)]
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    let addr = env::var("PKDEALER_ADDR").unwrap_or_else(|_| DEFAULT_SERVICE_ADDR.to_owned());
+    run(&addr).await
+}
+
+async fn run(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let socket_addr: SocketAddr = addr.parse()?;
+
     println!("Poker Dealer Service v{}", env!("CARGO_PKG_VERSION"));
-    println!("Starting gRPC server...");
+    println!("Starting gRPC server on {socket_addr}...");
 
-    // TODO: Initialize gRPC server
-    // TODO: Register service handlers
-    // TODO: Start listening on configured port
-
-    println!("Service is ready to accept connections");
+    Server::builder()
+        .add_service(DealerServer::new(DealerService))
+        .serve(socket_addr)
+        .await?;
 
     Ok(())
 }
@@ -70,11 +63,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn run_initializes_successfully() {
-        // Test that run() can be called without panicking
-        // In a real implementation, this would test actual service initialization
-        let result = run();
-        assert!(result.is_ok());
+    #[tokio::test]
+    async fn dealer_service_ping_happy_path() {
+        let service = DealerService;
+        let request = Request::new(PingRequest {
+            client_id: "client-99".to_owned(),
+        });
+
+        let response = service
+            .ping(request)
+            .await
+            .expect("ping should return a successful response");
+
+        assert_eq!(response.into_inner().message, "pong:client-99");
+    }
+
+    #[tokio::test]
+    async fn dealer_service_ping_empty_client_id() {
+        let service = DealerService;
+        let request = Request::new(PingRequest {
+            client_id: String::new(),
+        });
+
+        let response = service
+            .ping(request)
+            .await
+            .expect("ping should return a successful response for empty client IDs");
+
+        assert_eq!(response.into_inner().message, "pong");
     }
 }

@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package pkdealer.v1;
+
+service Dealer {
+  rpc Ping(PingRequest) returns (PingReply);
+}
+
+message PingRequest {
+  string client_id = 1;
+}
+
+message PingReply {
+  string message = 1;
+}
+

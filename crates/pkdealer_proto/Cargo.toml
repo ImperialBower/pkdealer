@@ -1,0 +1,24 @@
+[package]
+name = "pkdealer_proto"
+version = "0.1.0"
+edition = "2024"
+authors = ["electronicpanopticon <gaoler@electronicpanopticon.com>"]
+license = "GPL-3.0-or-later"
+description = "Shared protobuf definitions and generated Rust types for pkdealer"
+repository = "https://github.com/ImperialBower/pkgrpc"
+keywords = ["poker", "grpc", "protobuf", "proto"]
+categories = ["games"]
+rust-version = "1.85.0"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+prost = "0.13"
+tonic = "0.12"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
+

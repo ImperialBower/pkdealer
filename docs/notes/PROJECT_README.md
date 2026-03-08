@@ -1,7 +1,7 @@
 [![CI](https://github.com/ImperialBower/pkgrpc/actions/workflows/CI.yaml/badge.svg)](https://github.com/ImperialBower/pkgrpc/actions/workflows/CI.yaml)
 [![Workspace Check](https://github.com/ImperialBower/pkgrpc/actions/workflows/workspace-check.yaml/badge.svg)](https://github.com/ImperialBower/pkgrpc/actions/workflows/workspace-check.yaml)
 [![Security Audit](https://github.com/ImperialBower/pkgrpc/actions/workflows/audit.yml/badge.svg)](https://github.com/ImperialBower/pkgrpc/actions/workflows/audit.yml)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](../../CODE_OF_CONDUCT.md)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.en.html)
 
 ---
@@ -107,7 +107,7 @@ This project maintains high code quality:
 - ✅ **Safety**: No `unwrap()` or `panic!()` in production code
 - ✅ **License Compliance**: GPL-3.0-or-later with dependency checking
 
-See [`.github/copilot-instructions.md`](.github/copilot-instructions.md) for detailed guidelines.
+See [`.github/copilot-instructions.md`](../../.github/copilot-instructions.md) for detailed guidelines.
 
 ### Development Commands
 
@@ -146,26 +146,26 @@ GitHub Actions workflows automatically:
 - ✅ Audit dependencies for security issues
 - ✅ Check license compliance
 
-See [`.github/WORKFLOWS.md`](.github/WORKFLOWS.md) for detailed workflow documentation.
+See [`.github/WORKFLOWS.md`](../../.github/WORKFLOWS.md) for detailed workflow documentation.
 
 ## Documentation
 
 ### Project Documentation
-- **Workflow Guide**: [`.github/WORKFLOWS.md`](.github/WORKFLOWS.md)
+- **Workflow Guide**: [`.github/WORKFLOWS.md`](../../.github/WORKFLOWS.md)
 - **License Compatibility**: [`GPL_LICENSE_COMPATIBILITY.md`](GPL_LICENSE_COMPATIBILITY.md)
 - **Workspace Commands**: [`WORKSPACE_COMMANDS.md`](WORKSPACE_COMMANDS.md)
 - **cargo-deny Quick Start**: [`CARGO_DENY_QUICKSTART.md`](CARGO_DENY_QUICKSTART.md)
 - **Subprojects Overview**: [`SUBPROJECTS_ADDED.md`](SUBPROJECTS_ADDED.md)
 
 ### Crate Documentation
-- **Service**: [`crates/pkdealer_service/README.md`](crates/pkdealer_service/README.md)
-- **Client**: [`crates/pkdealer_client/README.md`](crates/pkdealer_client/README.md)
+- **Service**: [`crates/pkdealer_service/README.md`](../../crates/pkdealer_service/README.md)
+- **Client**: [`crates/pkdealer_client/README.md`](../../crates/pkdealer_client/README.md)
 
 ## License
 
 This project is licensed under GPL-3.0-or-later.
 
-See [LICENSE-GPL3.0](LICENSE-GPL3.0) for details.
+See [LICENSE-GPL3.0](../../LICENSE-GPL3.0) for details.
 
 ### Dependency Licenses
 
@@ -175,8 +175,8 @@ All dependencies are checked for GPL compatibility using `cargo-deny`. See [`GPL
 
 Contributions are welcome! Please:
 
-1. Read the [Code of Conduct](CODE_OF_CONDUCT.md)
-2. Follow the coding guidelines in [`.github/copilot-instructions.md`](.github/copilot-instructions.md)
+1. Read the [Code of Conduct](../../CODE_OF_CONDUCT.md)
+2. Follow the coding guidelines in [`.github/copilot-instructions.md`](../../.github/copilot-instructions.md)
 3. Ensure all tests pass: `cargo test --workspace`
 4. Run clippy: `cargo clippy --workspace --all-targets`
 5. Format code: `cargo fmt --workspace`
@@ -198,5 +198,5 @@ Contributions are welcome! Please:
 - [Rust Book](https://doc.rust-lang.org/book/)
 - [Tonic gRPC Guide](https://github.com/hyperium/tonic)
 - [Tokio Documentation](https://tokio.rs/)
-- [Project Coding Guidelines](.github/copilot-instructions.md)
+- [Project Coding Guidelines](../../.github/copilot-instructions.md)
 

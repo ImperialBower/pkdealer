@@ -5,6 +5,9 @@
 .PHONY: help build test check fmt clippy doc clean all ci-local install-tools
 
 # Default target
+default: ayce
+
+# Default target
 help:
 	@echo "pkgrpc Workspace Commands"
 	@echo "========================="
@@ -135,7 +138,7 @@ ci-local: fmt-check clippy-pedantic test doc
 	@echo ""
 
 # Run everything
-all: build test clippy doc
+ayce: build test clippy doc
 
 # Install required tools
 install-tools:

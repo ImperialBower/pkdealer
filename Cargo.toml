@@ -2,5 +2,6 @@
 members = [
     "crates/pkdealer_service",
     "crates/pkdealer_client",
+    "crates/pkdealer_proto",
 ]
 resolver = "2"

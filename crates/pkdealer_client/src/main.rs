@@ -3,83 +3,93 @@
 //! # Poker Dealer Client
 //!
 //! A gRPC client for interacting with the poker dealer service.
-//!
-//! This client provides a command-line interface for:
-//! - Connecting to the poker dealer service
-//! - Requesting card deals
-//! - Managing game sessions
-//! - Querying game state
-//!
-//! ## Usage
-//!
-//! Run the client:
-//! ```bash
-//! cargo run --bin pkdealer_client
-//! ```
 
 use std::process;
 
-/// Main entry point for the poker dealer client.
-///
-/// Parses command-line arguments and executes the requested operation
-/// against the poker dealer service.
-///
-/// # Examples
-///
-/// ```bash
-/// cargo run --bin pkdealer_client
-/// ```
-fn main() {
-    // Initialize and run the client
-    if let Err(e) = run() {
-        eprintln!("Application error: {e}");
+use pkdealer_proto::{dealer::dealer_client::DealerClient, new_ping_request};
+
+const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50051";
+const DEFAULT_CLIENT_ID: &str = "pkdealer-client";
+
+/// Main entry point for the poker dealer client binary.
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run_from_env().await {
+        eprintln!("Application error: {error}");
         process::exit(1);
     }
 }
 
-/// Runs the poker dealer client.
-///
-/// Establishes connection to the gRPC service and handles user commands.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Unable to connect to the service
-/// - Service request fails
-/// - Invalid command-line arguments
-///
-/// # Examples
-///
-/// ```no_run
-/// # fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// // Client initialization and operation
-/// # Ok(())
-/// # }
-/// ```
-#[allow(clippy::unnecessary_wraps)]
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = std::env::var("PKDEALER_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned());
+    let client_id = std::env::var("PKDEALER_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_owned());
+
     println!("Poker Dealer Client v{}", env!("CARGO_PKG_VERSION"));
-    println!("Connecting to service...");
+    println!("Connecting to service at {endpoint}...");
 
-    // TODO: Parse command-line arguments
-    // TODO: Establish gRPC connection to service
-    // TODO: Execute requested operation
-    // TODO: Display results
-
-    println!("Client initialized successfully");
+    let message = ping(&endpoint, &client_id).await?;
+    println!("Service response: {message}");
 
     Ok(())
+}
+
+async fn ping(endpoint: &str, client_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut client = DealerClient::connect(endpoint.to_owned()).await?;
+    let request = tonic::Request::new(new_ping_request(client_id));
+    let response = client.ping(request).await?;
+
+    Ok(response.into_inner().message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn run_initializes_successfully() {
-        // Test that run() can be called without panicking
-        // In a real implementation, this would test actual client initialization
-        let result = run();
-        assert!(result.is_ok());
+    use pkdealer_proto::dealer::{
+        PingReply, PingRequest,
+        dealer_server::{Dealer, DealerServer},
+    };
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status, transport::Server};
+
+    #[derive(Debug, Default)]
+    struct TestDealerService;
+
+    #[tonic::async_trait]
+    impl Dealer for TestDealerService {
+        async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
+            let client_id = request.into_inner().client_id;
+            Ok(Response::new(PingReply {
+                message: format!("pong:{client_id}"),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_happy_path() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind on an ephemeral local port");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local addr");
+        let incoming = TcpListenerStream::new(listener);
+
+        let server_handle = tokio::spawn(async move {
+            Server::builder()
+                .add_service(DealerServer::new(TestDealerService))
+                .serve_with_incoming(incoming)
+                .await
+        });
+
+        let endpoint = format!("http://{addr}");
+        let message = ping(&endpoint, "client-7")
+            .await
+            .expect("ping should succeed against test server");
+
+        assert_eq!(message, "pong:client-7");
+
+        server_handle.abort();
     }
 }
