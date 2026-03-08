@@ -134,6 +134,16 @@ allow = [
 ]
 ```
 
+### 🧹 Duplicate-Version Skips
+`deny.toml` currently uses `[bans].skip` for a few older transitive crates required by the current `tonic`/`prost` stack. This keeps `cargo deny check` output clean while `multiple-versions = "warn"` still catches new duplicates.
+
+### ♻️ When To Remove Skips
+After upgrading dependencies, run:
+```bash
+cargo deny check bans
+```
+If the older versions are no longer in `Cargo.lock`, remove the matching entries from `[bans].skip` in `deny.toml`.
+
 ### ⚠️ Watch Out For
 - **GPL-2.0-only** - NOT compatible (needs "or-later")
 - **OpenSSL** - Use `rustls` feature instead
@@ -171,4 +181,3 @@ make audit
 3. ⚠️ If license rejected, uncomment it in `deny.toml`
 4. ✅ Run `cargo deny check` to verify
 5. 🎉 Done!
-

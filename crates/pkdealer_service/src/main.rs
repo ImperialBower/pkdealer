@@ -64,32 +64,28 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn dealer_service_ping_happy_path() {
+    async fn dealer_service_ping_happy_path() -> Result<(), Box<dyn std::error::Error>> {
         let service = DealerService;
         let request = Request::new(PingRequest {
             client_id: "client-99".to_owned(),
         });
 
-        let response = service
-            .ping(request)
-            .await
-            .expect("ping should return a successful response");
+        let response = service.ping(request).await?;
 
         assert_eq!(response.into_inner().message, "pong:client-99");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn dealer_service_ping_empty_client_id() {
+    async fn dealer_service_ping_empty_client_id() -> Result<(), Box<dyn std::error::Error>> {
         let service = DealerService;
         let request = Request::new(PingRequest {
             client_id: String::new(),
         });
 
-        let response = service
-            .ping(request)
-            .await
-            .expect("ping should return a successful response for empty client IDs");
+        let response = service.ping(request).await?;
 
         assert_eq!(response.into_inner().message, "pong");
+        Ok(())
     }
 }

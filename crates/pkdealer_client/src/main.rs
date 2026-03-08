@@ -67,13 +67,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ping_happy_path() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind on an ephemeral local port");
-        let addr = listener
-            .local_addr()
-            .expect("listener should expose local addr");
+    async fn ping_happy_path() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
         let incoming = TcpListenerStream::new(listener);
 
         let server_handle = tokio::spawn(async move {
@@ -84,12 +80,11 @@ mod tests {
         });
 
         let endpoint = format!("http://{addr}");
-        let message = ping(&endpoint, "client-7")
-            .await
-            .expect("ping should succeed against test server");
+        let message = ping(&endpoint, "client-7").await?;
 
         assert_eq!(message, "pong:client-7");
 
         server_handle.abort();
+        Ok(())
     }
 }
