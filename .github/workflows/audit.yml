@@ -13,9 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Auth for private git dependencies
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - name: Checkout pkcore dependency
+        run: git clone --branch dealer https://github.com/ImperialBower/pkcore.git
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
       - uses: taiki-e/install-action@cargo-deny
       - name: Scan for vulnerabilities
         run: cargo deny check advisories

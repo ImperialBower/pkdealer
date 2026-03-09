@@ -28,13 +28,14 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
+      - name: Checkout pkcore dependency
+        run: git clone --branch dealer https://github.com/ImperialBower/pkcore.git
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{matrix.rust}}
           components: rust-src
-      - name: Auth for private git dependencies
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -72,12 +73,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
+      - name: Checkout pkcore dependency
+        run: git clone --branch dealer https://github.com/ImperialBower/pkcore.git
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-src
-      - name: Auth for private git dependencies
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -105,12 +107,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
+      - name: Checkout pkcore dependency
+        run: git clone --branch dealer https://github.com/ImperialBower/pkcore.git
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rust-src
-      - name: Auth for private git dependencies
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -131,12 +134,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
+      - name: Checkout pkcore dependency
+        run: git clone --branch dealer https://github.com/ImperialBower/pkcore.git
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, rust-src
-      - name: Auth for private git dependencies
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -147,12 +151,13 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
+      - name: Checkout pkcore dependency
+        run: git clone --branch dealer https://github.com/ImperialBower/pkcore.git
+        env:
+          GIT_AUTH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-docs, rust-src
-      - name: Auth for private git dependencies
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
