@@ -29,7 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        run: git clone --branch dealer https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/ImperialBower/pkcore.git
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          git clone --branch dealer https://github.com/ImperialBower/pkcore.git
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{matrix.rust}}
@@ -72,7 +74,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        run: git clone --branch dealer https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/ImperialBower/pkcore.git
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          git clone --branch dealer https://github.com/ImperialBower/pkcore.git
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-src
@@ -104,7 +108,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        run: git clone --branch dealer https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/ImperialBower/pkcore.git
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          git clone --branch dealer https://github.com/ImperialBower/pkcore.git
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rust-src
