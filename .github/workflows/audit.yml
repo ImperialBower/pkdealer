@@ -14,9 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        run: git clone --branch dealer https://github.com/ImperialBower/pkcore.git
-        env:
-          GIT_AUTH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
+        run: git clone --branch dealer https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/ImperialBower/pkcore.git
       - uses: taiki-e/install-action@cargo-deny
       - name: Scan for vulnerabilities
         run: cargo deny check advisories
