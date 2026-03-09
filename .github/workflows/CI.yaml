@@ -28,11 +28,16 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - name: Checkout pkcore dependency
+
+      - name: Checkout pkcore repo
         env:
-          GH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
-        run: |
-          git clone --depth 1 --branch dealer https://oauth2:${GH_TOKEN}@github.com/ImperialBower/pkcore.git
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        # Use token for authentication
+        run: git clone https://GH_TOKEN@github.com/ImperialBower/pkcore.git
+
+#      - name: Checkout pkcore dependency
+#        run: |
+#          git clone --depth 1 --branch dealer "https://oauth2:${{ secrets.PKCORE_READ_TOKEN }}@github.com/ImperialBower/pkcore.git"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{matrix.rust}}
@@ -75,10 +80,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        env:
-          GH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
         run: |
-          git clone --depth 1 --branch dealer https://oauth2:${GH_TOKEN}@github.com/ImperialBower/pkcore.git
+          git clone --depth 1 --branch dealer "https://oauth2:${{ secrets.PKCORE_READ_TOKEN }}@github.com/ImperialBower/pkcore.git"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-src
@@ -110,10 +113,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        env:
-          GH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
         run: |
-          git clone --depth 1 --branch dealer https://oauth2:${GH_TOKEN}@github.com/ImperialBower/pkcore.git
+          git clone --depth 1 --branch dealer "https://oauth2:${{ secrets.PKCORE_READ_TOKEN }}@github.com/ImperialBower/pkcore.git"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rust-src
