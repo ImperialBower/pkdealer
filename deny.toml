@@ -35,6 +35,8 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "Unicode-3.0",
     "BSD-3-Clause",
+    "MPL-2.0",
+    "Zlib",
 ]
 
 # ============================================================================
@@ -102,6 +104,13 @@ skip = [
     { name = "socket2", version = "0.5.10" },
     { name = "tower", version = "0.4.13" },
     { name = "windows-sys", version = "0.52.0" },
+    # Additional duplicate transitive versions currently required by pkcore + tonic build deps.
+    { name = "getrandom", version = "0.3.4" },
+    { name = "hashbrown", version = "0.15.5" },
+    { name = "r-efi", version = "5.3.0" },
+    { name = "rand", version = "0.8.5" },
+    { name = "rand_chacha", version = "0.3.1" },
+    { name = "rand_core", version = "0.6.4" },
 ]
 # Similarly named crates that are allowed. Similar to `skip` but can use
 # glob patterns.
@@ -119,4 +128,4 @@ unknown-git = "warn"
 # will be allowed.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # List of URLs for allowed Git repositories
-allow-git = []
+allow-git = ["https://github.com/ImperialBower/pkcore"]
