@@ -29,12 +29,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        uses: actions/checkout@v6
-        with:
-          repository: ImperialBower/pkcore
-          ref: dealer
-          token: ${{ secrets.PKCORE_READ_TOKEN }}
-          path: pkcore
+        env:
+          GH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
+        run: |
+          git clone --depth 1 --branch dealer https://oauth2:${GH_TOKEN}@github.com/ImperialBower/pkcore.git
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{matrix.rust}}
@@ -77,12 +75,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        uses: actions/checkout@v6
-        with:
-          repository: ImperialBower/pkcore
-          ref: dealer
-          token: ${{ secrets.PKCORE_READ_TOKEN }}
-          path: pkcore
+        env:
+          GH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
+        run: |
+          git clone --depth 1 --branch dealer https://oauth2:${GH_TOKEN}@github.com/ImperialBower/pkcore.git
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-src
@@ -114,12 +110,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        uses: actions/checkout@v6
-        with:
-          repository: ImperialBower/pkcore
-          ref: dealer
-          token: ${{ secrets.PKCORE_READ_TOKEN }}
-          path: pkcore
+        env:
+          GH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
+        run: |
+          git clone --depth 1 --branch dealer https://oauth2:${GH_TOKEN}@github.com/ImperialBower/pkcore.git
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rust-src
@@ -144,12 +138,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        uses: actions/checkout@v6
-        with:
-          repository: ImperialBower/pkcore
-          ref: dealer
-          token: ${{ secrets.PKCORE_READ_TOKEN }}
-          path: pkcore
+        env:
+          GH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
+        run: |
+          git clone --depth 1 --branch dealer https://oauth2:${GH_TOKEN}@github.com/ImperialBower/pkcore.git
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, rust-src
@@ -164,12 +156,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        uses: actions/checkout@v6
-        with:
-          repository: ImperialBower/pkcore
-          ref: dealer
-          token: ${{ secrets.PKCORE_READ_TOKEN }}
-          path: pkcore
+        env:
+          GH_TOKEN: ${{ secrets.PKCORE_READ_TOKEN }}
+        run: |
+          git clone --depth 1 --branch dealer https://oauth2:${GH_TOKEN}@github.com/ImperialBower/pkcore.git
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-docs, rust-src
