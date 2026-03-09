@@ -18,9 +18,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
-          git clone --branch dealer https://github.com/ImperialBower/pkcore.git
+        uses: actions/checkout@v6
+        with:
+          repository: ImperialBower/pkcore
+          ref: dealer
+          token: ${{ secrets.PKCORE_READ_TOKEN }}
+          path: pkcore
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-src
@@ -47,9 +50,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
-          git clone --branch dealer https://github.com/ImperialBower/pkcore.git
+        uses: actions/checkout@v6
+        with:
+          repository: ImperialBower/pkcore
+          ref: dealer
+          token: ${{ secrets.PKCORE_READ_TOKEN }}
+          path: pkcore
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
@@ -64,9 +70,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Checkout pkcore dependency
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
-          git clone --branch dealer https://github.com/ImperialBower/pkcore.git
+        uses: actions/checkout@v6
+        with:
+          repository: ImperialBower/pkcore
+          ref: dealer
+          token: ${{ secrets.PKCORE_READ_TOKEN }}
+          path: pkcore
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-udeps
         uses: taiki-e/install-action@cargo-udeps
