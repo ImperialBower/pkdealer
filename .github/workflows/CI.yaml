@@ -32,6 +32,9 @@ jobs:
         with:
           toolchain: ${{matrix.rust}}
           components: rust-src
+      - name: Auth for private git dependencies
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -72,6 +75,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-src
+      - name: Auth for private git dependencies
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -102,6 +108,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rust-src
+      - name: Auth for private git dependencies
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -125,6 +134,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, rust-src
+      - name: Auth for private git dependencies
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -138,6 +150,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-docs, rust-src
+      - name: Auth for private git dependencies
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
