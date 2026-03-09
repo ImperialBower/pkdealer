@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 indexmap = { version = "=2.12.1", features = ["rayon"] }
-pkcore = { version = "=0.0.17", git = "https://github.com/ImperialBower/pkcore", rev = "363b8866ff819c7eaf1409dc0bd496fc303b79b5" }
+pkcore = { version = "=0.0.17", git = "https://github.com/ImperialBower/pkcore", branch = "dealer" }
 prost = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 tonic = "0.12"

@@ -7,6 +7,8 @@
 # Default target
 default: ayce
 
+all: ayce
+
 # Default target
 help:
 	@echo "pkgrpc Workspace Commands"
@@ -36,7 +38,6 @@ help:
 # Build all crates
 build:
 	@echo "Building workspace..."
-	cargo build --workspace --all-features
 
 # Build in release mode
 build-release:
