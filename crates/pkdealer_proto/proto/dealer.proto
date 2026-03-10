@@ -252,5 +252,3 @@ enum EventType {
   STREET_ADVANCED = 4;
   HAND_ENDED = 5;
 }
-
-
