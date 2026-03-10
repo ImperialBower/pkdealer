@@ -1,6 +1,6 @@
-[![CI](https://github.com/ImperialBower/pkgrpc/actions/workflows/CI.yaml/badge.svg)](https://github.com/ImperialBower/pkgrpc/actions/workflows/CI.yaml)
-[![Workspace Check](https://github.com/ImperialBower/pkgrpc/actions/workflows/workspace-check.yaml/badge.svg)](https://github.com/ImperialBower/pkgrpc/actions/workflows/workspace-check.yaml)
-[![Security Audit](https://github.com/ImperialBower/pkgrpc/actions/workflows/audit.yml/badge.svg)](https://github.com/ImperialBower/pkgrpc/actions/workflows/audit.yml)
+[![CI](https://github.com/ImperialBower/pkdealer/actions/workflows/CI.yaml/badge.svg)](https://github.com/ImperialBower/pkdealer/actions/workflows/CI.yaml)
+[![Workspace Check](https://github.com/ImperialBower/pkdealer/actions/workflows/workspace-check.yaml/badge.svg)](https://github.com/ImperialBower/pkdealer/actions/workflows/workspace-check.yaml)
+[![Security Audit](https://github.com/ImperialBower/pkdealer/actions/workflows/audit.yml/badge.svg)](https://github.com/ImperialBower/pkdealer/actions/workflows/audit.yml)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.en.html)
 
