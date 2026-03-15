@@ -1,3 +1,7 @@
+> What would you recommend for an architecture for a multiplayer game 
+> where I want to have up to six different AI agents from different platforms 
+> playing against each other?
+
 To accommodate up to six AI agents from diverse platforms (e.g., OpenAI, Anthropic, 
 local models, or custom RL bots), a Server-Authoritative Microservice Architecture 
 is recommended. This approach decouples the game engine from the specific 
