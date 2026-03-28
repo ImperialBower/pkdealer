@@ -1,4 +1,5 @@
 #![warn(clippy::pedantic, clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::cast_possible_truncation)]
 
 //! # Poker Dealer Service
 //!
@@ -31,19 +32,17 @@ use pkcore::casino::{
     player::Player,
 };
 use pkdealer_proto::dealer::{
-    ActionResult, ActionType, ActRequest, ActResponse, AdvanceStreetRequest,
-    AdvanceStreetResponse, EndHandRequest, EndHandResponse, EventType, GetBoardRequest,
-    GetBoardResponse, GetChipsRequest, GetChipsResponse, GetEventLogRequest,
-    GetEventLogResponse, GetNextToActRequest, GetNextToActResponse, GetPotRequest,
-    GetPotResponse, GetStatusRequest, GetStatusResponse, HandResult, NextToActInfo,
-    PingReply, PingRequest, PlayerChips, RemovePlayerRequest, RemovePlayerResponse,
-    SeatInfo, SeatPlayerAtRequest, SeatPlayerAtResponse, SeatPlayerRequest,
-    SeatPlayerResponse, StartHandRequest, StartHandResponse, StreamEventsRequest,
-    StreetResult, TableEvent, TableStatus,
-    act_response, advance_street_response, end_hand_response, get_next_to_act_response,
-    remove_player_response, seat_player_at_response, seat_player_response,
-    start_hand_response,
+    ActRequest, ActResponse, ActionResult, ActionType, AdvanceStreetRequest, AdvanceStreetResponse,
+    EndHandRequest, EndHandResponse, EventType, GetBoardRequest, GetBoardResponse, GetChipsRequest,
+    GetChipsResponse, GetEventLogRequest, GetEventLogResponse, GetNextToActRequest,
+    GetNextToActResponse, GetPotRequest, GetPotResponse, GetStatusRequest, GetStatusResponse,
+    HandResult, NextToActInfo, PingReply, PingRequest, PlayerChips, RemovePlayerRequest,
+    RemovePlayerResponse, SeatInfo, SeatPlayerAtRequest, SeatPlayerAtResponse, SeatPlayerRequest,
+    SeatPlayerResponse, StartHandRequest, StartHandResponse, StreamEventsRequest, StreetResult,
+    TableEvent, TableStatus, act_response, advance_street_response,
     dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
+    end_hand_response, get_next_to_act_response, remove_player_response, seat_player_at_response,
+    seat_player_response, start_hand_response,
 };
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, transport::Server};
@@ -61,7 +60,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 ///
 /// # Safety
 ///
-/// [`Dealer`] (and its inner [`Table`]) use `Cell`/`RefCell` for interior
+/// [`Dealer`] (and its inner `Table`) use `Cell`/`RefCell` for interior
 /// mutability, which makes them `!Send` by default. We guarantee that every
 /// access to this struct goes through the `Mutex` in `DealerService`, so only
 /// one thread ever touches the `Dealer` at a time. That invariant makes the
@@ -96,6 +95,10 @@ impl DealerService {
 
     /// Acquires the state lock and returns an error `Status` if the lock is
     /// poisoned.
+    // `tonic::Status` is 176 bytes, but it is the mandatory error type for all
+    // gRPC handlers in this crate.  Boxing it here would just push the
+    // unboxing cost to every call site for no real benefit.
+    #[allow(clippy::result_large_err)]
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, TableState>, Status> {
         self.state
             .lock()
@@ -108,16 +111,16 @@ impl DealerService {
         let mut seats = Vec::new();
 
         for i in 0..table.seats.size() {
-            if let Some(seat) = table.seats.get_seat(i) {
-                if !seat.is_empty() {
-                    seats.push(SeatInfo {
-                        seat_number: u32::from(i),
-                        player_name: seat.player.handle.clone(),
-                        chips: seat.player.chips.count() as u32,
-                        cards: seat.cards.to_string(),
-                        state: format!("{:?}", seat.player.state.get()),
-                    });
-                }
+            if let Some(seat) = table.seats.get_seat(i)
+                && !seat.is_empty()
+            {
+                seats.push(SeatInfo {
+                    seat_number: u32::from(i),
+                    player_name: seat.player.handle.clone(),
+                    chips: seat.player.chips.count() as u32,
+                    cards: seat.cards.to_string(),
+                    state: format!("{:?}", seat.player.state.get()),
+                });
             }
         }
 
@@ -136,14 +139,14 @@ impl DealerService {
         let table = &dealer.table;
         let mut result = Vec::new();
         for i in 0..table.seats.size() {
-            if let Some(seat) = table.seats.get_seat(i) {
-                if !seat.is_empty() {
-                    result.push(PlayerChips {
-                        seat: u32::from(i),
-                        player_name: seat.player.handle.clone(),
-                        chips: seat.player.chips.count() as u32,
-                    });
-                }
+            if let Some(seat) = table.seats.get_seat(i)
+                && !seat.is_empty()
+            {
+                result.push(PlayerChips {
+                    seat: u32::from(i),
+                    player_name: seat.player.handle.clone(),
+                    chips: seat.player.chips.count() as u32,
+                });
             }
         }
         result
@@ -160,12 +163,7 @@ impl DealerService {
     /// Constructs and enqueues a [`TableEvent`] on the broadcast channel.
     ///
     /// Errors from `send` (no active subscribers) are silently discarded.
-    fn emit_event(
-        &self,
-        event_type: EventType,
-        description: String,
-        status: TableStatus,
-    ) {
+    fn emit_event(&self, event_type: EventType, description: String, status: TableStatus) {
         let event = TableEvent {
             timestamp: Self::now_unix_ms(),
             event_type: event_type as i32,
@@ -183,12 +181,6 @@ impl DealerServiceTrait for DealerService {
     // ── Ping ──────────────────────────────────────────────────────────────────
 
     /// Returns `"pong"` or `"pong:<client_id>"` to confirm the service is alive.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// // gRPC ping — no doc-runnable example needed here; see unit tests.
-    /// ```
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
         let client_id = request.into_inner().client_id;
         let message = if client_id.is_empty() {
@@ -302,7 +294,7 @@ impl DealerServiceTrait for DealerService {
                 .table
                 .seats
                 .get_seat(seat)
-                .map_or(true, |s| s.is_empty());
+                .is_none_or(|s| s.is_empty());
             if is_empty {
                 let msg = format!("seat {seat} is empty or does not exist");
                 return Ok(Response::new(RemovePlayerResponse {
@@ -350,7 +342,11 @@ impl DealerServiceTrait for DealerService {
             match guard.dealer.start_hand() {
                 Ok(()) => {
                     let status = Self::build_table_status(&guard.dealer);
-                    let event = (EventType::HandStarted, "Hand started".to_owned(), status.clone());
+                    let event = (
+                        EventType::HandStarted,
+                        "Hand started".to_owned(),
+                        status.clone(),
+                    );
                     (start_hand_response::Result::Status(status), Some(event))
                 }
                 Err(e) => (
@@ -434,7 +430,10 @@ impl DealerServiceTrait for DealerService {
                         format!("Hand ended. {result_text}"),
                         status,
                     );
-                    (end_hand_response::Result::HandResult(hand_result), Some(event))
+                    (
+                        end_hand_response::Result::HandResult(hand_result),
+                        Some(event),
+                    )
                 }
                 Err(e) => (
                     end_hand_response::Result::Error(dealer_error_to_string(&e)),
@@ -463,13 +462,12 @@ impl DealerServiceTrait for DealerService {
         #[allow(clippy::cast_possible_truncation)]
         let seat = proto_action.seat as u8;
         let amount = proto_action.amount as usize;
-        let action_type = ActionType::try_from(proto_action.action_type)
-            .map_err(|_| {
-                Status::invalid_argument(format!(
-                    "unknown action_type value: {}",
-                    proto_action.action_type
-                ))
-            })?;
+        let action_type = ActionType::try_from(proto_action.action_type).map_err(|_| {
+            Status::invalid_argument(format!(
+                "unknown action_type value: {}",
+                proto_action.action_type
+            ))
+        })?;
 
         let dealer_action = match action_type {
             ActionType::Bet => DealerAction::Bet { seat, amount },
@@ -496,9 +494,15 @@ impl DealerServiceTrait for DealerService {
                         format!("Seat {seat}: {action_type:?}"),
                         status,
                     );
-                    (act_response::Result::ActionResult(action_result), Some(event))
+                    (
+                        act_response::Result::ActionResult(action_result),
+                        Some(event),
+                    )
                 }
-                Err(e) => (act_response::Result::Error(dealer_error_to_string(&e)), None),
+                Err(e) => (
+                    act_response::Result::Error(dealer_error_to_string(&e)),
+                    None,
+                ),
             }
         };
 
@@ -601,8 +605,7 @@ impl DealerServiceTrait for DealerService {
 
     // ── Event stream ──────────────────────────────────────────────────────────
 
-    type StreamEventsStream =
-        tokio_stream::wrappers::ReceiverStream<Result<TableEvent, Status>>;
+    type StreamEventsStream = tokio_stream::wrappers::ReceiverStream<Result<TableEvent, Status>>;
 
     async fn stream_events(
         &self,
@@ -632,9 +635,9 @@ impl DealerServiceTrait for DealerService {
             }
         });
 
-        Ok(Response::new(
-            tokio_stream::wrappers::ReceiverStream::new(mpsc_rx),
-        ))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            mpsc_rx,
+        )))
     }
 }
 
@@ -680,6 +683,7 @@ async fn run(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use pkdealer_proto::dealer::PlayerAction;
@@ -724,7 +728,7 @@ mod tests {
         let response = service.seat_player(request).await?;
         match response.into_inner().result {
             Some(seat_player_response::Result::SeatNumber(n)) => {
-                assert!(n < DEFAULT_SEAT_COUNT as u32);
+                assert!(n < u32::from(DEFAULT_SEAT_COUNT));
             }
             other => panic!("unexpected result: {other:?}"),
         }
@@ -834,7 +838,10 @@ mod tests {
         let response = service
             .get_status(Request::new(GetStatusRequest {}))
             .await?;
-        let status = response.into_inner().status.expect("status should be present");
+        let status = response
+            .into_inner()
+            .status
+            .expect("status should be present");
         assert!(status.seats.is_empty());
         assert!(!status.hand_in_progress);
         Ok(())
@@ -843,7 +850,8 @@ mod tests {
     // ── start_hand ────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn dealer_service_start_hand_not_enough_players() -> Result<(), Box<dyn std::error::Error>> {
+    async fn dealer_service_start_hand_not_enough_players() -> Result<(), Box<dyn std::error::Error>>
+    {
         let service = make_service();
         // Only one player — start_hand should fail
         service
@@ -913,9 +921,7 @@ mod tests {
     #[tokio::test]
     async fn dealer_service_act_missing_action_field() -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
-        let result = service
-            .act(Request::new(ActRequest { action: None }))
-            .await;
+        let result = service.act(Request::new(ActRequest { action: None })).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
         Ok(())
@@ -961,7 +967,8 @@ mod tests {
     // ── stream_events ─────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn dealer_service_stream_events_receives_seat_event() -> Result<(), Box<dyn std::error::Error>> {
+    async fn dealer_service_stream_events_receives_seat_event()
+    -> Result<(), Box<dyn std::error::Error>> {
         use tokio_stream::StreamExt;
 
         let service = make_service();
@@ -989,6 +996,277 @@ mod tests {
         Ok(())
     }
 
+    // ── get_next_to_act with hand in progress ─────────────────────────────────
+
+    #[tokio::test]
+    async fn dealer_service_get_next_to_act_during_hand() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let service = make_service();
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let response = service
+            .get_next_to_act(Request::new(GetNextToActRequest {}))
+            .await?;
+        match response.into_inner().result {
+            Some(get_next_to_act_response::Result::Info(info)) => {
+                assert!(info.seat < u32::from(DEFAULT_SEAT_COUNT));
+                assert!(!info.player_name.is_empty());
+                assert!(info.chips > 0);
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    // ── get_chips ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dealer_service_get_chips_with_players() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        seat_two_players(&service).await?;
+
+        let chips = service
+            .get_chips(Request::new(GetChipsRequest {}))
+            .await?
+            .into_inner()
+            .chips;
+        assert_eq!(chips.len(), 2);
+        assert!(chips.iter().all(|p| p.chips == 1_000));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dealer_service_get_chips_after_blinds_posted() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let service = make_service();
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let chips = service
+            .get_chips(Request::new(GetChipsRequest {}))
+            .await?
+            .into_inner()
+            .chips;
+        // SB paid 50, BB paid 100 — chips in hand, not counted until pot is awarded
+        let total: u32 = chips.iter().map(|p| p.chips).sum();
+        assert_eq!(total, 1_850, "SB 950 + BB 900 = 1850 chips remaining");
+        Ok(())
+    }
+
+    // ── get_event_log ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dealer_service_get_event_log_grows_after_start_hand()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let log_before = service
+            .get_event_log(Request::new(GetEventLogRequest {}))
+            .await?
+            .into_inner()
+            .log;
+        let lines_before = log_before.lines().count();
+
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let log_after = service
+            .get_event_log(Request::new(GetEventLogRequest {}))
+            .await?
+            .into_inner()
+            .log;
+        let lines_after = log_after.lines().count();
+
+        assert!(
+            lines_after > lines_before,
+            "log should grow after start_hand: before={lines_before}, after={lines_after}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dealer_service_get_event_log_populated_after_start_hand()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let log = service
+            .get_event_log(Request::new(GetEventLogRequest {}))
+            .await?
+            .into_inner()
+            .log;
+        assert!(
+            !log.is_empty(),
+            "event log should be populated after start_hand"
+        );
+        // Log lines are numbered; check there are at least a few entries
+        let line_count = log.lines().count();
+        assert!(line_count >= 3, "expected ≥3 log entries, got {line_count}");
+        Ok(())
+    }
+
+    // ── end_hand ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dealer_service_end_hand_after_fold() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        fold_next_to_act(&service).await?;
+
+        let response = service.end_hand(Request::new(EndHandRequest {})).await?;
+        assert!(
+            matches!(
+                response.into_inner().result,
+                Some(end_hand_response::Result::HandResult(_))
+            ),
+            "expected HandResult after a fold"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dealer_service_end_hand_chips_conserved() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        fold_next_to_act(&service).await?;
+        service.end_hand(Request::new(EndHandRequest {})).await?;
+
+        let total: u32 = service
+            .get_chips(Request::new(GetChipsRequest {}))
+            .await?
+            .into_inner()
+            .chips
+            .iter()
+            .map(|p| p.chips)
+            .sum();
+        assert_eq!(total, 2_000, "chips must be conserved after payout");
+        Ok(())
+    }
+
+    // ── advance_street ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dealer_service_advance_street_before_betting_complete_returns_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        // Attempt to advance before anyone has acted preflop
+        let response = service
+            .advance_street(Request::new(AdvanceStreetRequest {}))
+            .await?;
+        assert!(
+            matches!(
+                response.into_inner().result,
+                Some(advance_street_response::Result::Error(_))
+            ),
+            "advance_street must fail while betting is still in progress"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dealer_service_advance_street_to_flop() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        complete_preflop_betting(&service).await?;
+
+        let response = service
+            .advance_street(Request::new(AdvanceStreetRequest {}))
+            .await?;
+        match response.into_inner().result {
+            Some(advance_street_response::Result::StreetResult(s)) => {
+                // Flop = 3 cards separated by spaces, e.g. "A♠ K♦ 7♣"
+                assert!(!s.board.is_empty(), "board should be non-empty after flop");
+            }
+            other => panic!("expected StreetResult, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    // ── full hand sequence ────────────────────────────────────────────────────
+
+    /// Plays a complete two-player hand where both players call/check every
+    /// street and reach showdown.  Verifies that:
+    ///   - `advance_street` succeeds through flop, turn, and river
+    ///   - `end_hand` returns a `HandResult`
+    ///   - total chips are conserved (no chips created or destroyed)
+    #[tokio::test]
+    async fn dealer_service_full_hand_call_check_all_streets_to_showdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        // Preflop: UTG calls, BB checks
+        complete_preflop_betting(&service).await?;
+
+        // Flop
+        service
+            .advance_street(Request::new(AdvanceStreetRequest {}))
+            .await?;
+        check_all_active(&service).await?;
+
+        // Turn
+        service
+            .advance_street(Request::new(AdvanceStreetRequest {}))
+            .await?;
+        check_all_active(&service).await?;
+
+        // River
+        service
+            .advance_street(Request::new(AdvanceStreetRequest {}))
+            .await?;
+        check_all_active(&service).await?;
+
+        // Showdown
+        let response = service.end_hand(Request::new(EndHandRequest {})).await?;
+        assert!(
+            matches!(
+                response.into_inner().result,
+                Some(end_hand_response::Result::HandResult(_))
+            ),
+            "expected HandResult at showdown"
+        );
+
+        // Chips must be fully conserved
+        let total: u32 = service
+            .get_chips(Request::new(GetChipsRequest {}))
+            .await?
+            .into_inner()
+            .chips
+            .iter()
+            .map(|p| p.chips)
+            .sum();
+        assert_eq!(total, 2_000, "chips must be conserved through a full hand");
+
+        Ok(())
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /// Seats two players so tests that need a startable hand can call `start_hand`.
@@ -1006,5 +1284,73 @@ mod tests {
             }))
             .await?;
         Ok(())
+    }
+
+    /// Folds on behalf of whoever is next to act.
+    async fn fold_next_to_act(service: &DealerService) -> Result<(), Box<dyn std::error::Error>> {
+        let seat = {
+            let guard = service.lock().expect("lock");
+            guard.dealer.next_to_act()
+        };
+        service
+            .act(Request::new(ActRequest {
+                action: Some(PlayerAction {
+                    seat: u32::from(seat),
+                    action_type: ActionType::Fold as i32,
+                    amount: 0,
+                }),
+            }))
+            .await?;
+        Ok(())
+    }
+
+    /// Completes preflop betting for a two-player hand: UTG calls, BB checks.
+    async fn complete_preflop_betting(
+        service: &DealerService,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        act_next(service, ActionType::Call).await?;
+        act_next(service, ActionType::Check).await?;
+        Ok(())
+    }
+
+    /// Has every remaining active player check in turn until the betting round
+    /// is complete.
+    async fn check_all_active(service: &DealerService) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..DEFAULT_SEAT_COUNT {
+            let done = {
+                let guard = service.lock().expect("lock");
+                guard.dealer.table.is_betting_complete()
+            };
+            if done {
+                break;
+            }
+            act_next(service, ActionType::Check).await?;
+        }
+        Ok(())
+    }
+
+    /// Dispatches `action_type` for whoever is currently next to act.
+    async fn act_next(
+        service: &DealerService,
+        action_type: ActionType,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let seat = {
+            let guard = service.lock().expect("lock");
+            guard.dealer.next_to_act()
+        };
+        let response = service
+            .act(Request::new(ActRequest {
+                action: Some(PlayerAction {
+                    seat: u32::from(seat),
+                    action_type: action_type as i32,
+                    amount: 0,
+                }),
+            }))
+            .await?;
+        match response.into_inner().result {
+            Some(act_response::Result::ActionResult(_)) => Ok(()),
+            Some(act_response::Result::Error(e)) => Err(e.into()),
+            None => Err("empty act response".into()),
+        }
     }
 }

@@ -7,7 +7,13 @@
       "Bash(find /Users/gaoler/src/github.com/ImperialBower/pkdealer -name *.rs -path */OUT_DIR/*)",
       "Bash(ls /Users/gaoler/src/github.com/ImperialBower/pkdealer/target/debug/build/pkdealer_proto-*/out/)",
       "Bash(cargo build:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(ls:*)",
+      "Bash(grpcurl --version)",
+      "Bash(tmux -V)",
+      "Bash(chmod:*)",
+      "Bash(bash -n demo.sh)",
+      "Bash(cargo clippy:*)"
     ]
   }
 }
