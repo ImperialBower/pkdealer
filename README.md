@@ -312,44 +312,6 @@ Run `make help` to print a summary at any time.
 
 ---
 
-## Private Dependency Authentication
-
-`pkdealer_proto` depends on `pkcore`, which is hosted in a private GitHub repository
-(`ImperialBower/pkcore`). Cargo must be able to authenticate before resolving dependencies.
-
-### Local development
-
-Generate a [GitHub personal access token](https://github.com/settings/tokens) with `repo` (read)
-scope, then configure git:
-
-```sh
-git config --global \
-  url."https://x-access-token:<YOUR_TOKEN>@github.com/".insteadOf \
-  "https://github.com/"
-```
-
-### GitHub Actions
-
-Add the token as a repository secret named `PKCORE_READ_TOKEN`, then insert the following step
-**immediately after `actions/checkout`** in every job that runs Cargo:
-
-```yaml
-- uses: actions/checkout@v4
-
-- name: Auth for private git dependencies
-  run: |
-    git config --global \
-      url."https://x-access-token:${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf \
-      "https://github.com/"
-
-- uses: dtolnay/rust-toolchain@stable
-```
-
-This must appear in every job that fetches dependencies (`build`, `test`, `clippy`, `cargo-deny`,
-`cargo-udeps`, etc.).
-
----
-
 ## Contributing
 
 Please read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) before contributing. All contributions are

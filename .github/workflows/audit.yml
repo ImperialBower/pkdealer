@@ -13,8 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Configure git credentials for private dependencies
-        run: git config --global url."https://${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: taiki-e/install-action@cargo-deny
       - name: Scan for vulnerabilities
         run: cargo deny check advisories

@@ -28,8 +28,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - name: Configure git credentials for private dependencies
-        run: git config --global url."https://${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{matrix.rust}}
@@ -71,8 +69,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - name: Configure git credentials for private dependencies
-        run: git config --global url."https://${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-src
@@ -103,8 +99,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - name: Configure git credentials for private dependencies
-        run: git config --global url."https://${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rust-src
@@ -128,8 +122,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - name: Configure git credentials for private dependencies
-        run: git config --global url."https://${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, rust-src
@@ -143,8 +135,6 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - name: Configure git credentials for private dependencies
-        run: git config --global url."https://${{ secrets.PKCORE_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-docs, rust-src
