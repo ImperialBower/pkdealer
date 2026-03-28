@@ -12,7 +12,11 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
-ignore = []
+ignore = [
+    # atomic-polyfill is unmaintained (RUSTSEC-2023-0089) but there is no safe
+    # upgrade path — it is a transitive dependency of pkcore via postcard/heapless.
+    { id = "RUSTSEC-2023-0089", reason = "transitive dep of pkcore; no safe upgrade available upstream" },
+]
 
 [licenses]
 # List of explicitly allowed licenses
@@ -128,4 +132,4 @@ unknown-git = "warn"
 # will be allowed.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # List of URLs for allowed Git repositories
-allow-git = ["https://github.com/ImperialBower/pkcore"]
+allow-git = []

@@ -1,11 +1,11 @@
 [package]
 name = "pkdealer_proto"
-version = "0.1.0"
-edition = "2024"
-authors = ["electronicpanopticon <gaoler@electronicpanopticon.com>"]
-license = "GPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Shared protobuf definitions and generated Rust types for pkdealer"
-repository = "https://github.com/ImperialBower/pkgrpc"
 keywords = ["poker", "grpc", "protobuf", "proto"]
 categories = ["games"]
 rust-version = "1.85.0"
@@ -16,7 +16,6 @@ path = "src/lib.rs"
 
 [dependencies]
 indexmap = { version = "=2.12.1", features = ["rayon"] }
-pkcore = "0.0.28"
 prost = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 tonic = "0.12"
