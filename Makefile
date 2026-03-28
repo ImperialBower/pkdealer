@@ -2,7 +2,7 @@
 #
 # Common commands for development, testing, and CI emulation
 
-.PHONY: help build test check fmt clippy doc clean all ci-local install-tools
+.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve demo
 
 # Default target
 default: ayce
@@ -31,9 +31,23 @@ help:
 	@echo "  make test-service   - Test pkdealer_service"
 	@echo "  make test-client    - Test pkdealer_client"
 	@echo ""
+	@echo "Service:"
+	@echo "  make serve          - Build and start the dealer service"
+	@echo "  make demo           - Run the 9-player client demo (service must be running)"
+	@echo ""
 	@echo "Tools:"
 	@echo "  make install-tools  - Install cargo-deny, cargo-udeps, etc."
 	@echo ""
+
+# Run the 9-player client demo (requires the service to already be running)
+demo:
+	@echo "Running pkdealer client demo..."
+	cargo run --example demo -p pkdealer_client
+
+# Start the dealer service
+serve:
+	@echo "Starting pkdealer_service on 127.0.0.1:50051..."
+	cargo run --bin pkdealer_service -p pkdealer_service
 
 # Build all crates
 build:

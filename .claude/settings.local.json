@@ -13,7 +13,8 @@
       "Bash(tmux -V)",
       "Bash(chmod:*)",
       "Bash(bash -n demo.sh)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "Bash(grep -r \"illegal\\\\|Illegal\\\\|InvalidAction\\\\|invalid action\\\\|cannot\\\\|not allowed\" ~/.cargo/registry/src/*/pkcore-*/src/)"
     ]
   }
 }
