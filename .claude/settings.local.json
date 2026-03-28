@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo tree:*)",
+      "Bash(cargo doc:*)",
+      "Bash(ls ~/.cargo/registry/src/*/pkcore-0.0.28/src/)",
+      "Bash(find /Users/gaoler/src/github.com/ImperialBower/pkdealer -name *.rs -path */OUT_DIR/*)",
+      "Bash(ls /Users/gaoler/src/github.com/ImperialBower/pkdealer/target/debug/build/pkdealer_proto-*/out/)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)"
+    ]
+  }
+}
