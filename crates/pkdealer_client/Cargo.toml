@@ -15,7 +15,7 @@ name = "pkdealer_client"
 path = "src/main.rs"
 
 [dependencies]
-pkdealer_proto = { version = "0.1.0", path = "../pkdealer_proto" }
+pkdealer_proto = { version = "0.1.1", path = "../pkdealer_proto" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tonic = { version = "0.12", features = ["transport"] }
 
