@@ -1687,4 +1687,178 @@ mod tests {
 
         Ok(())
     }
+
+    // ── two-player interaction ────────────────────────────────────────────────
+
+    /// Simulates two independent clients: each only knows its own seat and token.
+    ///
+    /// This mirrors real usage — a deployed client stores only the token issued
+    /// to it and cannot act on behalf of any other seat.
+    #[tokio::test]
+    async fn dealer_service_two_players_each_know_only_own_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+
+        // Player A seating — stores only its own token.
+        let r_a = service
+            .seat_player(Request::new(SeatPlayerRequest {
+                name: "Alice".to_owned(),
+                chips: 1_000,
+            }))
+            .await?
+            .into_inner();
+        let (seat_a, token_a) = match r_a.result {
+            Some(seat_player_response::Result::SeatNumber(s)) => (s as u8, r_a.player_token),
+            other => panic!("Alice seat failed: {other:?}"),
+        };
+        let map_a: HashMap<u8, String> = HashMap::from([(seat_a, token_a.clone())]);
+
+        // Player B seating — stores only its own token.
+        let r_b = service
+            .seat_player(Request::new(SeatPlayerRequest {
+                name: "Bob".to_owned(),
+                chips: 1_000,
+            }))
+            .await?
+            .into_inner();
+        let (seat_b, token_b) = match r_b.result {
+            Some(seat_player_response::Result::SeatNumber(s)) => (s as u8, r_b.player_token),
+            other => panic!("Bob seat failed: {other:?}"),
+        };
+        let map_b: HashMap<u8, String> = HashMap::from([(seat_b, token_b)]);
+
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        // Preflop: two actions — each player dispatches only when it is their turn.
+        for _ in 0..2 {
+            let next_seat = {
+                let guard = service.lock().expect("lock");
+                guard.dealer.next_to_act()
+            };
+            let (tokens, action) = if next_seat == seat_a {
+                (&map_a, ActionType::Call)
+            } else {
+                (&map_b, ActionType::Check)
+            };
+            act_next(&service, action, tokens).await?;
+        }
+
+        // Each player can see their own hole cards via their token.
+        let mut req_a = Request::new(GetStatusRequest {});
+        req_a.metadata_mut().insert(
+            PLAYER_TOKEN_METADATA_KEY,
+            token_a.parse().expect("valid token"),
+        );
+        let status_a = service
+            .get_status(req_a)
+            .await?
+            .into_inner()
+            .status
+            .expect("status");
+        let seat_info_a = status_a
+            .seats
+            .iter()
+            .find(|s| s.seat_number == u32::from(seat_a))
+            .expect("Alice's seat in status");
+        assert!(
+            !seat_info_a.cards.is_empty(),
+            "Alice should see her own hole cards"
+        );
+        let seat_info_b_from_a = status_a
+            .seats
+            .iter()
+            .find(|s| s.seat_number == u32::from(seat_b))
+            .expect("Bob's seat in Alice's status");
+        assert!(
+            seat_info_b_from_a.cards.is_empty(),
+            "Alice must not see Bob's hole cards"
+        );
+
+        Ok(())
+    }
+
+    /// A player whose token is valid for their seat cannot act when it is not
+    /// their turn.  Auth passes; the game engine rejects the out-of-turn action.
+    ///
+    /// This verifies the distinction between auth errors (`PermissionDenied` gRPC
+    /// status) and game-state errors (Error variant in the result oneof).
+    #[tokio::test]
+    async fn dealer_service_act_for_own_seat_when_not_your_turn_is_game_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let next_seat = {
+            let guard = service.lock().expect("lock");
+            guard.dealer.next_to_act()
+        };
+
+        // Find the player who is NOT next to act.
+        let &idle_seat = tokens.keys().find(|&&s| s != next_seat).expect("idle seat");
+
+        let resp = service
+            .act(act_request_with_token(idle_seat, ActionType::Fold, &tokens))
+            .await?;
+
+        // The request was authenticated (token matches seat), but the game engine
+        // must reject the out-of-turn action — this is a domain error, not an
+        // auth error, so it arrives as Ok(Response { result: Error(...) }).
+        assert!(
+            matches!(
+                resp.into_inner().result,
+                Some(act_response::Result::Error(_))
+            ),
+            "out-of-turn action must produce a game error, not a gRPC status error"
+        );
+        Ok(())
+    }
+
+    /// After `remove_player`, the seat's token is revoked.  Any subsequent `Act`
+    /// with that token must return `PermissionDenied` even before a hand starts.
+    #[tokio::test]
+    async fn dealer_service_token_revoked_after_remove_player()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+
+        let r = service
+            .seat_player_at(Request::new(SeatPlayerAtRequest {
+                seat: 4,
+                name: "Dave".to_owned(),
+                chips: 1_000,
+            }))
+            .await?
+            .into_inner();
+        let old_token = r.player_token;
+        assert!(!old_token.is_empty());
+
+        service
+            .remove_player(Request::new(RemovePlayerRequest { seat: 4 }))
+            .await?;
+
+        // Auth runs before the game-engine check, so PermissionDenied is returned
+        // immediately even though no hand is in progress.
+        let mut req = Request::new(ActRequest {
+            action: Some(PlayerAction {
+                seat: 4,
+                action_type: ActionType::Fold as i32,
+                amount: 0,
+            }),
+        });
+        req.metadata_mut()
+            .insert(PLAYER_TOKEN_METADATA_KEY, old_token.parse().expect("valid"));
+
+        let result = service.act(req).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::PermissionDenied,
+            "revoked token must not be accepted"
+        );
+        Ok(())
+    }
 }

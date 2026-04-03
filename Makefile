@@ -52,6 +52,8 @@ serve:
 # Build all crates
 build:
 	@echo "Building workspace..."
+	cargo clean
+	cargo build --workspace --all-features
 
 # Build in release mode
 build-release:
