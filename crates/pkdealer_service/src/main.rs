@@ -14,11 +14,25 @@
 //!
 //! ## Configuration
 //!
-//! | Variable          | Default           | Purpose                    |
-//! |-------------------|-------------------|----------------------------|
-//! | `PKDEALER_ADDR`   | 127.0.0.1:50051   | gRPC listen address        |
+//! | Variable                    | Default           | Purpose                              |
+//! |-----------------------------|-------------------|--------------------------------------|
+//! | `PKDEALER_ADDR`             | 127.0.0.1:50051   | gRPC listen address                  |
+//! | `PKDEALER_SPECTATOR_TOKEN`  | `spectator`       | Shared secret for full-table card visibility |
+//!
+//! ## Authentication
+//!
+//! Players receive a UUID token in the `player_token` field of `SeatPlayerResponse`
+//! or `SeatPlayerAtResponse`.  They must include it in every mutating RPC as the
+//! `x-player-token` gRPC metadata value.
+//!
+//! - `Act` — requires a valid token matching the acting seat; returns
+//!   `PERMISSION_DENIED` otherwise.
+//! - `GetStatus` — with a valid player token returns that player's hole cards only;
+//!   with the spectator token returns all hole cards; with no token returns no hole
+//!   cards.
 
 use std::{
+    collections::HashMap,
     env,
     net::SocketAddr,
     process,
@@ -45,7 +59,8 @@ use pkdealer_proto::dealer::{
     seat_player_response, start_hand_response,
 };
 use tokio::sync::broadcast;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{Request, Response, Status, metadata::MetadataMap, transport::Server};
+use uuid::Uuid;
 
 const DEFAULT_SERVICE_ADDR: &str = "127.0.0.1:50051";
 const DEFAULT_CHIPS: usize = 10_000;
@@ -53,10 +68,27 @@ const DEFAULT_SMALL_BLIND: usize = 50;
 const DEFAULT_BIG_BLIND: usize = 100;
 const DEFAULT_SEAT_COUNT: u8 = 9;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
+/// gRPC metadata key carrying the player's UUID auth token.
+const PLAYER_TOKEN_METADATA_KEY: &str = "x-player-token";
+/// Default spectator token used when `PKDEALER_SPECTATOR_TOKEN` is not set.
+const DEFAULT_SPECTATOR_TOKEN: &str = "spectator";
+
+// ── CardVisibility ────────────────────────────────────────────────────────────
+
+/// Controls which hole cards appear in a [`TableStatus`] snapshot.
+#[derive(Clone, Copy)]
+enum CardVisibility {
+    /// No hole cards are revealed — used for broadcast events and unauthenticated queries.
+    Hidden,
+    /// Only the given seat's hole cards are revealed — used for authenticated player queries.
+    Player(u8),
+    /// All hole cards are revealed — used for spectator / admin access.
+    Spectator,
+}
 
 // ── TableState ───────────────────────────────────────────────────────────────
 
-/// Wraps [`Dealer`] for use behind an `Arc<Mutex<_>>`.
+/// Wraps [`Dealer`] and the player auth token maps for use behind an `Arc<Mutex<_>>`.
 ///
 /// # Safety
 ///
@@ -67,6 +99,10 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// `unsafe impl Send` sound.
 struct TableState {
     dealer: Dealer,
+    /// Maps player UUID tokens → seat numbers.
+    token_to_seat: HashMap<Uuid, u8>,
+    /// Maps seat numbers → player UUID tokens (for O(1) cleanup on `remove_player`).
+    seat_to_token: HashMap<u8, Uuid>,
 }
 
 // SAFETY: see doc-comment above.
@@ -88,13 +124,16 @@ impl DealerService {
             ForcedBets::new(DEFAULT_SMALL_BLIND, DEFAULT_BIG_BLIND),
             DEFAULT_SEAT_COUNT,
         );
-        let state = Arc::new(Mutex::new(TableState { dealer }));
+        let state = Arc::new(Mutex::new(TableState {
+            dealer,
+            token_to_seat: HashMap::new(),
+            seat_to_token: HashMap::new(),
+        }));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         DealerService { state, event_tx }
     }
 
-    /// Acquires the state lock and returns an error `Status` if the lock is
-    /// poisoned.
+    /// Acquires the state lock and returns an error `Status` if the lock is poisoned.
     // `tonic::Status` is 176 bytes, but it is the mandatory error type for all
     // gRPC handlers in this crate.  Boxing it here would just push the
     // unboxing cost to every call site for no real benefit.
@@ -106,7 +145,12 @@ impl DealerService {
     }
 
     /// Builds a [`TableStatus`] snapshot from the current dealer state.
-    fn build_table_status(dealer: &Dealer) -> TableStatus {
+    ///
+    /// The `visibility` parameter controls which hole cards are included:
+    /// - [`CardVisibility::Hidden`] — `cards` is empty for every seat.
+    /// - [`CardVisibility::Player`]`(seat)` — `cards` is populated only for `seat`.
+    /// - [`CardVisibility::Spectator`] — `cards` is populated for every seat.
+    fn build_table_status(dealer: &Dealer, visibility: CardVisibility) -> TableStatus {
         let table = &dealer.table;
         let mut seats = Vec::new();
 
@@ -114,11 +158,16 @@ impl DealerService {
             if let Some(seat) = table.seats.get_seat(i)
                 && !seat.is_empty()
             {
+                let cards = match &visibility {
+                    CardVisibility::Spectator => seat.cards.to_string(),
+                    CardVisibility::Player(s) if *s == i => seat.cards.to_string(),
+                    _ => String::new(),
+                };
                 seats.push(SeatInfo {
                     seat_number: u32::from(i),
                     player_name: seat.player.handle.clone(),
                     chips: seat.player.chips.count() as u32,
-                    cards: seat.cards.to_string(),
+                    cards,
                     state: format!("{:?}", seat.player.state.get()),
                 });
             }
@@ -172,6 +221,38 @@ impl DealerService {
         };
         let _ = self.event_tx.send(event);
     }
+
+    /// Returns the spectator token, preferring the `PKDEALER_SPECTATOR_TOKEN`
+    /// environment variable and falling back to [`DEFAULT_SPECTATOR_TOKEN`].
+    fn spectator_token() -> String {
+        env::var("PKDEALER_SPECTATOR_TOKEN").unwrap_or_else(|_| DEFAULT_SPECTATOR_TOKEN.to_owned())
+    }
+
+    /// Determines [`CardVisibility`] from the `x-player-token` gRPC metadata.
+    ///
+    /// - Spectator token → [`CardVisibility::Spectator`]
+    /// - Valid player UUID → [`CardVisibility::Player`]`(seat)`
+    /// - Missing or unrecognized token → [`CardVisibility::Hidden`]
+    fn card_visibility_from_metadata(metadata: &MetadataMap, state: &TableState) -> CardVisibility {
+        let Some(token_str) = metadata
+            .get(PLAYER_TOKEN_METADATA_KEY)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return CardVisibility::Hidden;
+        };
+
+        if token_str == Self::spectator_token() {
+            return CardVisibility::Spectator;
+        }
+
+        if let Ok(uuid) = token_str.parse::<Uuid>()
+            && let Some(&seat) = state.token_to_seat.get(&uuid)
+        {
+            return CardVisibility::Player(seat);
+        }
+
+        CardVisibility::Hidden
+    }
 }
 
 // ── gRPC trait implementation ─────────────────────────────────────────────────
@@ -205,11 +286,14 @@ impl DealerServiceTrait for DealerService {
         };
         let player = Player::new_with_chips(req.name, chips);
 
-        let (response_result, maybe_event) = {
-            let guard = self.lock()?;
+        let (response_result, player_token, maybe_event) = {
+            let mut guard = self.lock()?;
             match guard.dealer.seat_player(player) {
                 Ok(seat_num) => {
-                    let status = Self::build_table_status(&guard.dealer);
+                    let token = Uuid::new_v4();
+                    guard.token_to_seat.insert(token, seat_num);
+                    guard.seat_to_token.insert(seat_num, token);
+                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
                     let event = (
                         EventType::PlayerSeated,
                         format!("Player seated at seat {seat_num}"),
@@ -217,11 +301,13 @@ impl DealerServiceTrait for DealerService {
                     );
                     (
                         seat_player_response::Result::SeatNumber(u32::from(seat_num)),
+                        token.to_string(),
                         Some(event),
                     )
                 }
                 Err(e) => (
                     seat_player_response::Result::Error(dealer_error_to_string(&e)),
+                    String::new(),
                     None,
                 ),
             }
@@ -233,6 +319,7 @@ impl DealerServiceTrait for DealerService {
 
         Ok(Response::new(SeatPlayerResponse {
             result: Some(response_result),
+            player_token,
         }))
     }
 
@@ -250,20 +337,28 @@ impl DealerServiceTrait for DealerService {
         let seat_number = req.seat as u8;
         let player = Player::new_with_chips(req.name, chips);
 
-        let (response_result, maybe_event) = {
-            let guard = self.lock()?;
+        let (response_result, player_token, maybe_event) = {
+            let mut guard = self.lock()?;
             match guard.dealer.seat_player_at(player, seat_number) {
                 Ok(()) => {
-                    let status = Self::build_table_status(&guard.dealer);
+                    let token = Uuid::new_v4();
+                    guard.token_to_seat.insert(token, seat_number);
+                    guard.seat_to_token.insert(seat_number, token);
+                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
                     let event = (
                         EventType::PlayerSeated,
                         format!("Player seated at seat {seat_number}"),
                         status,
                     );
-                    (seat_player_at_response::Result::Success(true), Some(event))
+                    (
+                        seat_player_at_response::Result::Success(true),
+                        token.to_string(),
+                        Some(event),
+                    )
                 }
                 Err(e) => (
                     seat_player_at_response::Result::Error(dealer_error_to_string(&e)),
+                    String::new(),
                     None,
                 ),
             }
@@ -275,6 +370,7 @@ impl DealerServiceTrait for DealerService {
 
         Ok(Response::new(SeatPlayerAtResponse {
             result: Some(response_result),
+            player_token,
         }))
     }
 
@@ -286,7 +382,7 @@ impl DealerServiceTrait for DealerService {
         let seat = request.into_inner().seat as u8;
 
         let (response_result, maybe_event) = {
-            let guard = self.lock()?;
+            let mut guard = self.lock()?;
             // Guard against removing from an already-empty seat, since the
             // library does not return an error in that case.
             let is_empty = guard
@@ -303,8 +399,12 @@ impl DealerServiceTrait for DealerService {
             }
             match guard.dealer.remove_player(seat) {
                 Ok(player) => {
+                    // Clean up the auth token for the removed seat.
+                    if let Some(uuid) = guard.seat_to_token.remove(&seat) {
+                        guard.token_to_seat.remove(&uuid);
+                    }
                     let name = player.handle.clone();
-                    let status = Self::build_table_status(&guard.dealer);
+                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
                     let event = (
                         EventType::PlayerRemoved,
                         format!("Player '{name}' removed from seat {seat}"),
@@ -341,7 +441,7 @@ impl DealerServiceTrait for DealerService {
             let mut guard = self.lock()?;
             match guard.dealer.start_hand() {
                 Ok(()) => {
-                    let status = Self::build_table_status(&guard.dealer);
+                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
                     let event = (
                         EventType::HandStarted,
                         "Hand started".to_owned(),
@@ -383,7 +483,7 @@ impl DealerServiceTrait for DealerService {
                         next_to_act,
                         pot,
                     };
-                    let status = Self::build_table_status(&guard.dealer);
+                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
                     let event = (
                         EventType::StreetAdvanced,
                         format!("Street advanced. Board: {board}"),
@@ -424,7 +524,7 @@ impl DealerServiceTrait for DealerService {
                         result_text: result_text.clone(),
                         final_chips,
                     };
-                    let status = Self::build_table_status(&guard.dealer);
+                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
                     let event = (
                         EventType::HandEnded,
                         format!("Hand ended. {result_text}"),
@@ -454,6 +554,13 @@ impl DealerServiceTrait for DealerService {
     // ── Player action ─────────────────────────────────────────────────────────
 
     async fn act(&self, request: Request<ActRequest>) -> Result<Response<ActResponse>, Status> {
+        // Extract the player token from metadata before consuming the request.
+        let token_str: Option<String> = request
+            .metadata()
+            .get(PLAYER_TOKEN_METADATA_KEY)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+
         let req = request.into_inner();
         let proto_action = req
             .action
@@ -468,6 +575,29 @@ impl DealerServiceTrait for DealerService {
                 proto_action.action_type
             ))
         })?;
+
+        // Verify the token authorizes this seat before acquiring the broader lock.
+        {
+            let guard = self.lock()?;
+            match token_str.as_deref().and_then(|t| t.parse::<Uuid>().ok()) {
+                Some(uuid) => match guard.token_to_seat.get(&uuid) {
+                    Some(&token_seat) if token_seat == seat => {} // authorized
+                    Some(&token_seat) => {
+                        return Err(Status::permission_denied(format!(
+                            "token belongs to seat {token_seat}, not seat {seat}"
+                        )));
+                    }
+                    None => {
+                        return Err(Status::permission_denied("unknown player token"));
+                    }
+                },
+                None => {
+                    return Err(Status::permission_denied(
+                        "missing or invalid x-player-token metadata",
+                    ));
+                }
+            }
+        }
 
         let dealer_action = match action_type {
             ActionType::Bet => DealerAction::Bet { seat, amount },
@@ -488,7 +618,7 @@ impl DealerServiceTrait for DealerService {
                         pot: table.pot.count() as u32,
                         hand_complete: table.is_game_over(),
                     };
-                    let status = Self::build_table_status(&guard.dealer);
+                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
                     let event = (
                         EventType::PlayerAction,
                         format!("Seat {seat}: {action_type:?}"),
@@ -519,10 +649,11 @@ impl DealerServiceTrait for DealerService {
 
     async fn get_status(
         &self,
-        _request: Request<GetStatusRequest>,
+        request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
         let guard = self.lock()?;
-        let status = Self::build_table_status(&guard.dealer);
+        let visibility = Self::card_visibility_from_metadata(request.metadata(), &guard);
+        let status = Self::build_table_status(&guard.dealer, visibility);
         Ok(Response::new(GetStatusResponse {
             status: Some(status),
         }))
@@ -692,6 +823,117 @@ mod tests {
         DealerService::new()
     }
 
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Seats two players and returns a `seat → token` map for use in `act` calls.
+    async fn seat_two_players(
+        service: &DealerService,
+    ) -> Result<HashMap<u8, String>, Box<dyn std::error::Error>> {
+        let mut tokens: HashMap<u8, String> = HashMap::new();
+
+        let r1 = service
+            .seat_player(Request::new(SeatPlayerRequest {
+                name: "Alice".to_owned(),
+                chips: 1_000,
+            }))
+            .await?
+            .into_inner();
+        if let Some(seat_player_response::Result::SeatNumber(seat)) = r1.result {
+            tokens.insert(seat as u8, r1.player_token);
+        }
+
+        let r2 = service
+            .seat_player(Request::new(SeatPlayerRequest {
+                name: "Bob".to_owned(),
+                chips: 1_000,
+            }))
+            .await?
+            .into_inner();
+        if let Some(seat_player_response::Result::SeatNumber(seat)) = r2.result {
+            tokens.insert(seat as u8, r2.player_token);
+        }
+
+        Ok(tokens)
+    }
+
+    /// Builds an `ActRequest` with the `x-player-token` metadata set.
+    fn act_request_with_token(
+        seat: u8,
+        action_type: ActionType,
+        tokens: &HashMap<u8, String>,
+    ) -> Request<ActRequest> {
+        let token = tokens.get(&seat).expect("token for seat");
+        let mut req = Request::new(ActRequest {
+            action: Some(PlayerAction {
+                seat: u32::from(seat),
+                action_type: action_type as i32,
+                amount: 0,
+            }),
+        });
+        req.metadata_mut().insert(
+            PLAYER_TOKEN_METADATA_KEY,
+            token.parse().expect("valid token"),
+        );
+        req
+    }
+
+    /// Dispatches `action_type` for whoever is currently next to act.
+    async fn act_next(
+        service: &DealerService,
+        action_type: ActionType,
+        tokens: &HashMap<u8, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let seat = {
+            let guard = service.lock().expect("lock");
+            guard.dealer.next_to_act()
+        };
+        let response = service
+            .act(act_request_with_token(seat, action_type, tokens))
+            .await?;
+        match response.into_inner().result {
+            Some(act_response::Result::ActionResult(_)) => Ok(()),
+            Some(act_response::Result::Error(e)) => Err(e.into()),
+            None => Err("empty act response".into()),
+        }
+    }
+
+    /// Folds on behalf of whoever is next to act.
+    async fn fold_next_to_act(
+        service: &DealerService,
+        tokens: &HashMap<u8, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        act_next(service, ActionType::Fold, tokens).await
+    }
+
+    /// Completes preflop betting for a two-player hand: UTG calls, BB checks.
+    async fn complete_preflop_betting(
+        service: &DealerService,
+        tokens: &HashMap<u8, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        act_next(service, ActionType::Call, tokens).await?;
+        act_next(service, ActionType::Check, tokens).await?;
+        Ok(())
+    }
+
+    /// Has every remaining active player check in turn until the betting round
+    /// is complete.
+    async fn check_all_active(
+        service: &DealerService,
+        tokens: &HashMap<u8, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..DEFAULT_SEAT_COUNT {
+            let done = {
+                let guard = service.lock().expect("lock");
+                guard.dealer.table.is_betting_complete()
+            };
+            if done {
+                break;
+            }
+            act_next(service, ActionType::Check, tokens).await?;
+        }
+        Ok(())
+    }
+
     // ── ping ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -725,13 +967,16 @@ mod tests {
             name: "Alice".to_owned(),
             chips: 1_000,
         });
-        let response = service.seat_player(request).await?;
-        match response.into_inner().result {
+        let inner = service.seat_player(request).await?.into_inner();
+        match inner.result {
             Some(seat_player_response::Result::SeatNumber(n)) => {
                 assert!(n < u32::from(DEFAULT_SEAT_COUNT));
             }
             other => panic!("unexpected result: {other:?}"),
         }
+        // A UUID token must be issued on success.
+        assert!(!inner.player_token.is_empty());
+        assert!(inner.player_token.parse::<Uuid>().is_ok());
         Ok(())
     }
 
@@ -742,16 +987,18 @@ mod tests {
             name: "Bob".to_owned(),
             chips: 0, // should default to DEFAULT_CHIPS
         });
-        let response = service.seat_player(request).await?;
+        let inner = service.seat_player(request).await?.into_inner();
         assert!(matches!(
-            response.into_inner().result,
+            inner.result,
             Some(seat_player_response::Result::SeatNumber(_))
         ));
+        assert!(!inner.player_token.is_empty());
         Ok(())
     }
 
     #[tokio::test]
-    async fn dealer_service_seat_player_table_full() -> Result<(), Box<dyn std::error::Error>> {
+    async fn dealer_service_seat_player_error_returns_empty_token()
+    -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
         // Fill all 9 seats
         for i in 0..DEFAULT_SEAT_COUNT {
@@ -761,16 +1008,19 @@ mod tests {
             });
             service.seat_player(req).await?;
         }
-        // One more should fail
-        let req = Request::new(SeatPlayerRequest {
-            name: "Extra".to_owned(),
-            chips: 1_000,
-        });
-        let response = service.seat_player(req).await?;
+        // One more should fail with an empty token.
+        let inner = service
+            .seat_player(Request::new(SeatPlayerRequest {
+                name: "Extra".to_owned(),
+                chips: 1_000,
+            }))
+            .await?
+            .into_inner();
         assert!(matches!(
-            response.into_inner().result,
+            inner.result,
             Some(seat_player_response::Result::Error(_))
         ));
+        assert!(inner.player_token.is_empty());
         Ok(())
     }
 
@@ -784,11 +1034,13 @@ mod tests {
             name: "Carol".to_owned(),
             chips: 2_000,
         });
-        let response = service.seat_player_at(request).await?;
+        let inner = service.seat_player_at(request).await?.into_inner();
         assert!(matches!(
-            response.into_inner().result,
+            inner.result,
             Some(seat_player_at_response::Result::Success(true))
         ));
+        assert!(!inner.player_token.is_empty());
+        assert!(inner.player_token.parse::<Uuid>().is_ok());
         Ok(())
     }
 
@@ -797,7 +1049,6 @@ mod tests {
     #[tokio::test]
     async fn dealer_service_remove_player_happy_path() -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
-        // Seat then remove
         service
             .seat_player_at(Request::new(SeatPlayerAtRequest {
                 seat: 0,
@@ -814,6 +1065,9 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+        // Token must be cleaned up: the seat no longer holds a token.
+        let guard = service.lock().expect("lock");
+        assert!(!guard.seat_to_token.contains_key(&0u8));
         Ok(())
     }
 
@@ -830,7 +1084,7 @@ mod tests {
         Ok(())
     }
 
-    // ── get_status ────────────────────────────────────────────────────────────
+    // ── get_status card visibility ────────────────────────────────────────────
 
     #[tokio::test]
     async fn dealer_service_get_status_empty_table() -> Result<(), Box<dyn std::error::Error>> {
@@ -847,13 +1101,110 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn dealer_service_get_status_no_token_hides_all_cards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        // No token — cards must be hidden.
+        let status = service
+            .get_status(Request::new(GetStatusRequest {}))
+            .await?
+            .into_inner()
+            .status
+            .expect("status present");
+        for seat in &status.seats {
+            assert!(
+                seat.cards.is_empty(),
+                "seat {} cards should be hidden without a token",
+                seat.seat_number
+            );
+        }
+        drop(tokens);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dealer_service_get_status_player_token_shows_own_cards_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        // Use the first seated player's token.
+        let (&my_seat, my_token) = tokens.iter().next().expect("at least one token");
+
+        let mut req = Request::new(GetStatusRequest {});
+        req.metadata_mut().insert(
+            PLAYER_TOKEN_METADATA_KEY,
+            my_token.parse().expect("valid token"),
+        );
+        let status = service
+            .get_status(req)
+            .await?
+            .into_inner()
+            .status
+            .expect("status present");
+
+        for seat in &status.seats {
+            if seat.seat_number == u32::from(my_seat) {
+                assert!(
+                    !seat.cards.is_empty(),
+                    "own cards should be visible with player token"
+                );
+            } else {
+                assert!(
+                    seat.cards.is_empty(),
+                    "opponent's cards must be hidden with player token"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dealer_service_get_status_spectator_token_shows_all_cards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let spectator = DEFAULT_SPECTATOR_TOKEN;
+        let mut req = Request::new(GetStatusRequest {});
+        req.metadata_mut()
+            .insert(PLAYER_TOKEN_METADATA_KEY, spectator.parse().expect("valid"));
+        let status = service
+            .get_status(req)
+            .await?
+            .into_inner()
+            .status
+            .expect("status present");
+
+        for seat in &status.seats {
+            assert!(
+                !seat.cards.is_empty(),
+                "spectator should see all cards, seat {} was empty",
+                seat.seat_number
+            );
+        }
+        drop(tokens);
+        Ok(())
+    }
+
     // ── start_hand ────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn dealer_service_start_hand_not_enough_players() -> Result<(), Box<dyn std::error::Error>>
     {
         let service = make_service();
-        // Only one player — start_hand should fail
         service
             .seat_player(Request::new(SeatPlayerRequest {
                 name: "Solo".to_owned(),
@@ -880,6 +1231,11 @@ mod tests {
         match response.into_inner().result {
             Some(start_hand_response::Result::Status(status)) => {
                 assert!(status.hand_in_progress);
+                // Cards are hidden in the start_hand response; players use
+                // get_status with their token to see their own hole cards.
+                for seat in &status.seats {
+                    assert!(seat.cards.is_empty(), "start_hand response hides cards");
+                }
             }
             other => panic!("unexpected result: {other:?}"),
         }
@@ -891,7 +1247,7 @@ mod tests {
     #[tokio::test]
     async fn dealer_service_act_fold_happy_path() -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
-        seat_two_players(&service).await?;
+        let tokens = seat_two_players(&service).await?;
         service
             .start_hand(Request::new(StartHandRequest {}))
             .await?;
@@ -902,13 +1258,7 @@ mod tests {
         };
 
         let response = service
-            .act(Request::new(ActRequest {
-                action: Some(PlayerAction {
-                    seat: u32::from(next_seat),
-                    action_type: ActionType::Fold as i32,
-                    amount: 0,
-                }),
-            }))
+            .act(act_request_with_token(next_seat, ActionType::Fold, &tokens))
             .await?;
 
         assert!(matches!(
@@ -921,9 +1271,80 @@ mod tests {
     #[tokio::test]
     async fn dealer_service_act_missing_action_field() -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
+        // The missing-action check happens before the token check, so no token
+        // is needed here — we expect InvalidArgument regardless.
         let result = service.act(Request::new(ActRequest { action: None })).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dealer_service_act_no_token_returns_permission_denied()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let next_seat = {
+            let guard = service.lock().expect("lock");
+            guard.dealer.next_to_act()
+        };
+
+        // Act without any token — must be rejected.
+        let result = service
+            .act(Request::new(ActRequest {
+                action: Some(PlayerAction {
+                    seat: u32::from(next_seat),
+                    action_type: ActionType::Fold as i32,
+                    amount: 0,
+                }),
+            }))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
+        drop(tokens);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dealer_service_act_wrong_seat_token_returns_permission_denied()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let next_seat = {
+            let guard = service.lock().expect("lock");
+            guard.dealer.next_to_act()
+        };
+
+        // Find the token that belongs to the *other* seat.
+        let other_token = tokens
+            .iter()
+            .find(|&(&seat, _)| seat != next_seat)
+            .map(|(_, token)| token.clone())
+            .expect("other token");
+
+        let mut req = Request::new(ActRequest {
+            action: Some(PlayerAction {
+                seat: u32::from(next_seat),
+                action_type: ActionType::Fold as i32,
+                amount: 0,
+            }),
+        });
+        req.metadata_mut().insert(
+            PLAYER_TOKEN_METADATA_KEY,
+            other_token.parse().expect("valid"),
+        );
+
+        let result = service.act(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
         Ok(())
     }
 
@@ -1119,12 +1540,12 @@ mod tests {
     #[tokio::test]
     async fn dealer_service_end_hand_after_fold() -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
-        seat_two_players(&service).await?;
+        let tokens = seat_two_players(&service).await?;
         service
             .start_hand(Request::new(StartHandRequest {}))
             .await?;
 
-        fold_next_to_act(&service).await?;
+        fold_next_to_act(&service, &tokens).await?;
 
         let response = service.end_hand(Request::new(EndHandRequest {})).await?;
         assert!(
@@ -1140,12 +1561,12 @@ mod tests {
     #[tokio::test]
     async fn dealer_service_end_hand_chips_conserved() -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
-        seat_two_players(&service).await?;
+        let tokens = seat_two_players(&service).await?;
         service
             .start_hand(Request::new(StartHandRequest {}))
             .await?;
 
-        fold_next_to_act(&service).await?;
+        fold_next_to_act(&service, &tokens).await?;
         service.end_hand(Request::new(EndHandRequest {})).await?;
 
         let total: u32 = service
@@ -1187,11 +1608,11 @@ mod tests {
     #[tokio::test]
     async fn dealer_service_advance_street_to_flop() -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
-        seat_two_players(&service).await?;
+        let tokens = seat_two_players(&service).await?;
         service
             .start_hand(Request::new(StartHandRequest {}))
             .await?;
-        complete_preflop_betting(&service).await?;
+        complete_preflop_betting(&service, &tokens).await?;
 
         let response = service
             .advance_street(Request::new(AdvanceStreetRequest {}))
@@ -1217,31 +1638,31 @@ mod tests {
     async fn dealer_service_full_hand_call_check_all_streets_to_showdown()
     -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
-        seat_two_players(&service).await?;
+        let tokens = seat_two_players(&service).await?;
         service
             .start_hand(Request::new(StartHandRequest {}))
             .await?;
 
         // Preflop: UTG calls, BB checks
-        complete_preflop_betting(&service).await?;
+        complete_preflop_betting(&service, &tokens).await?;
 
         // Flop
         service
             .advance_street(Request::new(AdvanceStreetRequest {}))
             .await?;
-        check_all_active(&service).await?;
+        check_all_active(&service, &tokens).await?;
 
         // Turn
         service
             .advance_street(Request::new(AdvanceStreetRequest {}))
             .await?;
-        check_all_active(&service).await?;
+        check_all_active(&service, &tokens).await?;
 
         // River
         service
             .advance_street(Request::new(AdvanceStreetRequest {}))
             .await?;
-        check_all_active(&service).await?;
+        check_all_active(&service, &tokens).await?;
 
         // Showdown
         let response = service.end_hand(Request::new(EndHandRequest {})).await?;
@@ -1267,90 +1688,177 @@ mod tests {
         Ok(())
     }
 
-    // ── helpers ───────────────────────────────────────────────────────────────
+    // ── two-player interaction ────────────────────────────────────────────────
 
-    /// Seats two players so tests that need a startable hand can call `start_hand`.
-    async fn seat_two_players(service: &DealerService) -> Result<(), Box<dyn std::error::Error>> {
-        service
+    /// Simulates two independent clients: each only knows its own seat and token.
+    ///
+    /// This mirrors real usage — a deployed client stores only the token issued
+    /// to it and cannot act on behalf of any other seat.
+    #[tokio::test]
+    async fn dealer_service_two_players_each_know_only_own_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+
+        // Player A seating — stores only its own token.
+        let r_a = service
             .seat_player(Request::new(SeatPlayerRequest {
                 name: "Alice".to_owned(),
                 chips: 1_000,
             }))
-            .await?;
-        service
+            .await?
+            .into_inner();
+        let (seat_a, token_a) = match r_a.result {
+            Some(seat_player_response::Result::SeatNumber(s)) => (s as u8, r_a.player_token),
+            other => panic!("Alice seat failed: {other:?}"),
+        };
+        let map_a: HashMap<u8, String> = HashMap::from([(seat_a, token_a.clone())]);
+
+        // Player B seating — stores only its own token.
+        let r_b = service
             .seat_player(Request::new(SeatPlayerRequest {
                 name: "Bob".to_owned(),
                 chips: 1_000,
             }))
-            .await?;
-        Ok(())
-    }
-
-    /// Folds on behalf of whoever is next to act.
-    async fn fold_next_to_act(service: &DealerService) -> Result<(), Box<dyn std::error::Error>> {
-        let seat = {
-            let guard = service.lock().expect("lock");
-            guard.dealer.next_to_act()
+            .await?
+            .into_inner();
+        let (seat_b, token_b) = match r_b.result {
+            Some(seat_player_response::Result::SeatNumber(s)) => (s as u8, r_b.player_token),
+            other => panic!("Bob seat failed: {other:?}"),
         };
+        let map_b: HashMap<u8, String> = HashMap::from([(seat_b, token_b)]);
+
         service
-            .act(Request::new(ActRequest {
-                action: Some(PlayerAction {
-                    seat: u32::from(seat),
-                    action_type: ActionType::Fold as i32,
-                    amount: 0,
-                }),
-            }))
+            .start_hand(Request::new(StartHandRequest {}))
             .await?;
-        Ok(())
-    }
 
-    /// Completes preflop betting for a two-player hand: UTG calls, BB checks.
-    async fn complete_preflop_betting(
-        service: &DealerService,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        act_next(service, ActionType::Call).await?;
-        act_next(service, ActionType::Check).await?;
-        Ok(())
-    }
-
-    /// Has every remaining active player check in turn until the betting round
-    /// is complete.
-    async fn check_all_active(service: &DealerService) -> Result<(), Box<dyn std::error::Error>> {
-        for _ in 0..DEFAULT_SEAT_COUNT {
-            let done = {
+        // Preflop: two actions — each player dispatches only when it is their turn.
+        for _ in 0..2 {
+            let next_seat = {
                 let guard = service.lock().expect("lock");
-                guard.dealer.table.is_betting_complete()
+                guard.dealer.next_to_act()
             };
-            if done {
-                break;
-            }
-            act_next(service, ActionType::Check).await?;
+            let (tokens, action) = if next_seat == seat_a {
+                (&map_a, ActionType::Call)
+            } else {
+                (&map_b, ActionType::Check)
+            };
+            act_next(&service, action, tokens).await?;
         }
+
+        // Each player can see their own hole cards via their token.
+        let mut req_a = Request::new(GetStatusRequest {});
+        req_a.metadata_mut().insert(
+            PLAYER_TOKEN_METADATA_KEY,
+            token_a.parse().expect("valid token"),
+        );
+        let status_a = service
+            .get_status(req_a)
+            .await?
+            .into_inner()
+            .status
+            .expect("status");
+        let seat_info_a = status_a
+            .seats
+            .iter()
+            .find(|s| s.seat_number == u32::from(seat_a))
+            .expect("Alice's seat in status");
+        assert!(
+            !seat_info_a.cards.is_empty(),
+            "Alice should see her own hole cards"
+        );
+        let seat_info_b_from_a = status_a
+            .seats
+            .iter()
+            .find(|s| s.seat_number == u32::from(seat_b))
+            .expect("Bob's seat in Alice's status");
+        assert!(
+            seat_info_b_from_a.cards.is_empty(),
+            "Alice must not see Bob's hole cards"
+        );
+
         Ok(())
     }
 
-    /// Dispatches `action_type` for whoever is currently next to act.
-    async fn act_next(
-        service: &DealerService,
-        action_type: ActionType,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let seat = {
+    /// A player whose token is valid for their seat cannot act when it is not
+    /// their turn.  Auth passes; the game engine rejects the out-of-turn action.
+    ///
+    /// This verifies the distinction between auth errors (`PermissionDenied` gRPC
+    /// status) and game-state errors (Error variant in the result oneof).
+    #[tokio::test]
+    async fn dealer_service_act_for_own_seat_when_not_your_turn_is_game_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let next_seat = {
             let guard = service.lock().expect("lock");
             guard.dealer.next_to_act()
         };
-        let response = service
-            .act(Request::new(ActRequest {
-                action: Some(PlayerAction {
-                    seat: u32::from(seat),
-                    action_type: action_type as i32,
-                    amount: 0,
-                }),
-            }))
+
+        // Find the player who is NOT next to act.
+        let &idle_seat = tokens.keys().find(|&&s| s != next_seat).expect("idle seat");
+
+        let resp = service
+            .act(act_request_with_token(idle_seat, ActionType::Fold, &tokens))
             .await?;
-        match response.into_inner().result {
-            Some(act_response::Result::ActionResult(_)) => Ok(()),
-            Some(act_response::Result::Error(e)) => Err(e.into()),
-            None => Err("empty act response".into()),
-        }
+
+        // The request was authenticated (token matches seat), but the game engine
+        // must reject the out-of-turn action — this is a domain error, not an
+        // auth error, so it arrives as Ok(Response { result: Error(...) }).
+        assert!(
+            matches!(
+                resp.into_inner().result,
+                Some(act_response::Result::Error(_))
+            ),
+            "out-of-turn action must produce a game error, not a gRPC status error"
+        );
+        Ok(())
+    }
+
+    /// After `remove_player`, the seat's token is revoked.  Any subsequent `Act`
+    /// with that token must return `PermissionDenied` even before a hand starts.
+    #[tokio::test]
+    async fn dealer_service_token_revoked_after_remove_player()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+
+        let r = service
+            .seat_player_at(Request::new(SeatPlayerAtRequest {
+                seat: 4,
+                name: "Dave".to_owned(),
+                chips: 1_000,
+            }))
+            .await?
+            .into_inner();
+        let old_token = r.player_token;
+        assert!(!old_token.is_empty());
+
+        service
+            .remove_player(Request::new(RemovePlayerRequest { seat: 4 }))
+            .await?;
+
+        // Auth runs before the game-engine check, so PermissionDenied is returned
+        // immediately even though no hand is in progress.
+        let mut req = Request::new(ActRequest {
+            action: Some(PlayerAction {
+                seat: 4,
+                action_type: ActionType::Fold as i32,
+                amount: 0,
+            }),
+        });
+        req.metadata_mut()
+            .insert(PLAYER_TOKEN_METADATA_KEY, old_token.parse().expect("valid"));
+
+        let result = service.act(req).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().code(),
+            tonic::Code::PermissionDenied,
+            "revoked token must not be accepted"
+        );
+        Ok(())
     }
 }

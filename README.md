@@ -26,7 +26,6 @@ processing actions (bet / call / raise / fold), advancing streets, and resolving
 - [Make Targets Reference](#make-targets-reference)
 - [Configuration](#configuration)
 - [CI and Workflows](#ci-and-workflows)
-- [Private Dependency Authentication](#private-dependency-authentication)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -96,9 +95,6 @@ cargo build --workspace
 # Or use the Makefile shortcut
 make build
 ```
-
-If `pkcore` (a private git dependency used by `pkdealer_proto`) cannot be fetched, see
-[Private Dependency Authentication](#private-dependency-authentication).
 
 ---
 

@@ -15,10 +15,11 @@ name = "pkdealer_service"
 path = "src/main.rs"
 
 [dependencies]
-pkcore = "0.0.31"
-pkdealer_proto = { version = "0.1.0", path = "../pkdealer_proto" }
+pkcore = "0.0.39"
+pkdealer_proto = { version = "0.1.1", path = "../pkdealer_proto" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

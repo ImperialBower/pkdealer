@@ -3,8 +3,8 @@
 //! Plays through one complete 9-player hand against the running service:
 //!
 //!   1.  Ping the service
-//!   2.  Seat nine players (Alice … Ivy)
-//!   3.  Start a hand — show hole cards for every player
+//!   2.  Seat nine players (Alice … Ivy) — capture their auth tokens
+//!   3.  Show hole cards using the spectator token (all cards visible)
 //!   4.  Preflop betting — everyone calls; BB checks their option
 //!   5.  Advance to flop — show board
 //!   6.  Flop betting — everyone checks
@@ -20,15 +20,21 @@
 //!   cargo run --bin pkdealer_service
 //!   cargo run --example demo -p pkdealer_client
 
+use std::collections::HashMap;
+
 use pkdealer_proto::dealer::{
     ActRequest, ActionType, AdvanceStreetRequest, EndHandRequest, GetChipsRequest,
     GetNextToActRequest, GetStatusRequest, PlayerAction, SeatPlayerRequest, StartHandRequest,
     advance_street_response, dealer_service_client::DealerServiceClient, end_hand_response,
     get_next_to_act_response, seat_player_response, start_hand_response,
 };
-use tonic::Request;
+use tonic::{Request, metadata::MetadataValue};
 
 const ENDPOINT: &str = "http://127.0.0.1:50051";
+/// Default spectator token — must match `PKDEALER_SPECTATOR_TOKEN` on the server.
+const SPECTATOR_TOKEN: &str = "spectator";
+/// gRPC metadata key for the player auth token.
+const PLAYER_TOKEN_KEY: &str = "x-player-token";
 
 /// (name, starting chips)
 const PLAYERS: &[(&str, u32)] = &[
@@ -59,11 +65,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 2. Seat players ───────────────────────────────────────────────────────
     section("SEATING PLAYERS");
-    let mut seats: Vec<(u32, &str)> = Vec::new();
+    // seat_tokens maps seat_number → player_token for use in Act requests.
+    let mut seat_tokens: HashMap<u32, String> = HashMap::new();
     for (name, chips) in PLAYERS {
-        let seat_number = seat(&mut client, name, *chips).await?;
+        let (seat_number, token) = seat(&mut client, name, *chips).await?;
         println!("  {:5}  →  seat {seat_number}  (chips={chips})", name);
-        seats.push((seat_number, name));
+        seat_tokens.insert(seat_number, token);
     }
 
     // ── 3. Start hand ─────────────────────────────────────────────────────────
@@ -76,17 +83,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(start_hand_response::Result::Status(s)) => {
             println!("  pot          : {}", s.pot);
             println!("  next_to_act  : seat {}", s.next_to_act);
-            println!();
-            for seat_status in &s.seats {
-                println!(
-                    "  seat {} {:5}  chips={:5}  cards=[{}]  state={}",
-                    seat_status.seat_number,
-                    seat_status.player_name,
-                    seat_status.chips,
-                    seat_status.cards,
-                    seat_status.state,
-                );
-            }
         }
         Some(start_hand_response::Result::Error(e)) => {
             eprintln!("  Error starting hand: {e}");
@@ -98,9 +94,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // ── 3b. Show hole cards via spectator token ───────────────────────────────
+    section("HOLE CARDS (spectator view — all cards visible)");
+    show_all_cards(&mut client).await?;
+
     // ── 4. Preflop betting ────────────────────────────────────────────────────
     section("PREFLOP BETTING");
-    let hand_over = run_betting_round(&mut client, ActionType::Call).await?;
+    let hand_over = run_betting_round(&mut client, ActionType::Call, &seat_tokens).await?;
     if hand_over {
         return finish(&mut client).await;
     }
@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 6. Flop betting ───────────────────────────────────────────────────────
     section("FLOP BETTING");
-    let hand_over = run_betting_round(&mut client, ActionType::Check).await?;
+    let hand_over = run_betting_round(&mut client, ActionType::Check, &seat_tokens).await?;
     if hand_over {
         return finish(&mut client).await;
     }
@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 8. Turn betting ───────────────────────────────────────────────────────
     section("TURN BETTING");
-    let hand_over = run_betting_round(&mut client, ActionType::Check).await?;
+    let hand_over = run_betting_round(&mut client, ActionType::Check, &seat_tokens).await?;
     if hand_over {
         return finish(&mut client).await;
     }
@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 10. River betting ─────────────────────────────────────────────────────
     section("RIVER BETTING");
-    run_betting_round(&mut client, ActionType::Check).await?;
+    run_betting_round(&mut client, ActionType::Check, &seat_tokens).await?;
 
     // ── 11. End hand / showdown ───────────────────────────────────────────────
     finish(&mut client).await
@@ -155,14 +155,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Drive one full betting round.
 ///
-/// Each player that is next-to-act receives `preferred_action`.  If that
-/// action is rejected (e.g. `Call` for BB who has already matched the bet),
-/// we retry once with `Check`.  If `Check` also fails the round is over.
+/// Each player that is next-to-act receives `preferred_action` with their auth
+/// token.  If that action is rejected (e.g. `Call` for BB who has already
+/// matched the bet), we retry once with `Check`.  If `Check` also fails the
+/// round is over.
 ///
 /// Returns `true` when the hand ended early (`hand_complete` was set).
 async fn run_betting_round(
     client: &mut Client,
     preferred_action: ActionType,
+    seat_tokens: &HashMap<u32, String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     loop {
         let (acting_seat, acting_name, pot) = match next_to_act(client).await? {
@@ -170,7 +172,7 @@ async fn run_betting_round(
             None => break, // no one left to act
         };
 
-        let outcome = try_act(client, acting_seat, preferred_action).await?;
+        let outcome = try_act(client, acting_seat, preferred_action, seat_tokens).await?;
         let final_outcome = match outcome {
             ActOutcome::HandComplete => return Ok(true),
             ActOutcome::Continuing => {
@@ -179,7 +181,7 @@ async fn run_betting_round(
             }
             ActOutcome::IllegalAction(ref msg) => {
                 // Preferred action was rejected — try Check as a fallback.
-                let fallback = try_act(client, acting_seat, ActionType::Check).await?;
+                let fallback = try_act(client, acting_seat, ActionType::Check, seat_tokens).await?;
                 match fallback {
                     ActOutcome::HandComplete => return Ok(true),
                     ActOutcome::Continuing => {
@@ -215,17 +217,24 @@ async fn try_act(
     client: &mut Client,
     seat: u32,
     action_type: ActionType,
+    seat_tokens: &HashMap<u32, String>,
 ) -> Result<ActOutcome, Box<dyn std::error::Error>> {
-    let resp = client
-        .act(Request::new(ActRequest {
-            action: Some(PlayerAction {
-                seat,
-                action_type: action_type as i32,
-                amount: 0,
-            }),
-        }))
-        .await?
-        .into_inner();
+    let mut req = Request::new(ActRequest {
+        action: Some(PlayerAction {
+            seat,
+            action_type: action_type as i32,
+            amount: 0,
+        }),
+    });
+
+    // Attach the player's auth token so the server can verify seat ownership.
+    if let Some(token) = seat_tokens.get(&seat)
+        && let Ok(mv) = token.parse::<MetadataValue<_>>()
+    {
+        req.metadata_mut().insert(PLAYER_TOKEN_KEY, mv);
+    }
+
+    let resp = client.act(req).await?.into_inner();
 
     match resp.result {
         Some(pkdealer_proto::dealer::act_response::Result::ActionResult(r)) => {
@@ -291,7 +300,8 @@ async fn advance_street(client: &mut Client) -> Result<bool, Box<dyn std::error:
     }
 }
 
-/// Print the current community cards.
+/// Print the current community cards using an unauthenticated status call.
+/// (Board cards are always public; no token needed.)
 async fn show_board(client: &mut Client) -> Result<(), Box<dyn std::error::Error>> {
     let status = client
         .get_status(Request::new(GetStatusRequest {}))
@@ -301,6 +311,27 @@ async fn show_board(client: &mut Client) -> Result<(), Box<dyn std::error::Error
         .unwrap_or_default();
     println!("  board : {}", status.board);
     println!("  pot   : {}", status.pot);
+    Ok(())
+}
+
+/// Show all hole cards by calling `GetStatus` with the spectator token.
+async fn show_all_cards(client: &mut Client) -> Result<(), Box<dyn std::error::Error>> {
+    let mut req = Request::new(GetStatusRequest {});
+    if let Ok(mv) = SPECTATOR_TOKEN.parse::<MetadataValue<_>>() {
+        req.metadata_mut().insert(PLAYER_TOKEN_KEY, mv);
+    }
+    let status = client
+        .get_status(req)
+        .await?
+        .into_inner()
+        .status
+        .unwrap_or_default();
+    for seat in &status.seats {
+        println!(
+            "  seat {} {:5}  chips={:5}  cards=[{}]  state={}",
+            seat.seat_number, seat.player_name, seat.chips, seat.cards, seat.state,
+        );
+    }
     Ok(())
 }
 
@@ -356,20 +387,21 @@ fn section(title: &str) {
     println!("\n── {title} {}", "─".repeat(dashes));
 }
 
+/// Seats a player and returns `(seat_number, player_token)`.
 async fn seat(
     client: &mut Client,
     name: &str,
     chips: u32,
-) -> Result<u32, Box<dyn std::error::Error>> {
-    let resp = client
+) -> Result<(u32, String), Box<dyn std::error::Error>> {
+    let inner = client
         .seat_player(Request::new(SeatPlayerRequest {
             name: name.to_owned(),
             chips,
         }))
         .await?
         .into_inner();
-    match resp.result {
-        Some(seat_player_response::Result::SeatNumber(n)) => Ok(n),
+    match inner.result {
+        Some(seat_player_response::Result::SeatNumber(n)) => Ok((n, inner.player_token)),
         Some(seat_player_response::Result::Error(e)) => Err(e.into()),
         None => Err("empty seat_player response".into()),
     }
