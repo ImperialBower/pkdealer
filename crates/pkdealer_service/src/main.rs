@@ -41,19 +41,20 @@ use std::{
 };
 
 use pkcore::casino::{
-    dealer::{Dealer, DealerAction, DealerError},
+    action::PlayerAction,
     game::ForcedBets,
-    player::Player,
+    session::{PokerSession, SessionStep},
+    table_no_cell::{PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell},
 };
 use pkdealer_proto::dealer::{
     ActRequest, ActResponse, ActionResult, ActionType, AdvanceStreetRequest, AdvanceStreetResponse,
     EndHandRequest, EndHandResponse, EventType, GetBoardRequest, GetBoardResponse, GetChipsRequest,
     GetChipsResponse, GetEventLogRequest, GetEventLogResponse, GetNextToActRequest,
     GetNextToActResponse, GetPotRequest, GetPotResponse, GetStatusRequest, GetStatusResponse,
-    HandResult, NextToActInfo, PingReply, PingRequest, PlayerChips, RemovePlayerRequest,
-    RemovePlayerResponse, SeatInfo, SeatPlayerAtRequest, SeatPlayerAtResponse, SeatPlayerRequest,
-    SeatPlayerResponse, StartHandRequest, StartHandResponse, StreamEventsRequest, StreetResult,
-    TableEvent, TableStatus, act_response, advance_street_response,
+    NextToActInfo, PingReply, PingRequest, PlayerChips, RemovePlayerRequest, RemovePlayerResponse,
+    SeatInfo, SeatPlayerAtRequest, SeatPlayerAtResponse, SeatPlayerRequest, SeatPlayerResponse,
+    StartHandRequest, StartHandResponse, StreamEventsRequest, TableEvent, TableStatus,
+    act_response, advance_street_response,
     dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
     end_hand_response, get_next_to_act_response, remove_player_response, seat_player_at_response,
     seat_player_response, start_hand_response,
@@ -88,25 +89,17 @@ enum CardVisibility {
 
 // ── TableState ───────────────────────────────────────────────────────────────
 
-/// Wraps [`Dealer`] and the player auth token maps for use behind an `Arc<Mutex<_>>`.
+/// Wraps [`PokerSession`] and the player auth token maps for use behind an `Arc<Mutex<_>>`.
 ///
-/// # Safety
-///
-/// [`Dealer`] (and its inner `Table`) use `Cell`/`RefCell` for interior
-/// mutability, which makes them `!Send` by default. We guarantee that every
-/// access to this struct goes through the `Mutex` in `DealerService`, so only
-/// one thread ever touches the `Dealer` at a time. That invariant makes the
-/// `unsafe impl Send` sound.
+/// [`PokerSession`] wraps [`TableNoCell`], which has no `Cell`/`RefCell` interior
+/// mutability, so it is `Send + Sync` without any unsafe code.
 struct TableState {
-    dealer: Dealer,
+    session: PokerSession,
     /// Maps player UUID tokens → seat numbers.
     token_to_seat: HashMap<Uuid, u8>,
     /// Maps seat numbers → player UUID tokens (for O(1) cleanup on `remove_player`).
     seat_to_token: HashMap<u8, Uuid>,
 }
-
-// SAFETY: see doc-comment above.
-unsafe impl Send for TableState {}
 
 // ── DealerService ─────────────────────────────────────────────────────────────
 
@@ -120,12 +113,18 @@ struct DealerService {
 impl DealerService {
     /// Creates a fresh table with default blind/seat configuration.
     fn new() -> Self {
-        let dealer = Dealer::new(
-            ForcedBets::new(DEFAULT_SMALL_BLIND, DEFAULT_BIG_BLIND),
-            DEFAULT_SEAT_COUNT,
+        let seats = SeatsNoCell::new(
+            (0..DEFAULT_SEAT_COUNT)
+                .map(|_| SeatNoCell::default())
+                .collect(),
         );
+        let table = TableNoCell::nlh_from_seats(
+            seats,
+            ForcedBets::new(DEFAULT_SMALL_BLIND, DEFAULT_BIG_BLIND),
+        );
+        let session = PokerSession::new(table);
         let state = Arc::new(Mutex::new(TableState {
-            dealer,
+            session,
             token_to_seat: HashMap::new(),
             seat_to_token: HashMap::new(),
         }));
@@ -150,8 +149,8 @@ impl DealerService {
     /// - [`CardVisibility::Hidden`] — `cards` is empty for every seat.
     /// - [`CardVisibility::Player`]`(seat)` — `cards` is populated only for `seat`.
     /// - [`CardVisibility::Spectator`] — `cards` is populated for every seat.
-    fn build_table_status(dealer: &Dealer, visibility: CardVisibility) -> TableStatus {
-        let table = &dealer.table;
+    fn build_table_status(session: &PokerSession, visibility: CardVisibility) -> TableStatus {
+        let table = &session.table;
         let mut seats = Vec::new();
 
         for i in 0..table.seats.size() {
@@ -166,9 +165,9 @@ impl DealerService {
                 seats.push(SeatInfo {
                     seat_number: u32::from(i),
                     player_name: seat.player.handle.clone(),
-                    chips: seat.player.chips.count() as u32,
+                    chips: seat.player.chips as u32,
                     cards,
-                    state: format!("{:?}", seat.player.state.get()),
+                    state: format!("{:?}", seat.player.state),
                 });
             }
         }
@@ -176,16 +175,16 @@ impl DealerService {
         TableStatus {
             seats,
             board: table.board.to_string(),
-            pot: table.pot.count() as u32,
+            pot: table.pot as u32,
             next_to_act: u32::from(table.next_to_act()),
-            hand_in_progress: dealer.is_hand_in_progress(),
+            hand_in_progress: session.is_hand_in_progress(),
             game_over: table.is_game_over(),
         }
     }
 
     /// Builds a flat list of chip counts for all occupied seats.
-    fn build_player_chips(dealer: &Dealer) -> Vec<PlayerChips> {
-        let table = &dealer.table;
+    fn build_player_chips(session: &PokerSession) -> Vec<PlayerChips> {
+        let table = &session.table;
         let mut result = Vec::new();
         for i in 0..table.seats.size() {
             if let Some(seat) = table.seats.get_seat(i)
@@ -194,7 +193,7 @@ impl DealerService {
                 result.push(PlayerChips {
                     seat: u32::from(i),
                     player_name: seat.player.handle.clone(),
-                    chips: seat.player.chips.count() as u32,
+                    chips: seat.player.chips as u32,
                 });
             }
         }
@@ -258,6 +257,7 @@ impl DealerService {
 // ── gRPC trait implementation ─────────────────────────────────────────────────
 
 #[tonic::async_trait]
+#[allow(clippy::too_many_lines)] // tonic requires all RPCs in a single impl block
 impl DealerServiceTrait for DealerService {
     // ── Ping ──────────────────────────────────────────────────────────────────
 
@@ -284,29 +284,40 @@ impl DealerServiceTrait for DealerService {
         } else {
             req.chips as usize
         };
-        let player = Player::new_with_chips(req.name, chips);
 
         let (response_result, player_token, maybe_event) = {
             let mut guard = self.lock()?;
-            match guard.dealer.seat_player(player) {
-                Ok(seat_num) => {
+            let size = guard.session.table.seats.size();
+            let seat_num = (0..size).find(|&i| {
+                guard
+                    .session
+                    .table
+                    .seats
+                    .get_seat(i)
+                    .is_some_and(SeatNoCell::is_empty)
+            });
+            match seat_num {
+                Some(i) => {
+                    if let Some(s) = guard.session.table.seats.get_seat_mut(i) {
+                        s.player = PlayerNoCell::new_with_chips(req.name.clone(), chips);
+                    }
                     let token = Uuid::new_v4();
-                    guard.token_to_seat.insert(token, seat_num);
-                    guard.seat_to_token.insert(seat_num, token);
-                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
+                    guard.token_to_seat.insert(token, i);
+                    guard.seat_to_token.insert(i, token);
+                    let status = Self::build_table_status(&guard.session, CardVisibility::Hidden);
                     let event = (
                         EventType::PlayerSeated,
-                        format!("Player seated at seat {seat_num}"),
+                        format!("Player seated at seat {i}"),
                         status,
                     );
                     (
-                        seat_player_response::Result::SeatNumber(u32::from(seat_num)),
+                        seat_player_response::Result::SeatNumber(u32::from(i)),
                         token.to_string(),
                         Some(event),
                     )
                 }
-                Err(e) => (
-                    seat_player_response::Result::Error(dealer_error_to_string(&e)),
+                None => (
+                    seat_player_response::Result::Error("no empty seat available".to_owned()),
                     String::new(),
                     None,
                 ),
@@ -335,32 +346,40 @@ impl DealerServiceTrait for DealerService {
         };
         #[allow(clippy::cast_possible_truncation)]
         let seat_number = req.seat as u8;
-        let player = Player::new_with_chips(req.name, chips);
 
         let (response_result, player_token, maybe_event) = {
             let mut guard = self.lock()?;
-            match guard.dealer.seat_player_at(player, seat_number) {
-                Ok(()) => {
-                    let token = Uuid::new_v4();
-                    guard.token_to_seat.insert(token, seat_number);
-                    guard.seat_to_token.insert(seat_number, token);
-                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
-                    let event = (
-                        EventType::PlayerSeated,
-                        format!("Player seated at seat {seat_number}"),
-                        status,
-                    );
-                    (
-                        seat_player_at_response::Result::Success(true),
-                        token.to_string(),
-                        Some(event),
-                    )
+            let is_available = guard
+                .session
+                .table
+                .seats
+                .get_seat(seat_number)
+                .is_some_and(SeatNoCell::is_empty);
+            if is_available {
+                if let Some(s) = guard.session.table.seats.get_seat_mut(seat_number) {
+                    s.player = PlayerNoCell::new_with_chips(req.name.clone(), chips);
                 }
-                Err(e) => (
-                    seat_player_at_response::Result::Error(dealer_error_to_string(&e)),
+                let token = Uuid::new_v4();
+                guard.token_to_seat.insert(token, seat_number);
+                guard.seat_to_token.insert(seat_number, token);
+                let status = Self::build_table_status(&guard.session, CardVisibility::Hidden);
+                let event = (
+                    EventType::PlayerSeated,
+                    format!("Player seated at seat {seat_number}"),
+                    status,
+                );
+                (
+                    seat_player_at_response::Result::Success(true),
+                    token.to_string(),
+                    Some(event),
+                )
+            } else {
+                let msg = format!("seat {seat_number} is occupied or does not exist");
+                (
+                    seat_player_at_response::Result::Error(msg),
                     String::new(),
                     None,
-                ),
+                )
             }
         };
 
@@ -383,43 +402,46 @@ impl DealerServiceTrait for DealerService {
 
         let (response_result, maybe_event) = {
             let mut guard = self.lock()?;
-            // Guard against removing from an already-empty seat, since the
-            // library does not return an error in that case.
             let is_empty = guard
-                .dealer
+                .session
                 .table
                 .seats
                 .get_seat(seat)
-                .is_none_or(|s| s.is_empty());
+                .is_none_or(SeatNoCell::is_empty);
             if is_empty {
                 let msg = format!("seat {seat} is empty or does not exist");
                 return Ok(Response::new(RemovePlayerResponse {
                     result: Some(remove_player_response::Result::Error(msg)),
                 }));
             }
-            match guard.dealer.remove_player(seat) {
-                Ok(player) => {
-                    // Clean up the auth token for the removed seat.
-                    if let Some(uuid) = guard.seat_to_token.remove(&seat) {
-                        guard.token_to_seat.remove(&uuid);
-                    }
-                    let name = player.handle.clone();
-                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
-                    let event = (
-                        EventType::PlayerRemoved,
-                        format!("Player '{name}' removed from seat {seat}"),
-                        status,
-                    );
-                    (
-                        remove_player_response::Result::PlayerName(name),
-                        Some(event),
-                    )
-                }
-                Err(e) => (
-                    remove_player_response::Result::Error(dealer_error_to_string(&e)),
-                    None,
-                ),
+
+            let name = guard
+                .session
+                .table
+                .seats
+                .get_seat_mut(seat)
+                .map(|s| {
+                    let n = s.player.handle.clone();
+                    s.player = PlayerNoCell::default();
+                    n
+                })
+                .unwrap_or_default();
+
+            // Clean up the auth token for the removed seat.
+            if let Some(uuid) = guard.seat_to_token.remove(&seat) {
+                guard.token_to_seat.remove(&uuid);
             }
+
+            let status = Self::build_table_status(&guard.session, CardVisibility::Hidden);
+            let event = (
+                EventType::PlayerRemoved,
+                format!("Player '{name}' removed from seat {seat}"),
+                status,
+            );
+            (
+                remove_player_response::Result::PlayerName(name),
+                Some(event),
+            )
         };
 
         if let Some((et, desc, status)) = maybe_event {
@@ -439,9 +461,16 @@ impl DealerServiceTrait for DealerService {
     ) -> Result<Response<StartHandResponse>, Status> {
         let (response_result, maybe_event) = {
             let mut guard = self.lock()?;
-            match guard.dealer.start_hand() {
+            if guard.session.count_funded() < 2 {
+                return Ok(Response::new(StartHandResponse {
+                    result: Some(start_hand_response::Result::Error(
+                        "at least 2 players with chips are required to start a hand".to_owned(),
+                    )),
+                }));
+            }
+            match guard.session.start_hand() {
                 Ok(()) => {
-                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
+                    let status = Self::build_table_status(&guard.session, CardVisibility::Hidden);
                     let event = (
                         EventType::HandStarted,
                         "Hand started".to_owned(),
@@ -449,10 +478,7 @@ impl DealerServiceTrait for DealerService {
                     );
                     (start_hand_response::Result::Status(status), Some(event))
                 }
-                Err(e) => (
-                    start_hand_response::Result::Error(dealer_error_to_string(&e)),
-                    None,
-                ),
+                Err(e) => (start_hand_response::Result::Error(e.to_string()), None),
             }
         };
 
@@ -469,44 +495,12 @@ impl DealerServiceTrait for DealerService {
         &self,
         _request: Request<AdvanceStreetRequest>,
     ) -> Result<Response<AdvanceStreetResponse>, Status> {
-        let (response_result, maybe_event) = {
-            let mut guard = self.lock()?;
-            match guard.dealer.advance_street() {
-                Ok(()) => {
-                    let table = &guard.dealer.table;
-                    let board = table.board.to_string();
-                    let next_to_act = u32::from(table.next_to_act());
-                    let pot = table.pot.count() as u32;
-
-                    let street_result = StreetResult {
-                        board: board.clone(),
-                        next_to_act,
-                        pot,
-                    };
-                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
-                    let event = (
-                        EventType::StreetAdvanced,
-                        format!("Street advanced. Board: {board}"),
-                        status,
-                    );
-                    (
-                        advance_street_response::Result::StreetResult(street_result),
-                        Some(event),
-                    )
-                }
-                Err(e) => (
-                    advance_street_response::Result::Error(dealer_error_to_string(&e)),
-                    None,
-                ),
-            }
-        };
-
-        if let Some((et, desc, status)) = maybe_event {
-            self.emit_event(et, desc, status);
-        }
-
+        // Street advancement is now managed autonomously by the `act` handler
+        // via `PokerSession::next_step()`. Calling this RPC is no longer needed.
         Ok(Response::new(AdvanceStreetResponse {
-            result: Some(response_result),
+            result: Some(advance_street_response::Result::Error(
+                "street advancement is managed autonomously; use Act".to_owned(),
+            )),
         }))
     }
 
@@ -514,40 +508,12 @@ impl DealerServiceTrait for DealerService {
         &self,
         _request: Request<EndHandRequest>,
     ) -> Result<Response<EndHandResponse>, Status> {
-        let (response_result, maybe_event) = {
-            let mut guard = self.lock()?;
-            match guard.dealer.end_hand() {
-                Ok(winnings) => {
-                    let result_text = winnings.to_string();
-                    let final_chips = Self::build_player_chips(&guard.dealer);
-                    let hand_result = HandResult {
-                        result_text: result_text.clone(),
-                        final_chips,
-                    };
-                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
-                    let event = (
-                        EventType::HandEnded,
-                        format!("Hand ended. {result_text}"),
-                        status,
-                    );
-                    (
-                        end_hand_response::Result::HandResult(hand_result),
-                        Some(event),
-                    )
-                }
-                Err(e) => (
-                    end_hand_response::Result::Error(dealer_error_to_string(&e)),
-                    None,
-                ),
-            }
-        };
-
-        if let Some((et, desc, status)) = maybe_event {
-            self.emit_event(et, desc, status);
-        }
-
+        // Hand resolution is now managed autonomously by the `act` handler
+        // via `PokerSession::next_step()`. Calling this RPC is no longer needed.
         Ok(Response::new(EndHandResponse {
-            result: Some(response_result),
+            result: Some(end_hand_response::Result::Error(
+                "hand resolution is managed autonomously; use Act".to_owned(),
+            )),
         }))
     }
 
@@ -599,50 +565,89 @@ impl DealerServiceTrait for DealerService {
             }
         }
 
-        let dealer_action = match action_type {
-            ActionType::Bet => DealerAction::Bet { seat, amount },
-            ActionType::Call => DealerAction::Call { seat },
-            ActionType::Check => DealerAction::Check { seat },
-            ActionType::Raise => DealerAction::Raise { seat, amount },
-            ActionType::AllIn => DealerAction::AllIn { seat },
-            ActionType::Fold => DealerAction::Fold { seat },
+        let player_action = match action_type {
+            ActionType::Bet => PlayerAction::Bet(amount),
+            ActionType::Call => PlayerAction::Call,
+            ActionType::Check => PlayerAction::Check,
+            ActionType::Raise => PlayerAction::Raise(amount),
+            ActionType::AllIn => PlayerAction::AllIn,
+            ActionType::Fold => PlayerAction::Fold,
         };
 
-        let (response_result, maybe_event) = {
-            let guard = self.lock()?;
-            match guard.dealer.act(dealer_action) {
-                Ok(()) => {
-                    let table = &guard.dealer.table;
-                    let action_result = ActionResult {
-                        next_to_act: u32::from(table.next_to_act()),
-                        pot: table.pot.count() as u32,
-                        hand_complete: table.is_game_over(),
-                    };
-                    let status = Self::build_table_status(&guard.dealer, CardVisibility::Hidden);
-                    let event = (
-                        EventType::PlayerAction,
-                        format!("Seat {seat}: {action_type:?}"),
-                        status,
-                    );
-                    (
-                        act_response::Result::ActionResult(action_result),
-                        Some(event),
-                    )
+        // Hold the lock for the full apply + advance loop to keep state atomic.
+        // `emit_event` only sends on the broadcast channel — it never re-acquires
+        // the state lock — so calling it while holding `guard` is safe.
+        let mut guard = self.lock()?;
+
+        match guard.session.apply_action(seat, player_action) {
+            Ok(()) => {
+                // Emit PlayerAction event for the triggering action.
+                let status = Self::build_table_status(&guard.session, CardVisibility::Hidden);
+                self.emit_event(
+                    EventType::PlayerAction,
+                    format!("Seat {seat}: {action_type:?}"),
+                    status,
+                );
+
+                // Auto-advance: deal streets and/or end the hand as needed.
+                let mut hand_complete = false;
+                let mut next_to_act_seat = guard.session.table.next_to_act();
+
+                loop {
+                    match guard.session.next_step() {
+                        SessionStep::PlayerToAct(s) => {
+                            next_to_act_seat = s;
+                            break;
+                        }
+                        SessionStep::StreetAdvanced => {
+                            let board = guard.session.table.board.to_string();
+                            let status =
+                                Self::build_table_status(&guard.session, CardVisibility::Hidden);
+                            self.emit_event(
+                                EventType::StreetAdvanced,
+                                format!("Street advanced. Board: {board}"),
+                                status,
+                            );
+                        }
+                        SessionStep::HandComplete => {
+                            match guard.session.end_hand() {
+                                Ok(winnings) => {
+                                    hand_complete = true;
+                                    let result_text = winnings.to_string();
+                                    let status = Self::build_table_status(
+                                        &guard.session,
+                                        CardVisibility::Hidden,
+                                    );
+                                    self.emit_event(
+                                        EventType::HandEnded,
+                                        format!("Hand ended. {result_text}"),
+                                        status,
+                                    );
+                                }
+                                Err(e) => {
+                                    return Ok(Response::new(ActResponse {
+                                        result: Some(act_response::Result::Error(e.to_string())),
+                                    }));
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
-                Err(e) => (
-                    act_response::Result::Error(dealer_error_to_string(&e)),
-                    None,
-                ),
+
+                let action_result = ActionResult {
+                    next_to_act: u32::from(next_to_act_seat),
+                    pot: guard.session.table.pot as u32,
+                    hand_complete,
+                };
+                Ok(Response::new(ActResponse {
+                    result: Some(act_response::Result::ActionResult(action_result)),
+                }))
             }
-        };
-
-        if let Some((et, desc, status)) = maybe_event {
-            self.emit_event(et, desc, status);
+            Err(e) => Ok(Response::new(ActResponse {
+                result: Some(act_response::Result::Error(e.to_string())),
+            })),
         }
-
-        Ok(Response::new(ActResponse {
-            result: Some(response_result),
-        }))
     }
 
     // ── Read-only queries ─────────────────────────────────────────────────────
@@ -653,7 +658,7 @@ impl DealerServiceTrait for DealerService {
     ) -> Result<Response<GetStatusResponse>, Status> {
         let guard = self.lock()?;
         let visibility = Self::card_visibility_from_metadata(request.metadata(), &guard);
-        let status = Self::build_table_status(&guard.dealer, visibility);
+        let status = Self::build_table_status(&guard.session, visibility);
         Ok(Response::new(GetStatusResponse {
             status: Some(status),
         }))
@@ -665,7 +670,7 @@ impl DealerServiceTrait for DealerService {
     ) -> Result<Response<GetNextToActResponse>, Status> {
         let guard = self.lock()?;
 
-        if !guard.dealer.is_hand_in_progress() {
+        if !guard.session.is_hand_in_progress() {
             return Ok(Response::new(GetNextToActResponse {
                 result: Some(get_next_to_act_response::Result::Message(
                     "No hand in progress".to_owned(),
@@ -673,16 +678,16 @@ impl DealerServiceTrait for DealerService {
             }));
         }
 
-        let seat_num = guard.dealer.next_to_act();
-        let result = if let Some(seat) = guard.dealer.table.seats.get_seat(seat_num) {
+        let seat_num = guard.session.table.next_to_act();
+        let result = if let Some(seat) = guard.session.table.seats.get_seat(seat_num) {
             if seat.is_empty() {
                 get_next_to_act_response::Result::Message("No active player to act".to_owned())
             } else {
                 get_next_to_act_response::Result::Info(NextToActInfo {
                     seat: u32::from(seat_num),
                     player_name: seat.player.handle.clone(),
-                    chips: seat.player.chips.count() as u32,
-                    pot: guard.dealer.pot() as u32,
+                    chips: seat.player.chips as u32,
+                    pot: guard.session.table.pot as u32,
                 })
             }
         } else {
@@ -700,7 +705,7 @@ impl DealerServiceTrait for DealerService {
     ) -> Result<Response<GetBoardResponse>, Status> {
         let guard = self.lock()?;
         Ok(Response::new(GetBoardResponse {
-            board: guard.dealer.table.board.to_string(),
+            board: guard.session.table.board.to_string(),
         }))
     }
 
@@ -710,7 +715,7 @@ impl DealerServiceTrait for DealerService {
     ) -> Result<Response<GetChipsResponse>, Status> {
         let guard = self.lock()?;
         Ok(Response::new(GetChipsResponse {
-            chips: Self::build_player_chips(&guard.dealer),
+            chips: Self::build_player_chips(&guard.session),
         }))
     }
 
@@ -720,7 +725,7 @@ impl DealerServiceTrait for DealerService {
     ) -> Result<Response<GetPotResponse>, Status> {
         let guard = self.lock()?;
         Ok(Response::new(GetPotResponse {
-            pot: guard.dealer.pot() as u32,
+            pot: guard.session.table.pot as u32,
         }))
     }
 
@@ -729,9 +734,16 @@ impl DealerServiceTrait for DealerService {
         _request: Request<GetEventLogRequest>,
     ) -> Result<Response<GetEventLogResponse>, Status> {
         let guard = self.lock()?;
-        Ok(Response::new(GetEventLogResponse {
-            log: guard.dealer.event_log().to_string(),
-        }))
+        let log = guard
+            .session
+            .table
+            .event_log
+            .iter()
+            .enumerate()
+            .map(|(i, a)| format!("{}: {a}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(Response::new(GetEventLogResponse { log }))
     }
 
     // ── Event stream ──────────────────────────────────────────────────────────
@@ -770,13 +782,6 @@ impl DealerServiceTrait for DealerService {
             mpsc_rx,
         )))
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Converts a [`DealerError`] to a human-readable string for proto error fields.
-fn dealer_error_to_string(e: &DealerError) -> String {
-    e.to_string()
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -885,7 +890,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let seat = {
             let guard = service.lock().expect("lock");
-            guard.dealer.next_to_act()
+            guard.session.table.next_to_act()
         };
         let response = service
             .act(act_request_with_token(seat, action_type, tokens))
@@ -912,25 +917,6 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         act_next(service, ActionType::Call, tokens).await?;
         act_next(service, ActionType::Check, tokens).await?;
-        Ok(())
-    }
-
-    /// Has every remaining active player check in turn until the betting round
-    /// is complete.
-    async fn check_all_active(
-        service: &DealerService,
-        tokens: &HashMap<u8, String>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        for _ in 0..DEFAULT_SEAT_COUNT {
-            let done = {
-                let guard = service.lock().expect("lock");
-                guard.dealer.table.is_betting_complete()
-            };
-            if done {
-                break;
-            }
-            act_next(service, ActionType::Check, tokens).await?;
-        }
         Ok(())
     }
 
@@ -1254,7 +1240,7 @@ mod tests {
 
         let next_seat = {
             let guard = service.lock().expect("lock");
-            guard.dealer.next_to_act()
+            guard.session.table.next_to_act()
         };
 
         let response = service
@@ -1290,7 +1276,7 @@ mod tests {
 
         let next_seat = {
             let guard = service.lock().expect("lock");
-            guard.dealer.next_to_act()
+            guard.session.table.next_to_act()
         };
 
         // Act without any token — must be rejected.
@@ -1320,7 +1306,7 @@ mod tests {
 
         let next_seat = {
             let guard = service.lock().expect("lock");
-            guard.dealer.next_to_act()
+            guard.session.table.next_to_act()
         };
 
         // Find the token that belongs to the *other* seat.
@@ -1535,39 +1521,37 @@ mod tests {
         Ok(())
     }
 
-    // ── end_hand ──────────────────────────────────────────────────────────────
+    // ── end_hand (deprecated) ─────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn dealer_service_end_hand_after_fold() -> Result<(), Box<dyn std::error::Error>> {
+    async fn dealer_service_end_hand_returns_deprecated_error()
+    -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
-        let tokens = seat_two_players(&service).await?;
-        service
-            .start_hand(Request::new(StartHandRequest {}))
-            .await?;
-
-        fold_next_to_act(&service, &tokens).await?;
-
         let response = service.end_hand(Request::new(EndHandRequest {})).await?;
         assert!(
             matches!(
                 response.into_inner().result,
-                Some(end_hand_response::Result::HandResult(_))
+                Some(end_hand_response::Result::Error(_))
             ),
-            "expected HandResult after a fold"
+            "end_hand must return a deprecation error"
         );
         Ok(())
     }
 
+    /// After a fold, `act` auto-ends the hand and chips are conserved.
     #[tokio::test]
-    async fn dealer_service_end_hand_chips_conserved() -> Result<(), Box<dyn std::error::Error>> {
+    async fn dealer_service_fold_auto_ends_hand_chips_conserved()
+    -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
         let tokens = seat_two_players(&service).await?;
         service
             .start_hand(Request::new(StartHandRequest {}))
             .await?;
 
-        fold_next_to_act(&service, &tokens).await?;
-        service.end_hand(Request::new(EndHandRequest {})).await?;
+        // Fold — the act handler auto-calls end_hand via next_step().
+        let response = fold_next_to_act(&service, &tokens).await;
+        // fold_next_to_act returns () on ActionResult; the hand is now over.
+        assert!(response.is_ok(), "fold should succeed: {response:?}");
 
         let total: u32 = service
             .get_chips(Request::new(GetChipsRequest {}))
@@ -1577,21 +1561,20 @@ mod tests {
             .iter()
             .map(|p| p.chips)
             .sum();
-        assert_eq!(total, 2_000, "chips must be conserved after payout");
+        assert_eq!(total, 2_000, "chips must be conserved after auto-payout");
         Ok(())
     }
 
-    // ── advance_street ────────────────────────────────────────────────────────
+    // ── advance_street (deprecated) ───────────────────────────────────────────
 
     #[tokio::test]
-    async fn dealer_service_advance_street_before_betting_complete_returns_error()
+    async fn dealer_service_advance_street_returns_deprecated_error()
     -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
         seat_two_players(&service).await?;
         service
             .start_hand(Request::new(StartHandRequest {}))
             .await?;
-        // Attempt to advance before anyone has acted preflop
         let response = service
             .advance_street(Request::new(AdvanceStreetRequest {}))
             .await?;
@@ -1600,42 +1583,20 @@ mod tests {
                 response.into_inner().result,
                 Some(advance_street_response::Result::Error(_))
             ),
-            "advance_street must fail while betting is still in progress"
+            "advance_street must return a deprecation error"
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dealer_service_advance_street_to_flop() -> Result<(), Box<dyn std::error::Error>> {
-        let service = make_service();
-        let tokens = seat_two_players(&service).await?;
-        service
-            .start_hand(Request::new(StartHandRequest {}))
-            .await?;
-        complete_preflop_betting(&service, &tokens).await?;
-
-        let response = service
-            .advance_street(Request::new(AdvanceStreetRequest {}))
-            .await?;
-        match response.into_inner().result {
-            Some(advance_street_response::Result::StreetResult(s)) => {
-                // Flop = 3 cards separated by spaces, e.g. "A♠ K♦ 7♣"
-                assert!(!s.board.is_empty(), "board should be non-empty after flop");
-            }
-            other => panic!("expected StreetResult, got {other:?}"),
-        }
         Ok(())
     }
 
     // ── full hand sequence ────────────────────────────────────────────────────
 
-    /// Plays a complete two-player hand where both players call/check every
-    /// street and reach showdown.  Verifies that:
-    ///   - `advance_street` succeeds through flop, turn, and river
-    ///   - `end_hand` returns a `HandResult`
+    /// Plays a complete two-player hand via `Act` only (no `advance_street` or
+    /// `end_hand`).  Verifies that:
+    ///   - streets are auto-advanced by the `act` handler via `next_step()`
+    ///   - `ActionResult.hand_complete` becomes `true` after the last river action
     ///   - total chips are conserved (no chips created or destroyed)
     #[tokio::test]
-    async fn dealer_service_full_hand_call_check_all_streets_to_showdown()
+    async fn dealer_service_act_only_full_hand_chips_conserved()
     -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service();
         let tokens = seat_two_players(&service).await?;
@@ -1643,38 +1604,35 @@ mod tests {
             .start_hand(Request::new(StartHandRequest {}))
             .await?;
 
-        // Preflop: UTG calls, BB checks
+        // Preflop: SB calls, BB checks — after BB checks, act auto-advances to flop.
         complete_preflop_betting(&service, &tokens).await?;
 
-        // Flop
-        service
-            .advance_street(Request::new(AdvanceStreetRequest {}))
-            .await?;
-        check_all_active(&service, &tokens).await?;
+        // Post-preflop: check until hand_complete is signalled in ActionResult.
+        let mut hand_complete = false;
+        for _ in 0..(DEFAULT_SEAT_COUNT * 4) {
+            // upper bound: 4 streets × 9 seats
+            if hand_complete {
+                break;
+            }
+            let seat = {
+                let guard = service.lock().expect("lock");
+                guard.session.table.next_to_act()
+            };
+            let resp = service
+                .act(act_request_with_token(seat, ActionType::Check, &tokens))
+                .await?
+                .into_inner();
+            match resp.result {
+                Some(act_response::Result::ActionResult(r)) => {
+                    hand_complete = r.hand_complete;
+                }
+                Some(act_response::Result::Error(e)) => return Err(e.into()),
+                None => return Err("empty act response".into()),
+            }
+        }
+        assert!(hand_complete, "hand should have completed by showdown");
 
-        // Turn
-        service
-            .advance_street(Request::new(AdvanceStreetRequest {}))
-            .await?;
-        check_all_active(&service, &tokens).await?;
-
-        // River
-        service
-            .advance_street(Request::new(AdvanceStreetRequest {}))
-            .await?;
-        check_all_active(&service, &tokens).await?;
-
-        // Showdown
-        let response = service.end_hand(Request::new(EndHandRequest {})).await?;
-        assert!(
-            matches!(
-                response.into_inner().result,
-                Some(end_hand_response::Result::HandResult(_))
-            ),
-            "expected HandResult at showdown"
-        );
-
-        // Chips must be fully conserved
+        // Chips must be fully conserved.
         let total: u32 = service
             .get_chips(Request::new(GetChipsRequest {}))
             .await?
@@ -1711,7 +1669,7 @@ mod tests {
             Some(seat_player_response::Result::SeatNumber(s)) => (s as u8, r_a.player_token),
             other => panic!("Alice seat failed: {other:?}"),
         };
-        let map_a: HashMap<u8, String> = HashMap::from([(seat_a, token_a.clone())]);
+        let _map_a: HashMap<u8, String> = HashMap::from([(seat_a, token_a.clone())]);
 
         // Player B seating — stores only its own token.
         let r_b = service
@@ -1725,25 +1683,14 @@ mod tests {
             Some(seat_player_response::Result::SeatNumber(s)) => (s as u8, r_b.player_token),
             other => panic!("Bob seat failed: {other:?}"),
         };
-        let map_b: HashMap<u8, String> = HashMap::from([(seat_b, token_b)]);
+        let _map_b: HashMap<u8, String> = HashMap::from([(seat_b, token_b)]);
 
         service
             .start_hand(Request::new(StartHandRequest {}))
             .await?;
 
-        // Preflop: two actions — each player dispatches only when it is their turn.
-        for _ in 0..2 {
-            let next_seat = {
-                let guard = service.lock().expect("lock");
-                guard.dealer.next_to_act()
-            };
-            let (tokens, action) = if next_seat == seat_a {
-                (&map_a, ActionType::Call)
-            } else {
-                (&map_b, ActionType::Check)
-            };
-            act_next(&service, action, tokens).await?;
-        }
+        // Cards are dealt at start_hand time; no betting is required to assert
+        // visibility — each player can already see (only) their own hole cards.
 
         // Each player can see their own hole cards via their token.
         let mut req_a = Request::new(GetStatusRequest {});
@@ -1795,7 +1742,7 @@ mod tests {
 
         let next_seat = {
             let guard = service.lock().expect("lock");
-            guard.dealer.next_to_act()
+            guard.session.table.next_to_act()
         };
 
         // Find the player who is NOT next to act.

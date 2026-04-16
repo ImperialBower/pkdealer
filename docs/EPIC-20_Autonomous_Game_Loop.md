@@ -27,7 +27,7 @@ own orchestration logic.
 
 Two related issues are addressed in this EPIC:
 
-1. **`unsafe impl Send for TableState {}`** — `pkcore::Dealer` wraps `Table`,
+1. **`unsafe impl Send for TableState {}`** — `pkcore::Dealer` wraps `TableCelled`,
    which uses `Cell`/`RefCell` and is `!Send`. The current workaround is an
    `unsafe impl Send`, sound only because every access goes through a `Mutex`.
    pkcore's `PokerSession` (wraps `TableNoCell`, a proper `Send` type) provides

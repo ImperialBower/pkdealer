@@ -13,9 +13,8 @@ use std::{
 };
 
 use pkdealer_proto::dealer::{
-    ActRequest, ActionType, AdvanceStreetRequest, EndHandRequest, GetChipsRequest,
-    GetNextToActRequest, PlayerAction, SeatPlayerRequest, StartHandRequest, act_response,
-    advance_street_response, dealer_service_client::DealerServiceClient, end_hand_response,
+    ActRequest, ActionType, GetChipsRequest, GetNextToActRequest, PlayerAction, SeatPlayerRequest,
+    StartHandRequest, act_response, dealer_service_client::DealerServiceClient,
     get_next_to_act_response, seat_player_response,
 };
 use tonic::{Request, metadata::MetadataValue};
@@ -174,7 +173,7 @@ async fn e2e_two_players_full_hand_with_token_enforcement() -> Result<(), Box<dy
     let mut player_a = PlayerClient::connect(&endpoint, "Alice", 1_000).await?;
     let mut player_b = PlayerClient::connect(&endpoint, "Bob", 1_000).await?;
 
-    // A third connection acts as the table orchestrator (start/advance/end hand).
+    // A third connection acts as the table orchestrator (start hand / observe).
     let mut orchestrator = DealerServiceClient::connect(endpoint.clone()).await?;
     orchestrator
         .start_hand(Request::new(StartHandRequest {}))
@@ -195,20 +194,22 @@ async fn e2e_two_players_full_hand_with_token_enforcement() -> Result<(), Box<dy
     );
 
     // ── Preflop betting ──────────────────────────────────────────────────────
-    // Determine turn order and have each player act with their own token.
-    for _ in 0..2 {
+    // First actor (SB) calls the big blind; second actor (BB) checks.
+    // After BB's check the `act` handler auto-advances to the flop via next_step().
+    for i in 0..2_usize {
         let next_seat = {
             let resp = orchestrator
                 .get_next_to_act(Request::new(GetNextToActRequest {}))
                 .await?
                 .into_inner();
             match resp.result {
-                Some(get_next_to_act_response::Result::Info(i)) => i.seat,
+                Some(get_next_to_act_response::Result::Info(info)) => info.seat,
                 _ => break,
             }
         };
 
-        let action = if next_seat == player_a.seat {
+        // SB (first to act preflop) calls; BB (second) checks.
+        let action = if i == 0 {
             ActionType::Call
         } else {
             ActionType::Check
@@ -227,62 +228,38 @@ async fn e2e_two_players_full_hand_with_token_enforcement() -> Result<(), Box<dy
         );
     }
 
-    // ── Flop ─────────────────────────────────────────────────────────────────
-    let flop = orchestrator
-        .advance_street(Request::new(AdvanceStreetRequest {}))
-        .await?
-        .into_inner();
-    assert!(
-        matches!(
-            flop.result,
-            Some(advance_street_response::Result::StreetResult(_))
-        ),
-        "advance to flop must succeed"
-    );
-
-    // ── Flop, turn, river — everyone checks ──────────────────────────────────
-    for _street in 0..3 {
-        for _ in 0..2 {
-            let next_seat = {
-                let resp = orchestrator
-                    .get_next_to_act(Request::new(GetNextToActRequest {}))
-                    .await?
-                    .into_inner();
-                match resp.result {
-                    Some(get_next_to_act_response::Result::Info(i)) => i.seat,
-                    _ => break,
-                }
-            };
-
-            let actor = if next_seat == player_a.seat {
-                &mut player_a
-            } else {
-                &mut player_b
-            };
-            let resp = actor.act(ActionType::Check).await?.into_inner();
-            assert!(
-                matches!(resp.result, Some(act_response::Result::ActionResult(_))),
-                "check must succeed"
-            );
+    // ── Post-preflop: check until hand_complete ──────────────────────────────
+    // Streets (flop, turn, river) are auto-advanced by the `act` handler.
+    // We loop checking until ActionResult.hand_complete is true.
+    let mut hand_complete = false;
+    for _ in 0..20 {
+        // safety cap: 4 streets × 2 players × some margin
+        if hand_complete {
+            break;
         }
-
-        // Advance street (skip after river)
-        if _street < 2 {
-            orchestrator
-                .advance_street(Request::new(AdvanceStreetRequest {}))
-                .await?;
+        let next_seat = {
+            let resp = orchestrator
+                .get_next_to_act(Request::new(GetNextToActRequest {}))
+                .await?
+                .into_inner();
+            match resp.result {
+                Some(get_next_to_act_response::Result::Info(info)) => info.seat,
+                _ => break, // hand already over
+            }
+        };
+        let actor = if next_seat == player_a.seat {
+            &mut player_a
+        } else {
+            &mut player_b
+        };
+        let resp = actor.act(ActionType::Check).await?.into_inner();
+        match resp.result {
+            Some(act_response::Result::ActionResult(r)) => hand_complete = r.hand_complete,
+            Some(act_response::Result::Error(e)) => return Err(e.into()),
+            None => return Err("empty act response".into()),
         }
     }
-
-    // ── Showdown ─────────────────────────────────────────────────────────────
-    let end = orchestrator
-        .end_hand(Request::new(EndHandRequest {}))
-        .await?
-        .into_inner();
-    assert!(
-        matches!(end.result, Some(end_hand_response::Result::HandResult(_))),
-        "end_hand must return a HandResult"
-    );
+    assert!(hand_complete, "hand must reach completion via Act alone");
 
     // Chips must be conserved across the full round trip.
     let chips = orchestrator

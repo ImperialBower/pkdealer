@@ -38,7 +38,7 @@ The same `PokerAgent` trait governs all three. Only the transport layer
 A shared library crate containing:
 
 ```rust
-/// Table state visible to one agent seat.
+/// TableCelled state visible to one agent seat.
 pub struct HandState {
     pub seat: u8,
     pub hole_cards: String,          // "Ah Kd"
