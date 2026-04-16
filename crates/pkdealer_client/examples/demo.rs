@@ -1,258 +1,303 @@
-//! # pkdealer demo
+//! # pkdealer bot arena
 //!
-//! Plays through one complete 9-player hand against the running service,
-//! driving the entire hand with `Act` alone — no `advance_street` or
-//! `end_hand` calls required.  Streets auto-advance and the hand resolves
-//! inside the server's `Act` handler; the demo detects transitions by
-//! watching the board string change between actions.
+//! A self-contained bot-vs-bot tournament that mirrors the pkarena0-web game
+//! loop, run entirely through the pkcore session layer (no gRPC required).
 //!
-//! Flow:
-//!   1.  Ping the service
-//!   2.  Seat nine players (Alice … Ivy) — capture their auth tokens
-//!   3.  Start hand — show hole cards via spectator token
-//!   4.  Loop: get next-to-act → Act (Call preflop / Check post-flop)
-//!         • print each action with pot size
-//!         • print board whenever a new street is dealt
-//!         • stop when `ActionResult.hand_complete` is true
-//!   5.  Final chip counts
+//! Nine bot profiles are shuffled and seated.  Hands are driven by the
+//! EPIC-20 `next_step()` API: the loop handles `PlayerToAct`, `StreetAdvanced`,
+//! and `HandComplete` one step at a time, with each bot deciding via
+//! `BotProfile::decide()`.  Play continues until only one player has chips.
 //!
-//! Run with the service already started in another terminal:
+//! Each completed hand is recorded as a [`HandHistory`] and the full session
+//! is saved as `generated/demo_<timestamp>.yaml` on exit.
 //!
-//!   cargo run --bin pkdealer_service
+//! Run:
+//!
 //!   cargo run --example demo -p pkdealer_client
 
-use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use pkdealer_proto::dealer::{
-    ActRequest, ActionType, GetChipsRequest, GetStatusRequest, PlayerAction, SeatPlayerRequest,
-    StartHandRequest, act_response, dealer_service_client::DealerServiceClient,
-    get_next_to_act_response, seat_player_response, start_hand_response,
-};
-use tonic::{Request, metadata::MetadataValue};
+use pkcore::bot::profile::BotProfile;
+use pkcore::card::Card;
+use pkcore::casino::action::PlayerAction;
+use pkcore::casino::game::ForcedBets;
+use pkcore::casino::session::{PokerSession, SessionStep};
+use pkcore::casino::table_no_cell::{PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell};
+use pkcore::hand_history::{HandCollection, HandHistory};
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
+use rand::seq::SliceRandom;
 
-const ENDPOINT: &str = "http://127.0.0.1:50051";
-/// Default spectator token — must match `PKDEALER_SPECTATOR_TOKEN` on the server.
-const SPECTATOR_TOKEN: &str = "spectator";
-/// gRPC metadata key for the player auth token.
-const PLAYER_TOKEN_KEY: &str = "x-player-token";
+const STARTING_CHIPS: usize = 10_000;
+const SMALL_BLIND: usize = 50;
+const BIG_BLIND: usize = 100;
 
-/// (name, starting chips)
-const PLAYERS: &[(&str, u32)] = &[
-    ("Alice", 1_500),
-    ("Bob", 2_000),
-    ("Carol", 1_200),
-    ("Dave", 1_800),
-    ("Eve", 2_500),
-    ("Frank", 1_100),
-    ("Grace", 1_700),
-    ("Hank", 2_200),
-    ("Ivy", 1_300),
-];
+fn main() {
+    let mut rng = SmallRng::from_os_rng();
 
-type Client = DealerServiceClient<tonic::transport::Channel>;
+    // ── Build a shuffled lineup of 9 bots ─────────────────────────────────────
+    let mut pool = BotProfile::default_profiles();
+    pool.push(BotProfile::joker());
+    pool.shuffle(&mut rng);
+    let bots: Vec<BotProfile> = pool.into_iter().take(9).collect();
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = DealerServiceClient::connect(ENDPOINT).await?;
-
-    // ── 1. Ping ───────────────────────────────────────────────────────────────
-    section("PING");
-    let pong = client
-        .ping(Request::new(pkdealer_proto::new_ping_request("demo")))
-        .await?
-        .into_inner();
-    println!("  {}", pong.message);
-
-    // ── 2. Seat players ───────────────────────────────────────────────────────
-    section("SEATING PLAYERS");
-    let mut seat_tokens: HashMap<u32, String> = HashMap::new();
-    for (name, chips) in PLAYERS {
-        let (seat_number, token) = seat_player(&mut client, name, *chips).await?;
-        println!("  {name:5}  →  seat {seat_number}  (chips={chips})");
-        seat_tokens.insert(seat_number, token);
+    section("BOT LINEUP");
+    for (i, bot) in bots.iter().enumerate() {
+        println!("  seat {i}  {}", bot.name);
     }
 
-    // ── 3. Start hand ─────────────────────────────────────────────────────────
-    section("START HAND");
-    let start = client
-        .start_hand(Request::new(StartHandRequest {}))
-        .await?
-        .into_inner();
-    match start.result {
-        Some(start_hand_response::Result::Status(s)) => {
-            println!("  pot         : {}", s.pot);
-            println!("  next_to_act : seat {}", s.next_to_act);
+    // ── Seat all bots ─────────────────────────────────────────────────────────
+    let seats_vec: Vec<SeatNoCell> = bots
+        .iter()
+        .map(|b| SeatNoCell::new(PlayerNoCell::new_with_chips(b.name.clone(), STARTING_CHIPS)))
+        .collect();
+
+    let table = TableNoCell::nlh_from_seats(
+        SeatsNoCell::new(seats_vec),
+        ForcedBets::new(SMALL_BLIND, BIG_BLIND),
+    );
+    let mut session = PokerSession::new(table);
+    let mut collection = HandCollection::new();
+
+    // ── Tournament loop ───────────────────────────────────────────────────────
+    loop {
+        if session.count_funded() < 2 {
+            break;
         }
-        Some(start_hand_response::Result::Error(e)) => {
-            eprintln!("  Error starting hand: {e}");
-            return Ok(());
+
+        // Capture starting chip counts BEFORE start_hand() posts blinds.
+        let starting_chips: Vec<(u8, usize)> = (0u8..9)
+            .filter_map(|s| {
+                session.table.seats.get_seat(s).and_then(|seat| {
+                    if seat.is_empty() {
+                        None
+                    } else {
+                        Some((s, seat.player.chips))
+                    }
+                })
+            })
+            .collect();
+
+        if session.start_hand().is_err() {
+            eprintln!("failed to start hand");
+            break;
         }
-        None => {
-            eprintln!("  empty start_hand response");
-            return Ok(());
-        }
-    }
 
-    // Show all hole cards via the spectator token.
-    section("HOLE CARDS (spectator view)");
-    show_all_cards(&mut client).await?;
+        section(&format!("HAND #{}", session.hand_number));
+        let ts_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut board = String::new();
 
-    // ── 4. Drive the hand via Act alone ───────────────────────────────────────
-    section("HAND IN PROGRESS");
-    let mut board = String::new(); // track board to detect street changes
+        // ── Drive the hand one step at a time ─────────────────────────────────
+        loop {
+            match session.next_step() {
+                SessionStep::PlayerToAct(seat) => {
+                    let action = bots[seat as usize].decide(&session.table, seat, &mut rng);
+                    let label = action_label(&action, &session, seat);
+                    let pot = session.table.pot;
+                    let name = player_name(&session, seat);
+                    println!("  seat {seat} {name:<18}  pot={pot:>6}  {label}");
 
-    'hand: loop {
-        // Ask who is next to act.
-        let next = client
-            .get_next_to_act(Request::new(pkdealer_proto::dealer::GetNextToActRequest {}))
-            .await?
-            .into_inner();
-
-        let (acting_seat, acting_name) = match next.result {
-            Some(get_next_to_act_response::Result::Info(info)) => {
-                (info.seat, info.player_name)
-            }
-            _ => break 'hand, // no hand in progress or no one to act
-        };
-
-        // Try Call first (correct for preflop); fall back to Check when Call
-        // is illegal (post-flop with no bet outstanding).
-        let (action_label, result) =
-            match try_act(&mut client, acting_seat, ActionType::Call, &seat_tokens).await? {
-                (_, Some(r)) => ("Call", r),
-                (_, None) => {
-                    match try_act(&mut client, acting_seat, ActionType::Check, &seat_tokens).await?
-                    {
-                        (_, Some(r)) => ("Check", r),
-                        (_, None) => break 'hand, // neither action succeeded; round is over
+                    if session.apply_action(seat, action).is_err() {
+                        let _ = session.apply_action(seat, PlayerAction::Fold);
                     }
                 }
-            };
 
-        println!(
-            "  seat {acting_seat} {acting_name:5}  pot={:4}  → {action_label}",
-            result.pot,
-        );
+                SessionStep::StreetAdvanced => {
+                    let new_board = session.table.board.to_string();
+                    if new_board != board {
+                        let street = match session.table.board.len() {
+                            3 => "FLOP",
+                            4 => "TURN",
+                            5 => "RIVER",
+                            _ => "STREET",
+                        };
+                        println!("  ── {street}: [{}]", new_board);
+                        board = new_board;
+                    }
+                }
 
-        // Detect a street change by re-reading the board.
-        let new_board = current_board(&mut client).await?;
-        if new_board != board && !new_board.is_empty() {
-            let street = match new_board.split_whitespace().count() {
-                3 => "FLOP",
-                4 => "TURN",
-                5 => "RIVER",
-                _ => "STREET",
-            };
-            println!("  ── {street}: [{new_board}]");
-            board = new_board;
+                SessionStep::HandComplete => {
+                    // Snapshot everything that end_hand() will reset.
+                    let hand_num = session.hand_number as usize;
+                    let button = session.table.button;
+                    let forced = session.table.forced;
+                    let board_str = session.table.board.to_string();
+                    let event_log = session.table.event_log.clone();
+
+                    let player_snapshot: Vec<(u8, String, usize, Option<String>)> = (0u8..9)
+                        .filter_map(|s| {
+                            session.table.seats.get_seat(s).and_then(|seat| {
+                                if seat.is_empty() {
+                                    return None;
+                                }
+                                let start = starting_chips
+                                    .iter()
+                                    .find(|(n, _)| *n == s)
+                                    .map_or(0, |(_, c)| *c);
+                                let hole = {
+                                    let cards: Vec<String> = seat
+                                        .cards
+                                        .as_slice()
+                                        .iter()
+                                        .filter(|c| **c != Card::BLANK)
+                                        .map(|c| c.to_string())
+                                        .collect();
+                                    if cards.is_empty() {
+                                        None
+                                    } else {
+                                        Some(cards.join(" "))
+                                    }
+                                };
+                                Some((s, seat.player.handle.clone(), start, hole))
+                            })
+                        })
+                        .collect();
+
+                    let end_result = session.end_hand();
+
+                    // If end_hand() failed before calling reset() internally
+                    // (e.g. Fubar — zero active players), the table is still
+                    // mid-hand. Force a reset so the next hand can start cleanly.
+                    // ChipAuditFailed already called reset() internally, so
+                    // is_hand_in_progress() will be false in that case.
+                    if session.is_hand_in_progress() {
+                        session.table.reset();
+                    }
+
+                    // Always clear the event log, success or failure.
+                    // pkcore does not auto-clear it, and a stale log would
+                    // contaminate the next hand's YAML record.
+                    session.table.event_log.clear();
+
+                    match end_result {
+                        Ok(ref winnings) => {
+                            for pot_win in winnings.vec() {
+                                let winners: Vec<String> = (0u8..9)
+                                    .filter(|&s| pot_win.equity.seats.contains(s))
+                                    .map(|s| player_name(&session, s))
+                                    .collect();
+                                println!(
+                                    "  ── POT ${}: {}",
+                                    pot_win.equity.chips,
+                                    winners.join(", ")
+                                );
+                            }
+
+                            // Ending stacks after end_hand() settled chips.
+                            let ending_stacks: Vec<(u8, usize)> = (0u8..9)
+                                .filter_map(|s| {
+                                    session.table.seats.get_seat(s).and_then(|seat| {
+                                        if seat.is_empty() {
+                                            None
+                                        } else {
+                                            Some((s, seat.player.chips))
+                                        }
+                                    })
+                                })
+                                .collect();
+
+                            let hh = HandHistory::from_table_state(
+                                hand_num,
+                                ts_secs,
+                                button,
+                                &forced,
+                                &player_snapshot,
+                                &board_str,
+                                winnings,
+                                &event_log,
+                                &ending_stacks,
+                                "demo",
+                            );
+                            collection.push(hh);
+                        }
+                        Err(e) => {
+                            eprintln!("  end_hand warning (hand {hand_num} skipped): {e}");
+                        }
+                    }
+
+                    break;
+                }
+            }
         }
 
-        if result.hand_complete {
-            println!("  ── HAND COMPLETE");
-            break 'hand;
+        // ── Eliminate busted players, advance button ───────────────────────────
+        session.eliminate_busted();
+        session.table.button_up();
+
+        // Print chip counts for surviving players.
+        let survivors: Vec<_> = (0u8..9)
+            .filter_map(|s| {
+                session.table.seats.get_seat(s).and_then(|seat| {
+                    if seat.is_empty() {
+                        None
+                    } else {
+                        Some((seat.player.handle.clone(), seat.player.chips))
+                    }
+                })
+            })
+            .collect();
+        print!("  chips:");
+        for (name, chips) in &survivors {
+            print!("  {name}=${chips}");
+        }
+        println!();
+    }
+
+    // ── Champion ──────────────────────────────────────────────────────────────
+    section("TOURNAMENT RESULT");
+    for s in 0u8..9 {
+        if let Some(seat) = session.table.seats.get_seat(s)
+            && !seat.is_empty()
+        {
+            println!(
+                "  CHAMPION: {} with ${} chips after {} hands",
+                seat.player.handle, seat.player.chips, session.hand_number,
+            );
         }
     }
 
-    // ── 5. Final chip counts ──────────────────────────────────────────────────
-    section("FINAL CHIP COUNTS");
-    let chips = client
-        .get_chips(Request::new(GetChipsRequest {}))
-        .await?
-        .into_inner();
-    let total: u32 = chips.chips.iter().map(|p| p.chips).sum();
-    for p in &chips.chips {
-        println!("  seat {} {:<5}  chips={}", p.seat, p.player_name, p.chips);
+    // ── Save hand histories ────────────────────────────────────────────────────
+    match collection.save("demo") {
+        Ok(path) => println!("  saved: {path}"),
+        Err(e) => eprintln!("  failed to save hand histories: {e}"),
     }
-    println!("  total chips in play: {total}");
-
-    Ok(())
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Attempts one `Act` RPC.  Returns `(action_type, Some(ActionResult))` on
-/// success, or `(action_type, None)` when the server returns an error (illegal
-/// action, wrong turn, etc.).
-async fn try_act(
-    client: &mut Client,
-    seat: u32,
-    action_type: ActionType,
-    seat_tokens: &HashMap<u32, String>,
-) -> Result<(ActionType, Option<pkdealer_proto::dealer::ActionResult>), Box<dyn std::error::Error>>
-{
-    let mut req = Request::new(ActRequest {
-        action: Some(PlayerAction {
-            seat,
-            action_type: action_type as i32,
-            amount: 0,
-        }),
-    });
-    if let Some(token) = seat_tokens.get(&seat)
-        && let Ok(mv) = token.parse::<MetadataValue<_>>()
-    {
-        req.metadata_mut().insert(PLAYER_TOKEN_KEY, mv);
-    }
-
-    let resp = client.act(req).await?.into_inner();
-    match resp.result {
-        Some(act_response::Result::ActionResult(r)) => Ok((action_type, Some(r))),
-        Some(act_response::Result::Error(_)) | None => Ok((action_type, None)),
-    }
+fn player_name(session: &PokerSession, seat: u8) -> String {
+    session
+        .table
+        .seats
+        .get_seat(seat)
+        .map(|s| s.player.handle.clone())
+        .unwrap_or_else(|| format!("seat{seat}"))
 }
 
-/// Returns the current board string (empty string between hands).
-async fn current_board(client: &mut Client) -> Result<String, Box<dyn std::error::Error>> {
-    let status = client
-        .get_status(Request::new(GetStatusRequest {}))
-        .await?
-        .into_inner()
-        .status
-        .unwrap_or_default();
-    Ok(status.board)
-}
-
-/// Seats a player and returns `(seat_number, player_token)`.
-async fn seat_player(
-    client: &mut Client,
-    name: &str,
-    chips: u32,
-) -> Result<(u32, String), Box<dyn std::error::Error>> {
-    let inner = client
-        .seat_player(Request::new(SeatPlayerRequest {
-            name: name.to_owned(),
-            chips,
-        }))
-        .await?
-        .into_inner();
-    match inner.result {
-        Some(seat_player_response::Result::SeatNumber(n)) => Ok((n, inner.player_token)),
-        Some(seat_player_response::Result::Error(e)) => Err(e.into()),
-        None => Err("empty seat_player response".into()),
+fn action_label(action: &PlayerAction, session: &PokerSession, seat: u8) -> String {
+    match action {
+        PlayerAction::Fold => "folds".to_string(),
+        PlayerAction::Check => "checks".to_string(),
+        PlayerAction::Call => {
+            let amount = session.table.to_call(seat);
+            format!("calls ${amount}")
+        }
+        PlayerAction::Bet(n) => format!("bets ${n}"),
+        PlayerAction::Raise(n) => format!("raises to ${n}"),
+        PlayerAction::AllIn => {
+            let chips = session
+                .table
+                .seats
+                .get_seat(seat)
+                .map_or(0, |s| s.player.chips);
+            format!("ALL-IN ${chips}")
+        }
     }
-}
-
-/// Show all hole cards by calling `GetStatus` with the spectator token.
-async fn show_all_cards(client: &mut Client) -> Result<(), Box<dyn std::error::Error>> {
-    let mut req = Request::new(GetStatusRequest {});
-    if let Ok(mv) = SPECTATOR_TOKEN.parse::<MetadataValue<_>>() {
-        req.metadata_mut().insert(PLAYER_TOKEN_KEY, mv);
-    }
-    let status = client
-        .get_status(req)
-        .await?
-        .into_inner()
-        .status
-        .unwrap_or_default();
-    for seat in &status.seats {
-        println!(
-            "  seat {} {:<5}  chips={:5}  cards=[{}]  state={}",
-            seat.seat_number, seat.player_name, seat.chips, seat.cards, seat.state,
-        );
-    }
-    Ok(())
 }
 
 fn section(title: &str) {
-    let dashes = 50usize.saturating_sub(title.len() + 4);
+    let dashes = 55usize.saturating_sub(title.len() + 4);
     println!("\n── {title} {}", "─".repeat(dashes));
 }

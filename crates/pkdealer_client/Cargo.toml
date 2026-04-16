@@ -24,4 +24,6 @@ name = "demo"
 path = "examples/demo.rs"
 
 [dev-dependencies]
+pkcore = "0.0.43"
+rand = "0.9"
 tokio-stream = { version = "0.1", features = ["net"] }

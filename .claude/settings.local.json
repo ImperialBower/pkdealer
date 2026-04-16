@@ -16,7 +16,8 @@
       "Bash(chmod:*)",
       "Bash(bash -n demo.sh)",
       "Bash(grep -r \"illegal\\\\|Illegal\\\\|InvalidAction\\\\|invalid action\\\\|cannot\\\\|not allowed\" ~/.cargo/registry/src/*/pkcore-*/src/)",
-      "Bash(find ~/.cargo/registry/src/*/pkcore-0.0.40/src -name \"*.rs\" -type f)"
+      "Bash(find ~/.cargo/registry/src/*/pkcore-0.0.40/src -name \"*.rs\" -type f)",
+      "Read(//Users/christoph/src/**)"
     ]
   }
 }
