@@ -2,7 +2,11 @@
 #
 # Common commands for development, testing, and CI emulation
 
-.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve demo
+# Number of demo+audit cycles to run (override with COUNT=N on the command line).
+# Example: make demo-audit COUNT=5
+COUNT ?= 1
+
+.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve demo demo-audit
 
 # Default target
 default: ayce
@@ -34,6 +38,7 @@ help:
 	@echo "Service:"
 	@echo "  make serve          - Build and start the dealer service"
 	@echo "  make demo           - Run the 9-player client demo (service must be running)"
+	@echo "  make demo-audit [COUNT=N] - Run demo+audit N times (default 1)"
 	@echo ""
 	@echo "Tools:"
 	@echo "  make install-tools  - Install cargo-deny, cargo-udeps, etc."
@@ -43,6 +48,22 @@ help:
 demo:
 	@echo "Running pkdealer client demo..."
 	cargo run --example demo -p pkdealer_client
+
+# Run a full demo session then immediately audit the generated file.
+# Pass COUNT=N to repeat N times (default 1).  Example: make demo-audit COUNT=5
+demo-audit:
+	@failed=0; \
+	for i in $$(seq 1 $(COUNT)); do \
+		echo "── Run $$i/$(COUNT) ─────────────────────────────────────────"; \
+		tmpfile=$$(mktemp); \
+		cargo run --example demo -p pkdealer_client | tee "$$tmpfile"; \
+		file=$$(grep "saved:" "$$tmpfile" | sed 's/.*saved: //' | tr -d '[:space:]'); \
+		rm -f "$$tmpfile"; \
+		if [ -z "$$file" ]; then echo "ERROR: could not find saved filename in demo output"; exit 1; fi; \
+		echo ""; \
+		cargo run --example audit -p pkdealer_client -- "$$file" || { failed=1; break; }; \
+	done; \
+	exit $$failed
 
 # Start the dealer service
 serve:

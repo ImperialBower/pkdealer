@@ -23,7 +23,11 @@ tonic = { version = "0.12", features = ["transport"] }
 name = "demo"
 path = "examples/demo.rs"
 
+[[example]]
+name = "audit"
+path = "examples/audit.rs"
+
 [dev-dependencies]
-pkcore = "0.0.43"
+pkcore = "0.0.45"
 rand = "0.9"
 tokio-stream = { version = "0.1", features = ["net"] }

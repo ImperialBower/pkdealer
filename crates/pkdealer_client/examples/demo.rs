@@ -17,6 +17,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use pkcore::PKError;
 use pkcore::bot::profile::BotProfile;
 use pkcore::card::Card;
 use pkcore::casino::action::PlayerAction;
@@ -60,7 +61,7 @@ fn main() {
     let mut collection = HandCollection::new();
 
     // ── Tournament loop ───────────────────────────────────────────────────────
-    loop {
+    'tournament: loop {
         if session.count_funded() < 2 {
             break;
         }
@@ -214,6 +215,22 @@ fn main() {
                         }
                         Err(e) => {
                             eprintln!("  end_hand warning (hand {hand_num} skipped): {e}");
+                            // Restore chips to pre-hand state so the pot is not silently
+                            // destroyed when reset() cleared it without awarding a winner.
+                            for (seat, chips) in &starting_chips {
+                                if let Some(s) = session.table.seats.get_seat_mut(*seat) {
+                                    s.player.chips = *chips;
+                                }
+                            }
+                            // Stop the demo immediately on a chip audit failure so the
+                            // collected hands can be audited to isolate the pkcore bug.
+                            if matches!(e, PKError::ChipAuditFailed { .. }) {
+                                eprintln!(
+                                    "  !! ChipAuditFailed — stopping after {} recorded hands",
+                                    collection.len()
+                                );
+                                break 'tournament;
+                            }
                         }
                     }
 
