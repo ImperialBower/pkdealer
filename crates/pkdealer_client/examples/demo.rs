@@ -242,6 +242,56 @@ fn main() {
 
         // ── Eliminate busted players, advance button ───────────────────────────
         session.eliminate_busted();
+
+        // A player whose stack is smaller than the small blind will be
+        // immediately all-in just from posting the forced bet and will have
+        // no agency in the hand.  Transfer their chips to the chip leader
+        // now so the chip-pool total stays correct, then eliminate them so
+        // the next count_funded() check ends the tournament cleanly.
+        let has_sub_blind_stack = (0u8..9).any(|s| {
+            session
+                .table
+                .seats
+                .get_seat(s)
+                .map(|seat| {
+                    !seat.is_empty() && seat.player.chips > 0 && seat.player.chips < SMALL_BLIND
+                })
+                .unwrap_or(false)
+        });
+
+        if has_sub_blind_stack {
+            let leader = (0u8..9)
+                .filter_map(|s| {
+                    session
+                        .table
+                        .seats
+                        .get_seat(s)
+                        .filter(|seat| !seat.is_empty() && seat.player.chips >= SMALL_BLIND)
+                        .map(|seat| (s, seat.player.chips))
+                })
+                .max_by_key(|&(_, chips)| chips)
+                .map(|(s, _)| s);
+
+            if let Some(leader_seat) = leader {
+                let mut transfer = 0usize;
+                for s in 0u8..9 {
+                    if s == leader_seat {
+                        continue;
+                    }
+                    if let Some(seat) = session.table.seats.get_seat_mut(s)
+                        && !seat.is_empty() && seat.player.chips < SMALL_BLIND
+                    {
+                        transfer += seat.player.chips;
+                        seat.player.chips = 0;
+                    }
+                }
+                if let Some(seat) = session.table.seats.get_seat_mut(leader_seat) {
+                    seat.player.chips += transfer;
+                }
+                session.eliminate_busted();
+            }
+        }
+
         session.table.button_up();
 
         // Print chip counts for surviving players.
