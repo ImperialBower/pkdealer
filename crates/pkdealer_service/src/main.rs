@@ -204,8 +204,7 @@ impl DealerService {
     fn now_unix_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_millis() as u64)
     }
 
     /// Constructs and enqueues a [`TableEvent`] on the broadcast channel.

@@ -210,6 +210,7 @@ fn main() {
                                 &event_log,
                                 &ending_stacks,
                                 "demo",
+                                None,
                             );
                             collection.push(hh);
                         }

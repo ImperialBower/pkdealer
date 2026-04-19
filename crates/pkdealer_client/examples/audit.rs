@@ -11,7 +11,7 @@
 //! - `[CHIP MISMATCH]` — actions replayed but final stacks diverge from recorded `net`.
 //! - `[REPLAY ERROR]`  — pkcore rejected the action sequence (e.g. illegal action).
 //! - `[CHIP LEAK]`     — total chips across all seated players changed between two
-//!                       consecutive recorded hands (chips created or destroyed).
+//!   consecutive recorded hands (chips created or destroyed).
 //!
 //! Files under `generated/old/` are treated as **legacy** — they were produced
 //! before `session.table.event_log.clear()` was added to `demo.rs` and may
@@ -127,7 +127,13 @@ fn collect_yaml(dir: &str) -> Vec<String> {
 
 fn audit_files(files: &[String], legacy: bool) -> Counts {
     let tag = if legacy { "[LEGACY]" } else { "" };
-    let mut counts = Counts { total: 0, ok: 0, inconsistent: 0, errors: 0, chip_leaks: 0 };
+    let mut counts = Counts {
+        total: 0,
+        ok: 0,
+        inconsistent: 0,
+        errors: 0,
+        chip_leaks: 0,
+    };
 
     for path in files {
         println!("\n── {path}");
@@ -159,28 +165,34 @@ fn audit_files(files: &[String], legacy: bool) -> Counts {
 
             // ── Cross-hand chip conservation check ────────────────────────────
             let total_start: f64 = hh.players.iter().map(|p| p.stack).sum();
-            if let Some((ref prev_id, prev_total)) = prev_end {
-                if (prev_total - total_start).abs() > 1.0 {
-                    println!(
-                        "  [CHIP LEAK]{tag} after hand {} → hand {}: {:.0} → {:.0} ({:+.0} chips)",
-                        prev_id,
-                        hh.hand.id,
-                        prev_total,
-                        total_start,
-                        total_start - prev_total,
-                    );
-                    counts.chip_leaks += 1;
-                }
+            if let Some((ref prev_id, prev_total)) = prev_end
+                && (prev_total - total_start).abs() > 1.0
+            {
+                println!(
+                    "  [CHIP LEAK]{tag} after hand {} → hand {}: {:.0} → {:.0} ({:+.0} chips)",
+                    prev_id,
+                    hh.hand.id,
+                    prev_total,
+                    total_start,
+                    total_start - prev_total,
+                );
+                counts.chip_leaks += 1;
             }
 
             // Compute ending total for the next iteration.
-            let total_end: f64 = hh.players.iter().map(|p| {
-                let net = hh.results.as_ref()
-                    .and_then(|rs| rs.iter().find(|r| r.seat == p.seat))
-                    .and_then(|r| r.net)
-                    .unwrap_or(0.0);
-                p.stack + net
-            }).sum();
+            let total_end: f64 = hh
+                .players
+                .iter()
+                .map(|p| {
+                    let net = hh
+                        .results
+                        .as_ref()
+                        .and_then(|rs| rs.iter().find(|r| r.seat == p.seat))
+                        .and_then(|r| r.net)
+                        .unwrap_or(0.0);
+                    p.stack + net
+                })
+                .sum();
             prev_end = Some((hh.hand.id.clone(), total_end));
 
             // ── Per-hand replay check ──────────────────────────────────────────
@@ -190,7 +202,10 @@ fn audit_files(files: &[String], legacy: bool) -> Counts {
                     counts.errors += 1;
                 }
                 Ok(ref r) if !r.is_consistent => {
-                    println!("  [CHIP MISMATCH]{tag} hand {} — per-seat diff:", hh.hand.id);
+                    println!(
+                        "  [CHIP MISMATCH]{tag} hand {} — per-seat diff:",
+                        hh.hand.id
+                    );
                     if let Some(results) = &hh.results {
                         for entry in results {
                             if let Some(net) = entry.net {
