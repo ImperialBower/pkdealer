@@ -8,7 +8,7 @@ repository.workspace = true
 description = "gRPC client for poker dealer service"
 keywords = ["poker", "grpc", "dealer", "client"]
 categories = ["games"]
-rust-version = "1.94.0"
+rust-version = "1.94.1"
 
 [[bin]]
 name = "pkdealer_client"
@@ -23,5 +23,11 @@ tonic = { version = "0.12", features = ["transport"] }
 name = "demo"
 path = "examples/demo.rs"
 
+[[example]]
+name = "audit"
+path = "examples/audit.rs"
+
 [dev-dependencies]
+pkcore = "0.0.46"
+rand = "0.9"
 tokio-stream = { version = "0.1", features = ["net"] }
