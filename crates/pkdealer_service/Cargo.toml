@@ -8,7 +8,7 @@ repository.workspace = true
 description = "gRPC service for poker dealer functionality"
 keywords = ["poker", "grpc", "dealer", "service"]
 categories = ["games"]
-rust-version = "1.94.0"
+rust-version = "1.94.1"
 
 [[bin]]
 name = "pkdealer_service"
