@@ -279,7 +279,8 @@ fn main() {
                         continue;
                     }
                     if let Some(seat) = session.table.seats.get_seat_mut(s)
-                        && !seat.is_empty() && seat.player.chips < SMALL_BLIND
+                        && !seat.is_empty()
+                        && seat.player.chips < SMALL_BLIND
                     {
                         transfer += seat.player.chips;
                         seat.player.chips = 0;
