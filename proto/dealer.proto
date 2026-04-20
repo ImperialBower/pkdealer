@@ -1,0 +1,262 @@
+syntax = "proto3";
+
+package pkdealer.dealer.v1;
+
+// The Dealer service manages a poker table: seating players, dealing hands,
+// processing actions, and resolving showdowns.
+//
+// Authentication: mutating RPCs require the `x-player-token` gRPC metadata
+// value (UUID issued by SeatPlayer / SeatPlayerAt). Act validates the token
+// matches the acting seat. RemovePlayer validates the token matches the seat
+// being removed. GetStatus and StreamEvents use the token to control
+// hole-card visibility.
+service DealerService {
+  rpc Ping(PingRequest) returns (PingReply);
+
+  // Seat a new player at the next available seat.
+  rpc SeatPlayer(SeatPlayerRequest) returns (SeatPlayerResponse);
+
+  // Seat a player at a specific seat number.
+  rpc SeatPlayerAt(SeatPlayerAtRequest) returns (SeatPlayerAtResponse);
+
+  // Remove a player from their seat. Requires x-player-token matching the seat.
+  rpc RemovePlayer(RemovePlayerRequest) returns (RemovePlayerResponse);
+
+  // Start a new hand: shuffle, post blinds, deal hole cards.
+  rpc StartHand(StartHandRequest) returns (StartHandResponse);
+
+  // Process a player action. Streets and hand resolution advance automatically.
+  // Requires x-player-token matching the acting seat.
+  rpc Act(ActRequest) returns (ActResponse);
+
+  // Get the current table status. Hole card visibility is controlled by
+  // x-player-token metadata (player sees own cards; spectator token sees all).
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // Get who is next to act and the current betting context.
+  rpc GetNextToAct(GetNextToActRequest) returns (GetNextToActResponse);
+
+  // Get the current community cards.
+  rpc GetBoard(GetBoardRequest) returns (GetBoardResponse);
+
+  // Get chip counts for all seated players.
+  rpc GetChips(GetChipsRequest) returns (GetChipsResponse);
+
+  // Get the current pot size.
+  rpc GetPot(GetPotRequest) returns (GetPotResponse);
+
+  // Get the full event log as formatted text.
+  rpc GetEventLog(GetEventLogRequest) returns (GetEventLogResponse);
+
+  // Get static table configuration (blinds, seat count, variant).
+  rpc GetTableConfig(GetTableConfigRequest) returns (GetTableConfigResponse);
+
+  // Stream all table events as they happen. Supply player_token to receive
+  // your own hole cards in event status snapshots.
+  rpc StreamEvents(StreamEventsRequest) returns (stream TableEvent);
+}
+
+// ── Enums ─────────────────────────────────────────────────────────────────────
+
+enum ActionType {
+  ACTION_TYPE_UNSPECIFIED = 0;
+  ACTION_TYPE_BET = 1;
+  ACTION_TYPE_CALL = 2;
+  ACTION_TYPE_CHECK = 3;
+  ACTION_TYPE_RAISE = 4;
+  ACTION_TYPE_ALL_IN = 5;
+  ACTION_TYPE_FOLD = 6;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_PLAYER_SEATED = 1;
+  EVENT_TYPE_PLAYER_REMOVED = 2;
+  EVENT_TYPE_HAND_STARTED = 3;
+  EVENT_TYPE_PLAYER_ACTION = 4;
+  EVENT_TYPE_STREET_ADVANCED = 5;
+  EVENT_TYPE_HAND_ENDED = 6;
+}
+
+// Represents the player's action state within the current betting round.
+enum PlayerState {
+  PLAYER_STATE_UNSPECIFIED = 0;
+  PLAYER_STATE_READY = 1;       // Seated, waiting for next hand.
+  PLAYER_STATE_YET_TO_ACT = 2;  // Has not acted this street.
+  PLAYER_STATE_CHECKED = 3;
+  PLAYER_STATE_CALLED = 4;
+  PLAYER_STATE_BET = 5;
+  PLAYER_STATE_RAISED = 6;      // Includes re-raise.
+  PLAYER_STATE_ALL_IN = 7;      // Includes showdown (committed all chips).
+  PLAYER_STATE_FOLDED = 8;
+  PLAYER_STATE_OUT = 9;         // Eliminated (busted out).
+  PLAYER_STATE_BLIND = 10;      // Posted forced blind this round.
+}
+
+enum Street {
+  STREET_UNSPECIFIED = 0;
+  STREET_PREFLOP = 1;
+  STREET_FLOP = 2;
+  STREET_TURN = 3;
+  STREET_RIVER = 4;
+}
+
+// ── Messages ──────────────────────────────────────────────────────────────────
+
+message PingRequest { string client_id = 1; }
+message PingReply   { string message   = 1; }
+
+message SeatPlayerRequest {
+  string name  = 1;
+  uint32 chips = 2;  // 0 → server default (10 000)
+}
+message SeatPlayerResponse {
+  oneof result {
+    uint32 seat_number = 1;
+    string error       = 2;
+  }
+  // UUID to use as x-player-token metadata on future RPCs.
+  string player_token = 3;
+}
+
+message SeatPlayerAtRequest {
+  uint32 seat  = 1;
+  string name  = 2;
+  uint32 chips = 3;  // 0 → server default
+}
+message SeatPlayerAtResponse {
+  oneof result {
+    bool   success = 1;
+    string error   = 2;
+  }
+  string player_token = 3;
+}
+
+message RemovePlayerRequest  { uint32 seat = 1; }
+message RemovePlayerResponse {
+  oneof result {
+    string player_name = 1;
+    string error       = 2;
+  }
+}
+
+message StartHandRequest {}
+message StartHandResponse {
+  oneof result {
+    TableStatus status = 1;
+    string      error  = 2;
+  }
+}
+
+message ActRequest { PlayerAction action = 1; }
+message ActResponse {
+  oneof result {
+    ActionResult action_result = 1;
+    string       error         = 2;
+  }
+}
+
+message PlayerAction {
+  uint32     seat        = 1;
+  ActionType action_type = 2;
+  uint32     amount      = 3;  // used for Bet and Raise only
+}
+
+message ActionResult {
+  uint32     next_to_act   = 1;
+  uint32     pot           = 2;
+  bool       hand_complete = 3;
+  HandResult hand_result   = 4;  // populated when hand_complete is true
+}
+
+message HandResult {
+  repeated WinnerInfo  winners     = 1;
+  repeated PlayerChips final_chips = 2;
+}
+
+message WinnerInfo {
+  uint32 seat             = 1;
+  string player_name      = 2;
+  uint32 amount_won       = 3;
+  string hand_description = 4;  // e.g. "Pair", "Flush" — empty on fold win
+}
+
+message GetStatusRequest {}
+message GetStatusResponse { TableStatus status = 1; }
+
+message TableStatus {
+  repeated SeatInfo seats            = 1;
+  string            board            = 2;
+  uint32            pot              = 3;
+  uint32            next_to_act      = 4;
+  bool              hand_in_progress = 5;
+  bool              game_over        = 6;
+  Street            current_street   = 7;
+}
+
+message SeatInfo {
+  uint32      seat_number = 1;
+  string      player_name = 2;
+  uint32      chips       = 3;
+  string      cards       = 4;  // hole cards; redacted unless caller owns this seat
+  PlayerState state       = 5;
+}
+
+message GetNextToActRequest {}
+message GetNextToActResponse {
+  oneof result {
+    NextToActInfo info    = 1;
+    string        message = 2;  // e.g. "No hand in progress"
+  }
+}
+
+message NextToActInfo {
+  uint32 seat           = 1;
+  string player_name    = 2;
+  uint32 chips          = 3;
+  uint32 pot            = 4;
+  uint32 amount_to_call = 5;
+  uint32 min_raise      = 6;
+  uint32 current_bet    = 7;
+}
+
+message GetBoardRequest  {}
+message GetBoardResponse { string board = 1; }
+
+message GetChipsRequest  {}
+message GetChipsResponse { repeated PlayerChips chips = 1; }
+
+message PlayerChips {
+  uint32 seat        = 1;
+  string player_name = 2;
+  uint32 chips       = 3;
+}
+
+message GetPotRequest  {}
+message GetPotResponse { uint32 pot = 1; }
+
+message GetEventLogRequest  {}
+message GetEventLogResponse { string log = 1; }
+
+message GetTableConfigRequest {}
+message GetTableConfigResponse { TableConfig config = 1; }
+message TableConfig {
+  uint32 seat_count    = 1;
+  uint32 small_blind   = 2;
+  uint32 big_blind     = 3;
+  string variant       = 4;  // e.g. "No-Limit Hold'em"
+  uint32 default_chips = 5;
+}
+
+message StreamEventsRequest {
+  // Optional. Supply your player_token to receive your hole cards in status
+  // snapshots embedded in events. Omit for a fully redacted view.
+  string player_token = 1;
+}
+
+message TableEvent {
+  uint64      timestamp      = 1;
+  EventType   event_type     = 2;
+  string      description    = 3;
+  TableStatus current_status = 4;
+}

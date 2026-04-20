@@ -48,13 +48,12 @@ mod tests {
     use super::*;
 
     use pkdealer_proto::dealer::{
-        ActRequest, ActResponse, AdvanceStreetRequest, AdvanceStreetResponse, EndHandRequest,
-        EndHandResponse, GetBoardRequest, GetBoardResponse, GetChipsRequest, GetChipsResponse,
-        GetEventLogRequest, GetEventLogResponse, GetNextToActRequest, GetNextToActResponse,
-        GetPotRequest, GetPotResponse, GetStatusRequest, GetStatusResponse, PingReply, PingRequest,
-        RemovePlayerRequest, RemovePlayerResponse, SeatPlayerAtRequest, SeatPlayerAtResponse,
-        SeatPlayerRequest, SeatPlayerResponse, StartHandRequest, StartHandResponse,
-        StreamEventsRequest, TableEvent,
+        ActRequest, ActResponse, GetBoardRequest, GetBoardResponse, GetChipsRequest,
+        GetChipsResponse, GetEventLogRequest, GetEventLogResponse, GetNextToActRequest,
+        GetNextToActResponse, GetPotRequest, GetPotResponse, GetStatusRequest, GetStatusResponse,
+        GetTableConfigRequest, GetTableConfigResponse, PingReply, PingRequest, RemovePlayerRequest,
+        RemovePlayerResponse, SeatPlayerAtRequest, SeatPlayerAtResponse, SeatPlayerRequest,
+        SeatPlayerResponse, StartHandRequest, StartHandResponse, StreamEventsRequest, TableEvent,
         dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
     };
     use tokio::net::TcpListener;
@@ -98,20 +97,6 @@ mod tests {
             &self,
             _request: Request<StartHandRequest>,
         ) -> Result<Response<StartHandResponse>, Status> {
-            Err(Status::unimplemented("not used in tests"))
-        }
-
-        async fn advance_street(
-            &self,
-            _request: Request<AdvanceStreetRequest>,
-        ) -> Result<Response<AdvanceStreetResponse>, Status> {
-            Err(Status::unimplemented("not used in tests"))
-        }
-
-        async fn end_hand(
-            &self,
-            _request: Request<EndHandRequest>,
-        ) -> Result<Response<EndHandResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
         }
 
@@ -161,6 +146,13 @@ mod tests {
             &self,
             _request: Request<GetEventLogRequest>,
         ) -> Result<Response<GetEventLogResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_table_config(
+            &self,
+            _request: Request<GetTableConfigRequest>,
+        ) -> Result<Response<GetTableConfigResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
         }
 
