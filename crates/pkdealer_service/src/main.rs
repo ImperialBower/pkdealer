@@ -14,10 +14,11 @@
 //!
 //! ## Configuration
 //!
-//! | Variable                    | Default           | Purpose                              |
-//! |-----------------------------|-------------------|--------------------------------------|
-//! | `PKDEALER_ADDR`             | 127.0.0.1:50051   | gRPC listen address                  |
-//! | `PKDEALER_SPECTATOR_TOKEN`  | `spectator`       | Shared secret for full-table card visibility |
+//! | Variable                    | Default           | Purpose                                                     |
+//! |-----------------------------|-------------------|-------------------------------------------------------------|
+//! | `PKDEALER_ADDR`             | 127.0.0.1:50051   | gRPC listen address                                         |
+//! | `PKDEALER_WEB_ADDR`         | *(unset)*         | HTTP spectator bind address; web server starts only when set |
+//! | `PKDEALER_SPECTATOR_TOKEN`  | `spectator`       | Shared secret for full-table card visibility                |
 //!
 //! ## Authentication
 //!
@@ -67,7 +68,16 @@ use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, metadata::MetadataMap, transport::Server};
 use uuid::Uuid;
 
+mod web;
+
 const DEFAULT_SERVICE_ADDR: &str = "127.0.0.1:50051";
+/// Default HTTP address for the web spectator interface.
+///
+/// The web server only starts when `PKDEALER_WEB_ADDR` is explicitly set in the environment.
+/// This constant documents the canonical default and is used by `run_from_env` when the variable
+/// is not set. If you want the web UI, set `PKDEALER_WEB_ADDR=127.0.0.1:3000` (or any address).
+#[allow(dead_code)]
+const DEFAULT_WEB_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_CHIPS: usize = 10_000;
 const DEFAULT_SMALL_BLIND: usize = 50;
 const DEFAULT_BIG_BLIND: usize = 100;
@@ -900,10 +910,11 @@ async fn main() {
 
 async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let addr = env::var("PKDEALER_ADDR").unwrap_or_else(|_| DEFAULT_SERVICE_ADDR.to_owned());
-    run(&addr).await
+    let web_addr = env::var("PKDEALER_WEB_ADDR").ok();
+    run(&addr, web_addr.as_deref()).await
 }
 
-async fn run(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(addr: &str, web_addr: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let socket_addr: SocketAddr = addr.parse()?;
 
     println!("Poker Dealer Service v{}", env!("CARGO_PKG_VERSION"));
@@ -911,12 +922,24 @@ async fn run(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let service = DealerService::new();
 
-    Server::builder()
-        .add_service(DealerServiceServer::new(service))
-        .serve(socket_addr)
-        .await?;
-
-    Ok(())
+    if let Some(wa) = web_addr {
+        let web_socket: SocketAddr = wa.parse()?;
+        println!("Starting web spectator on http://{web_socket}/ ...");
+        let event_tx = service.event_tx.clone();
+        let web_listener = tokio::net::TcpListener::bind(web_socket).await?;
+        tokio::select! {
+            result = Server::builder()
+                .add_service(DealerServiceServer::new(service))
+                .serve(socket_addr) => result.map_err(Into::into),
+            result = web::serve(web_listener, event_tx) => result.map_err(Into::into),
+        }
+    } else {
+        Server::builder()
+            .add_service(DealerServiceServer::new(service))
+            .serve(socket_addr)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
