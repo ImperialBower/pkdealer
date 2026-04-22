@@ -9,7 +9,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         env::set_var("PROTOC", protoc_path);
     }
 
-    let proto_dir = PathBuf::from("proto");
+    // Proto files live at the workspace root in `proto/`, not inside this crate.
+    // CARGO_MANIFEST_DIR is the absolute path to `crates/pkdealer_proto`; stepping
+    // up two levels reaches the workspace root.
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let proto_dir = manifest_dir.join("../../proto");
     let proto_file = proto_dir.join("dealer.proto");
 
     println!("cargo:rerun-if-changed={}", proto_file.display());
@@ -17,7 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&[proto_file], &[proto_dir])?;
+        .compile_protos(&[&proto_file], &[&proto_dir])?;
 
     Ok(())
 }

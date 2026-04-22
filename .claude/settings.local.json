@@ -18,7 +18,8 @@
       "Bash(grep -r \"illegal\\\\|Illegal\\\\|InvalidAction\\\\|invalid action\\\\|cannot\\\\|not allowed\" ~/.cargo/registry/src/*/pkcore-*/src/)",
       "Bash(find ~/.cargo/registry/src/*/pkcore-0.0.40/src -name \"*.rs\" -type f)",
       "Read(//Users/christoph/src/**)",
-      "Bash(grep *)"
+      "Bash(grep *)",
+      "Bash(cargo check *)"
     ]
   }
 }

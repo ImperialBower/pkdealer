@@ -14,10 +14,11 @@
 //!
 //! ## Configuration
 //!
-//! | Variable                    | Default           | Purpose                              |
-//! |-----------------------------|-------------------|--------------------------------------|
-//! | `PKDEALER_ADDR`             | 127.0.0.1:50051   | gRPC listen address                  |
-//! | `PKDEALER_SPECTATOR_TOKEN`  | `spectator`       | Shared secret for full-table card visibility |
+//! | Variable                    | Default           | Purpose                                                     |
+//! |-----------------------------|-------------------|-------------------------------------------------------------|
+//! | `PKDEALER_ADDR`             | 127.0.0.1:50051   | gRPC listen address                                         |
+//! | `PKDEALER_WEB_ADDR`         | *(unset)*         | HTTP spectator bind address; web server starts only when set |
+//! | `PKDEALER_SPECTATOR_TOKEN`  | `spectator`       | Shared secret for full-table card visibility                |
 //!
 //! ## Authentication
 //!
@@ -40,30 +41,43 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use pkcore::analysis::name::HandRankName;
+use pkcore::casino::table::seats::seatbit::Seatbit;
+use pkcore::casino::table::winnings::Winnings;
 use pkcore::casino::{
     action::PlayerAction,
     game::ForcedBets,
     session::{PokerSession, SessionStep},
+    state::PlayerState,
     table_no_cell::{PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell},
 };
 use pkdealer_proto::dealer::{
-    ActRequest, ActResponse, ActionResult, ActionType, AdvanceStreetRequest, AdvanceStreetResponse,
-    EndHandRequest, EndHandResponse, EventType, GetBoardRequest, GetBoardResponse, GetChipsRequest,
-    GetChipsResponse, GetEventLogRequest, GetEventLogResponse, GetNextToActRequest,
-    GetNextToActResponse, GetPotRequest, GetPotResponse, GetStatusRequest, GetStatusResponse,
-    NextToActInfo, PingReply, PingRequest, PlayerChips, RemovePlayerRequest, RemovePlayerResponse,
-    SeatInfo, SeatPlayerAtRequest, SeatPlayerAtResponse, SeatPlayerRequest, SeatPlayerResponse,
-    StartHandRequest, StartHandResponse, StreamEventsRequest, TableEvent, TableStatus,
-    act_response, advance_street_response,
+    ActRequest, ActResponse, ActionResult, ActionType, EventType, GetBoardRequest,
+    GetBoardResponse, GetChipsRequest, GetChipsResponse, GetEventLogRequest, GetEventLogResponse,
+    GetNextToActRequest, GetNextToActResponse, GetPotRequest, GetPotResponse, GetStatusRequest,
+    GetStatusResponse, GetTableConfigRequest, GetTableConfigResponse, HandResult, NextToActInfo,
+    PingReply, PingRequest, PlayerChips, PlayerState as ProtoPlayerState, RemovePlayerRequest,
+    RemovePlayerResponse, SeatInfo, SeatPlayerAtRequest, SeatPlayerAtResponse, SeatPlayerRequest,
+    SeatPlayerResponse, StartHandRequest, StartHandResponse, StreamEventsRequest, Street,
+    TableConfig, TableEvent, TableStatus, WinnerInfo, act_response,
     dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
-    end_hand_response, get_next_to_act_response, remove_player_response, seat_player_at_response,
+    get_next_to_act_response, remove_player_response, seat_player_at_response,
     seat_player_response, start_hand_response,
 };
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, metadata::MetadataMap, transport::Server};
 use uuid::Uuid;
 
+mod web;
+
 const DEFAULT_SERVICE_ADDR: &str = "127.0.0.1:50051";
+/// Default HTTP address for the web spectator interface.
+///
+/// The web server only starts when `PKDEALER_WEB_ADDR` is explicitly set in the environment.
+/// This constant documents the canonical default and is used by `run_from_env` when the variable
+/// is not set. If you want the web UI, set `PKDEALER_WEB_ADDR=127.0.0.1:3000` (or any address).
+#[allow(dead_code)]
+const DEFAULT_WEB_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_CHIPS: usize = 10_000;
 const DEFAULT_SMALL_BLIND: usize = 50;
 const DEFAULT_BIG_BLIND: usize = 100;
@@ -167,7 +181,7 @@ impl DealerService {
                     player_name: seat.player.handle.clone(),
                     chips: seat.player.chips as u32,
                     cards,
-                    state: format!("{:?}", seat.player.state),
+                    state: Self::map_player_state(seat.player.state) as i32,
                 });
             }
         }
@@ -179,6 +193,7 @@ impl DealerService {
             next_to_act: u32::from(table.next_to_act()),
             hand_in_progress: session.is_hand_in_progress(),
             game_over: table.is_game_over(),
+            current_street: Self::map_game_phase_to_street(table) as i32,
         }
     }
 
@@ -198,6 +213,84 @@ impl DealerService {
             }
         }
         result
+    }
+
+    /// Maps a `pkcore` [`PlayerState`] variant to the corresponding proto [`ProtoPlayerState`].
+    fn map_player_state(state: PlayerState) -> ProtoPlayerState {
+        match state {
+            PlayerState::Ready => ProtoPlayerState::Ready,
+            PlayerState::YetToAct => ProtoPlayerState::YetToAct,
+            PlayerState::Check => ProtoPlayerState::Checked,
+            PlayerState::Blind(_) => ProtoPlayerState::Blind,
+            PlayerState::Bet(_) => ProtoPlayerState::Bet,
+            PlayerState::Call(_) => ProtoPlayerState::Called,
+            PlayerState::Raise(_) | PlayerState::ReRaise(_) => ProtoPlayerState::Raised,
+            PlayerState::AllIn(_) | PlayerState::Showdown(_) => ProtoPlayerState::AllIn,
+            PlayerState::Fold => ProtoPlayerState::Folded,
+            PlayerState::Out => ProtoPlayerState::Out,
+        }
+    }
+
+    /// Maps the current game phase from [`TableNoCell`] to a proto [`Street`].
+    fn map_game_phase_to_street(table: &TableNoCell) -> Street {
+        if table.is_preflop() {
+            Street::Preflop
+        } else if table.is_flop() {
+            Street::Flop
+        } else if table.is_turn() {
+            Street::Turn
+        } else if table.is_river() {
+            Street::River
+        } else {
+            Street::Unspecified
+        }
+    }
+
+    /// Builds a structured [`HandResult`] from a completed [`Winnings`] value.
+    ///
+    /// Maps each `PotWin` to one [`WinnerInfo`] per winning seat. Split pots
+    /// produce one entry per sharing seat with each receiving `chips / count`.
+    fn build_hand_result(session: &PokerSession, winnings: &Winnings) -> HandResult {
+        let table = &session.table;
+        let mut winners = Vec::new();
+
+        for pot_win in winnings.vec() {
+            let seatbit = pot_win.equity.seats;
+            let total_chips = pot_win.equity.chips;
+            let hand_description = match pot_win.eval.hand_rank.name {
+                HandRankName::Invalid => String::new(), // fold win — no showdown
+                ref name => format!("{name:?}"),
+            };
+
+            let winning_seats: Vec<u8> = (0u8..Seatbit::CAPACITY)
+                .filter(|&s| seatbit.contains(s))
+                .collect();
+            let per_seat = if winning_seats.is_empty() {
+                0u32
+            } else {
+                (total_chips / winning_seats.len()) as u32
+            };
+
+            for seat_idx in winning_seats {
+                let player_name = table
+                    .seats
+                    .get_seat(seat_idx)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.player.handle.clone())
+                    .unwrap_or_default();
+                winners.push(WinnerInfo {
+                    seat: u32::from(seat_idx),
+                    player_name,
+                    amount_won: per_seat,
+                    hand_description: hand_description.clone(),
+                });
+            }
+        }
+
+        HandResult {
+            winners,
+            final_chips: Self::build_player_chips(session),
+        }
     }
 
     /// Returns the current UTC timestamp in milliseconds since the Unix epoch.
@@ -490,32 +583,6 @@ impl DealerServiceTrait for DealerService {
         }))
     }
 
-    async fn advance_street(
-        &self,
-        _request: Request<AdvanceStreetRequest>,
-    ) -> Result<Response<AdvanceStreetResponse>, Status> {
-        // Street advancement is now managed autonomously by the `act` handler
-        // via `PokerSession::next_step()`. Calling this RPC is no longer needed.
-        Ok(Response::new(AdvanceStreetResponse {
-            result: Some(advance_street_response::Result::Error(
-                "street advancement is managed autonomously; use Act".to_owned(),
-            )),
-        }))
-    }
-
-    async fn end_hand(
-        &self,
-        _request: Request<EndHandRequest>,
-    ) -> Result<Response<EndHandResponse>, Status> {
-        // Hand resolution is now managed autonomously by the `act` handler
-        // via `PokerSession::next_step()`. Calling this RPC is no longer needed.
-        Ok(Response::new(EndHandResponse {
-            result: Some(end_hand_response::Result::Error(
-                "hand resolution is managed autonomously; use Act".to_owned(),
-            )),
-        }))
-    }
-
     // ── Player action ─────────────────────────────────────────────────────────
 
     async fn act(&self, request: Request<ActRequest>) -> Result<Response<ActResponse>, Status> {
@@ -565,6 +632,11 @@ impl DealerServiceTrait for DealerService {
         }
 
         let player_action = match action_type {
+            ActionType::Unspecified => {
+                return Err(Status::invalid_argument(
+                    "action_type must not be UNSPECIFIED",
+                ));
+            }
             ActionType::Bet => PlayerAction::Bet(amount),
             ActionType::Call => PlayerAction::Call,
             ActionType::Check => PlayerAction::Check,
@@ -590,6 +662,7 @@ impl DealerServiceTrait for DealerService {
 
                 // Auto-advance: deal streets and/or end the hand as needed.
                 let mut hand_complete = false;
+                let mut hand_result: Option<HandResult> = None;
                 let mut next_to_act_seat = guard.session.table.next_to_act();
 
                 loop {
@@ -612,14 +685,16 @@ impl DealerServiceTrait for DealerService {
                             match guard.session.end_hand() {
                                 Ok(winnings) => {
                                     hand_complete = true;
-                                    let result_text = winnings.to_string();
+                                    hand_result =
+                                        Some(Self::build_hand_result(&guard.session, &winnings));
+                                    let desc = winnings.to_string();
                                     let status = Self::build_table_status(
                                         &guard.session,
                                         CardVisibility::Hidden,
                                     );
                                     self.emit_event(
                                         EventType::HandEnded,
-                                        format!("Hand ended. {result_text}"),
+                                        format!("Hand ended. {desc}"),
                                         status,
                                     );
                                 }
@@ -638,6 +713,7 @@ impl DealerServiceTrait for DealerService {
                     next_to_act: u32::from(next_to_act_seat),
                     pot: guard.session.table.pot as u32,
                     hand_complete,
+                    hand_result,
                 };
                 Ok(Response::new(ActResponse {
                     result: Some(act_response::Result::ActionResult(action_result)),
@@ -677,8 +753,9 @@ impl DealerServiceTrait for DealerService {
             }));
         }
 
-        let seat_num = guard.session.table.next_to_act();
-        let result = if let Some(seat) = guard.session.table.seats.get_seat(seat_num) {
+        let table = &guard.session.table;
+        let seat_num = table.next_to_act();
+        let result = if let Some(seat) = table.seats.get_seat(seat_num) {
             if seat.is_empty() {
                 get_next_to_act_response::Result::Message("No active player to act".to_owned())
             } else {
@@ -686,7 +763,10 @@ impl DealerServiceTrait for DealerService {
                     seat: u32::from(seat_num),
                     player_name: seat.player.handle.clone(),
                     chips: seat.player.chips as u32,
-                    pot: guard.session.table.pot as u32,
+                    pot: table.pot as u32,
+                    amount_to_call: table.to_call(seat_num) as u32,
+                    min_raise: table.min_raise() as u32,
+                    current_bet: table.bet as u32,
                 })
             }
         } else {
@@ -745,14 +825,48 @@ impl DealerServiceTrait for DealerService {
         Ok(Response::new(GetEventLogResponse { log }))
     }
 
+    // ── Table config ──────────────────────────────────────────────────────────
+
+    async fn get_table_config(
+        &self,
+        _request: Request<GetTableConfigRequest>,
+    ) -> Result<Response<GetTableConfigResponse>, Status> {
+        Ok(Response::new(GetTableConfigResponse {
+            config: Some(TableConfig {
+                seat_count: u32::from(DEFAULT_SEAT_COUNT),
+                small_blind: DEFAULT_SMALL_BLIND as u32,
+                big_blind: DEFAULT_BIG_BLIND as u32,
+                variant: "No-Limit Hold'em".to_owned(),
+                default_chips: DEFAULT_CHIPS as u32,
+            }),
+        }))
+    }
+
     // ── Event stream ──────────────────────────────────────────────────────────
 
     type StreamEventsStream = tokio_stream::wrappers::ReceiverStream<Result<TableEvent, Status>>;
 
     async fn stream_events(
         &self,
-        _request: Request<StreamEventsRequest>,
+        request: Request<StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
+        // Resolve card visibility from the token for future per-subscriber filtering.
+        // Current broadcast events carry Hidden-visibility status snapshots; this
+        // scaffolds per-subscriber hole-card visibility for a later changeset.
+        let token_str = request.into_inner().player_token;
+        let _visibility = {
+            let guard = self.lock()?;
+            if token_str == Self::spectator_token() {
+                CardVisibility::Spectator
+            } else if let Ok(uuid) = token_str.parse::<Uuid>()
+                && let Some(&seat) = guard.token_to_seat.get(&uuid)
+            {
+                CardVisibility::Player(seat)
+            } else {
+                CardVisibility::Hidden
+            }
+        };
+
         let mut broadcast_rx = self.event_tx.subscribe();
         let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
@@ -796,10 +910,11 @@ async fn main() {
 
 async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let addr = env::var("PKDEALER_ADDR").unwrap_or_else(|_| DEFAULT_SERVICE_ADDR.to_owned());
-    run(&addr).await
+    let web_addr = env::var("PKDEALER_WEB_ADDR").ok();
+    run(&addr, web_addr.as_deref()).await
 }
 
-async fn run(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(addr: &str, web_addr: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let socket_addr: SocketAddr = addr.parse()?;
 
     println!("Poker Dealer Service v{}", env!("CARGO_PKG_VERSION"));
@@ -807,12 +922,24 @@ async fn run(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let service = DealerService::new();
 
-    Server::builder()
-        .add_service(DealerServiceServer::new(service))
-        .serve(socket_addr)
-        .await?;
-
-    Ok(())
+    if let Some(wa) = web_addr {
+        let web_socket: SocketAddr = wa.parse()?;
+        println!("Starting web spectator on http://{web_socket}/ ...");
+        let event_tx = service.event_tx.clone();
+        let web_listener = tokio::net::TcpListener::bind(web_socket).await?;
+        tokio::select! {
+            result = Server::builder()
+                .add_service(DealerServiceServer::new(service))
+                .serve(socket_addr) => result.map_err(Into::into),
+            result = web::serve(web_listener, event_tx) => result.map_err(Into::into),
+        }
+    } else {
+        Server::builder()
+            .add_service(DealerServiceServer::new(service))
+            .serve(socket_addr)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1379,7 +1506,9 @@ mod tests {
 
         let service = make_service();
         let response = service
-            .stream_events(Request::new(StreamEventsRequest {}))
+            .stream_events(Request::new(StreamEventsRequest {
+                player_token: String::new(),
+            }))
             .await?;
         let mut stream = response.into_inner();
 
@@ -1421,9 +1550,39 @@ mod tests {
                 assert!(info.seat < u32::from(DEFAULT_SEAT_COUNT));
                 assert!(!info.player_name.is_empty());
                 assert!(info.chips > 0);
+                // Betting context: preflop, the SB (first to act heads-up) has posted 50
+                // and must call 50 more to match the BB's 100.
+                let expected_to_call = (DEFAULT_BIG_BLIND - DEFAULT_SMALL_BLIND) as u32;
+                assert_eq!(
+                    info.amount_to_call, expected_to_call,
+                    "SB needs to call BB - SB = {expected_to_call} more"
+                );
+                assert!(info.min_raise > 0, "min_raise must be positive");
+                assert_eq!(
+                    info.current_bet, DEFAULT_BIG_BLIND as u32,
+                    "current_bet must equal the posted big blind"
+                );
             }
             other => panic!("expected Info, got {other:?}"),
         }
+        Ok(())
+    }
+
+    // ── get_table_config ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_table_config_happy_path() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let response = service
+            .get_table_config(Request::new(GetTableConfigRequest {}))
+            .await?
+            .into_inner();
+        let config = response.config.expect("config must be present");
+        assert_eq!(config.seat_count, u32::from(DEFAULT_SEAT_COUNT));
+        assert_eq!(config.small_blind, DEFAULT_SMALL_BLIND as u32);
+        assert_eq!(config.big_blind, DEFAULT_BIG_BLIND as u32);
+        assert!(!config.variant.is_empty());
+        assert_eq!(config.default_chips, DEFAULT_CHIPS as u32);
         Ok(())
     }
 
@@ -1520,23 +1679,6 @@ mod tests {
         Ok(())
     }
 
-    // ── end_hand (deprecated) ─────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn dealer_service_end_hand_returns_deprecated_error()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let service = make_service();
-        let response = service.end_hand(Request::new(EndHandRequest {})).await?;
-        assert!(
-            matches!(
-                response.into_inner().result,
-                Some(end_hand_response::Result::Error(_))
-            ),
-            "end_hand must return a deprecation error"
-        );
-        Ok(())
-    }
-
     /// After a fold, `act` auto-ends the hand and chips are conserved.
     #[tokio::test]
     async fn dealer_service_fold_auto_ends_hand_chips_conserved()
@@ -1561,29 +1703,6 @@ mod tests {
             .map(|p| p.chips)
             .sum();
         assert_eq!(total, 2_000, "chips must be conserved after auto-payout");
-        Ok(())
-    }
-
-    // ── advance_street (deprecated) ───────────────────────────────────────────
-
-    #[tokio::test]
-    async fn dealer_service_advance_street_returns_deprecated_error()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let service = make_service();
-        seat_two_players(&service).await?;
-        service
-            .start_hand(Request::new(StartHandRequest {}))
-            .await?;
-        let response = service
-            .advance_street(Request::new(AdvanceStreetRequest {}))
-            .await?;
-        assert!(
-            matches!(
-                response.into_inner().result,
-                Some(advance_street_response::Result::Error(_))
-            ),
-            "advance_street must return a deprecation error"
-        );
         Ok(())
     }
 
@@ -1623,7 +1742,20 @@ mod tests {
                 .into_inner();
             match resp.result {
                 Some(act_response::Result::ActionResult(r)) => {
-                    hand_complete = r.hand_complete;
+                    if r.hand_complete {
+                        hand_complete = true;
+                        let hr = r
+                            .hand_result
+                            .expect("hand_result must be present when hand_complete");
+                        assert!(
+                            !hr.winners.is_empty(),
+                            "hand_result must have at least one winner"
+                        );
+                        assert!(
+                            !hr.final_chips.is_empty(),
+                            "hand_result must include final chip counts"
+                        );
+                    }
                 }
                 Some(act_response::Result::Error(e)) => return Err(e.into()),
                 None => return Err("empty act response".into()),
