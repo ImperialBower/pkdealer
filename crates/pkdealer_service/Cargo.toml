@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.7"
 pkcore = "0.0.48"
-pkdealer_proto = { version = "0.1.4", path = "../pkdealer_proto" }
+pkdealer_proto = { version = "0.1.6", path = "../pkdealer_proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "net"] }
