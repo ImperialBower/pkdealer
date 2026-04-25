@@ -51,6 +51,7 @@ use pkcore::casino::{
     state::PlayerState,
     table_no_cell::{PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell},
 };
+use pkdealer_proto::FILE_DESCRIPTOR_SET;
 use pkdealer_proto::dealer::{
     ActRequest, ActResponse, ActionResult, ActionType, EventType, GetBoardRequest,
     GetBoardResponse, GetChipsRequest, GetChipsResponse, GetEventLogRequest, GetEventLogResponse,
@@ -64,7 +65,6 @@ use pkdealer_proto::dealer::{
     get_next_to_act_response, remove_player_response, seat_player_at_response,
     seat_player_response, start_hand_response,
 };
-use pkdealer_proto::FILE_DESCRIPTOR_SET;
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, metadata::MetadataMap, transport::Server};
 use tonic_reflection::server::Builder as ReflectionBuilder;

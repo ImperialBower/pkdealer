@@ -15,8 +15,7 @@ pub mod dealer {
 ///
 /// Pass this to `tonic_reflection::server::Builder::register_encoded_file_descriptor_set`
 /// to enable reflection on the dealer service.
-pub const FILE_DESCRIPTOR_SET: &[u8] =
-    tonic::include_file_descriptor_set!("dealer_descriptor");
+pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("dealer_descriptor");
 
 /// Creates a basic ping request used for connectivity checks.
 ///
