@@ -18,9 +18,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("cargo:rerun-if-changed={}", proto_file.display());
 
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        .file_descriptor_set_path(out_dir.join("dealer_descriptor.bin"))
         .compile_protos(&[&proto_file], &[&proto_dir])?;
 
     Ok(())

@@ -11,6 +11,13 @@ pub mod dealer {
     tonic::include_proto!("pkdealer.dealer.v1");
 }
 
+/// Binary file descriptor set for gRPC server reflection.
+///
+/// Pass this to `tonic_reflection::server::Builder::register_encoded_file_descriptor_set`
+/// to enable reflection on the dealer service.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    tonic::include_file_descriptor_set!("dealer_descriptor");
+
 /// Creates a basic ping request used for connectivity checks.
 ///
 /// This helper exists so downstream crates can build request values without

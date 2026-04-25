@@ -64,8 +64,10 @@ use pkdealer_proto::dealer::{
     get_next_to_act_response, remove_player_response, seat_player_at_response,
     seat_player_response, start_hand_response,
 };
+use pkdealer_proto::FILE_DESCRIPTOR_SET;
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, metadata::MetadataMap, transport::Server};
+use tonic_reflection::server::Builder as ReflectionBuilder;
 use uuid::Uuid;
 
 mod web;
@@ -922,6 +924,11 @@ async fn run(addr: &str, web_addr: Option<&str>) -> Result<(), Box<dyn std::erro
 
     let service = DealerService::new();
 
+    let reflection = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .map_err(|e| format!("reflection service failed to build: {e}"))?;
+
     if let Some(wa) = web_addr {
         let web_socket: SocketAddr = wa.parse()?;
         println!("Starting web spectator on http://{web_socket}/ ...");
@@ -930,12 +937,14 @@ async fn run(addr: &str, web_addr: Option<&str>) -> Result<(), Box<dyn std::erro
         tokio::select! {
             result = Server::builder()
                 .add_service(DealerServiceServer::new(service))
+                .add_service(reflection)
                 .serve(socket_addr) => result.map_err(Into::into),
             result = web::serve(web_listener, event_tx) => result.map_err(Into::into),
         }
     } else {
         Server::builder()
             .add_service(DealerServiceServer::new(service))
+            .add_service(reflection)
             .serve(socket_addr)
             .await
             .map_err(Into::into)
