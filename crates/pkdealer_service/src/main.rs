@@ -17,8 +17,10 @@
 //! | Variable                    | Default           | Purpose                                                     |
 //! |-----------------------------|-------------------|-------------------------------------------------------------|
 //! | `PKDEALER_ADDR`             | 127.0.0.1:50051   | gRPC listen address                                         |
-//! | `PKDEALER_WEB_ADDR`         | *(unset)*         | HTTP spectator bind address; web server starts only when set |
 //! | `PKDEALER_SPECTATOR_TOKEN`  | `spectator`       | Shared secret for full-table card visibility                |
+//!
+//! For the browser spectator UI, run [`pkspectator`](https://github.com/ImperialBower/pkspectator)
+//! as a separate process. It subscribes to this service via gRPC `StreamEvents`.
 //!
 //! ## Authentication
 //!
@@ -68,16 +70,7 @@ use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, metadata::MetadataMap, transport::Server};
 use uuid::Uuid;
 
-mod web;
-
 const DEFAULT_SERVICE_ADDR: &str = "127.0.0.1:50051";
-/// Default HTTP address for the web spectator interface.
-///
-/// The web server only starts when `PKDEALER_WEB_ADDR` is explicitly set in the environment.
-/// This constant documents the canonical default and is used by `run_from_env` when the variable
-/// is not set. If you want the web UI, set `PKDEALER_WEB_ADDR=127.0.0.1:3000` (or any address).
-#[allow(dead_code)]
-const DEFAULT_WEB_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_CHIPS: usize = 10_000;
 const DEFAULT_SMALL_BLIND: usize = 50;
 const DEFAULT_BIG_BLIND: usize = 100;
@@ -194,6 +187,31 @@ impl DealerService {
             hand_in_progress: session.is_hand_in_progress(),
             game_over: table.is_game_over(),
             current_street: Self::map_game_phase_to_street(table) as i32,
+        }
+    }
+
+    /// Returns a copy of `status` with `seat.cards` blanked according to `visibility`.
+    ///
+    /// - [`CardVisibility::Hidden`] → every seat's `cards` is cleared.
+    /// - [`CardVisibility::Player`]`(s)` → only seat `s` keeps its cards.
+    /// - [`CardVisibility::Spectator`] → returned unchanged.
+    fn filter_cards(mut status: TableStatus, visibility: CardVisibility) -> TableStatus {
+        match visibility {
+            CardVisibility::Spectator => status,
+            CardVisibility::Hidden => {
+                for seat in &mut status.seats {
+                    seat.cards.clear();
+                }
+                status
+            }
+            CardVisibility::Player(target) => {
+                for seat in &mut status.seats {
+                    if seat.seat_number != u32::from(target) {
+                        seat.cards.clear();
+                    }
+                }
+                status
+            }
         }
     }
 
@@ -396,7 +414,8 @@ impl DealerServiceTrait for DealerService {
                     let token = Uuid::new_v4();
                     guard.token_to_seat.insert(token, i);
                     guard.seat_to_token.insert(i, token);
-                    let status = Self::build_table_status(&guard.session, CardVisibility::Hidden);
+                    let status =
+                        Self::build_table_status(&guard.session, CardVisibility::Spectator);
                     let event = (
                         EventType::PlayerSeated,
                         format!("Player seated at seat {i}"),
@@ -454,7 +473,7 @@ impl DealerServiceTrait for DealerService {
                 let token = Uuid::new_v4();
                 guard.token_to_seat.insert(token, seat_number);
                 guard.seat_to_token.insert(seat_number, token);
-                let status = Self::build_table_status(&guard.session, CardVisibility::Hidden);
+                let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
                 let event = (
                     EventType::PlayerSeated,
                     format!("Player seated at seat {seat_number}"),
@@ -524,7 +543,7 @@ impl DealerServiceTrait for DealerService {
                 guard.token_to_seat.remove(&uuid);
             }
 
-            let status = Self::build_table_status(&guard.session, CardVisibility::Hidden);
+            let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
             let event = (
                 EventType::PlayerRemoved,
                 format!("Player '{name}' removed from seat {seat}"),
@@ -562,13 +581,22 @@ impl DealerServiceTrait for DealerService {
             }
             match guard.session.start_hand() {
                 Ok(()) => {
-                    let status = Self::build_table_status(&guard.session, CardVisibility::Hidden);
+                    // Broadcast events carry full-visibility snapshots; per-subscriber
+                    // filtering happens in `stream_events`.  The unauthenticated
+                    // `StartHandResponse` itself must hide hole cards.
+                    let event_status =
+                        Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                    let response_status =
+                        Self::filter_cards(event_status.clone(), CardVisibility::Hidden);
                     let event = (
                         EventType::HandStarted,
                         "Hand started".to_owned(),
-                        status.clone(),
+                        event_status,
                     );
-                    (start_hand_response::Result::Status(status), Some(event))
+                    (
+                        start_hand_response::Result::Status(response_status),
+                        Some(event),
+                    )
                 }
                 Err(e) => (start_hand_response::Result::Error(e.to_string()), None),
             }
@@ -653,7 +681,7 @@ impl DealerServiceTrait for DealerService {
         match guard.session.apply_action(seat, player_action) {
             Ok(()) => {
                 // Emit PlayerAction event for the triggering action.
-                let status = Self::build_table_status(&guard.session, CardVisibility::Hidden);
+                let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
                 self.emit_event(
                     EventType::PlayerAction,
                     format!("Seat {seat}: {action_type:?}"),
@@ -674,7 +702,7 @@ impl DealerServiceTrait for DealerService {
                         SessionStep::StreetAdvanced => {
                             let board = guard.session.table.board.to_string();
                             let status =
-                                Self::build_table_status(&guard.session, CardVisibility::Hidden);
+                                Self::build_table_status(&guard.session, CardVisibility::Spectator);
                             self.emit_event(
                                 EventType::StreetAdvanced,
                                 format!("Street advanced. Board: {board}"),
@@ -690,7 +718,7 @@ impl DealerServiceTrait for DealerService {
                                     let desc = winnings.to_string();
                                     let status = Self::build_table_status(
                                         &guard.session,
-                                        CardVisibility::Hidden,
+                                        CardVisibility::Spectator,
                                     );
                                     self.emit_event(
                                         EventType::HandEnded,
@@ -850,11 +878,11 @@ impl DealerServiceTrait for DealerService {
         &self,
         request: Request<StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
-        // Resolve card visibility from the token for future per-subscriber filtering.
-        // Current broadcast events carry Hidden-visibility status snapshots; this
-        // scaffolds per-subscriber hole-card visibility for a later changeset.
+        // Resolve per-subscriber card visibility from the token.  Broadcast events
+        // carry full-visibility snapshots; the bridge below filters each one before
+        // forwarding it to this subscriber.
         let token_str = request.into_inner().player_token;
-        let _visibility = {
+        let visibility = {
             let guard = self.lock()?;
             if token_str == Self::spectator_token() {
                 CardVisibility::Spectator
@@ -873,7 +901,10 @@ impl DealerServiceTrait for DealerService {
         tokio::spawn(async move {
             loop {
                 match broadcast_rx.recv().await {
-                    Ok(event) => {
+                    Ok(mut event) => {
+                        if let Some(status) = event.current_status.take() {
+                            event.current_status = Some(Self::filter_cards(status, visibility));
+                        }
                         if mpsc_tx.send(Ok(event)).await.is_err() {
                             // Client disconnected
                             break;
@@ -910,11 +941,10 @@ async fn main() {
 
 async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let addr = env::var("PKDEALER_ADDR").unwrap_or_else(|_| DEFAULT_SERVICE_ADDR.to_owned());
-    let web_addr = env::var("PKDEALER_WEB_ADDR").ok();
-    run(&addr, web_addr.as_deref()).await
+    run(&addr).await
 }
 
-async fn run(addr: &str, web_addr: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let socket_addr: SocketAddr = addr.parse()?;
 
     println!("Poker Dealer Service v{}", env!("CARGO_PKG_VERSION"));
@@ -922,24 +952,11 @@ async fn run(addr: &str, web_addr: Option<&str>) -> Result<(), Box<dyn std::erro
 
     let service = DealerService::new();
 
-    if let Some(wa) = web_addr {
-        let web_socket: SocketAddr = wa.parse()?;
-        println!("Starting web spectator on http://{web_socket}/ ...");
-        let event_tx = service.event_tx.clone();
-        let web_listener = tokio::net::TcpListener::bind(web_socket).await?;
-        tokio::select! {
-            result = Server::builder()
-                .add_service(DealerServiceServer::new(service))
-                .serve(socket_addr) => result.map_err(Into::into),
-            result = web::serve(web_listener, event_tx) => result.map_err(Into::into),
-        }
-    } else {
-        Server::builder()
-            .add_service(DealerServiceServer::new(service))
-            .serve(socket_addr)
-            .await
-            .map_err(Into::into)
-    }
+    Server::builder()
+        .add_service(DealerServiceServer::new(service))
+        .serve(socket_addr)
+        .await
+        .map_err(Into::into)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1528,6 +1545,102 @@ mod tests {
             .expect("event error");
 
         assert_eq!(event.event_type, EventType::PlayerSeated as i32);
+        Ok(())
+    }
+
+    /// A subscriber holding the spectator token must see hole cards on every
+    /// seated player in the broadcast snapshot for `HandStarted`.
+    #[tokio::test]
+    async fn dealer_service_stream_events_spectator_token_sees_all_cards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio_stream::StreamExt;
+
+        let service = make_service();
+
+        // Subscribe with the spectator token before any state changes so we
+        // capture every event that follows.
+        let response = service
+            .stream_events(Request::new(StreamEventsRequest {
+                player_token: DEFAULT_SPECTATOR_TOKEN.to_owned(),
+            }))
+            .await?;
+        let mut stream = response.into_inner();
+
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        // Drain events until we see HandStarted, then assert visibility.
+        let mut saw_hand_started = false;
+        for _ in 0..6 {
+            let event = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                .await
+                .expect("timeout waiting for event")
+                .expect("stream ended")
+                .expect("event error");
+            if event.event_type == EventType::HandStarted as i32 {
+                let status = event.current_status.expect("HandStarted carries status");
+                assert!(
+                    !status.seats.is_empty(),
+                    "HandStarted snapshot has at least one seat"
+                );
+                for seat in &status.seats {
+                    assert!(
+                        !seat.cards.is_empty(),
+                        "spectator must see cards for seat {}",
+                        seat.seat_number
+                    );
+                }
+                saw_hand_started = true;
+                break;
+            }
+        }
+        assert!(saw_hand_started, "did not observe HandStarted event");
+        Ok(())
+    }
+
+    /// A subscriber with no token must see hole cards blanked on every event.
+    #[tokio::test]
+    async fn dealer_service_stream_events_no_token_hides_cards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio_stream::StreamExt;
+
+        let service = make_service();
+
+        let response = service
+            .stream_events(Request::new(StreamEventsRequest {
+                player_token: String::new(),
+            }))
+            .await?;
+        let mut stream = response.into_inner();
+
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let mut saw_hand_started = false;
+        for _ in 0..6 {
+            let event = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                .await
+                .expect("timeout waiting for event")
+                .expect("stream ended")
+                .expect("event error");
+            if event.event_type == EventType::HandStarted as i32 {
+                let status = event.current_status.expect("HandStarted carries status");
+                for seat in &status.seats {
+                    assert!(
+                        seat.cards.is_empty(),
+                        "no-token subscriber must not see cards for seat {}",
+                        seat.seat_number
+                    );
+                }
+                saw_hand_started = true;
+                break;
+            }
+        }
+        assert!(saw_hand_started, "did not observe HandStarted event");
         Ok(())
     }
 

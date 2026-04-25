@@ -59,6 +59,8 @@ pkdealer/
 | `pkdealer_service` | binary | gRPC server that implements `DealerService` |
 | `pkdealer_client` | binary | gRPC client that connects to the service |
 
+The browser spectator lives in a separate repo: [`pkspectator`](https://github.com/ImperialBower/pkspectator).
+
 ---
 
 ## Prerequisites

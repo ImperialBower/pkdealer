@@ -2,17 +2,23 @@
 
 ## Status
 
+The spectator now lives in its own repository:
+[ImperialBower/pkspectator](https://github.com/ImperialBower/pkspectator). The
+in-process `crates/pkdealer_service/src/web.rs` was removed; pkspectator subscribes
+to the dealer service over gRPC `StreamEvents` like any other client.
+
 | Component | Status |
 |---|---|
-| `pkdealer_spectator` crate | Planned |
-| Axum web server (serve static UI) | Planned |
-| `GET /state` — full table snapshot (JSON, all cards) | Planned |
-| `GET /events` — SSE stream of table events | Planned |
-| gRPC `StreamEvents` subscriber (spectator token) | Planned |
-| Table UI — oval layout, seat positions, board, pot | Planned |
-| Card rendering (SVG) | Planned |
-| Action log sidebar | Planned |
-| Live chip count updates | Planned |
+| `pkspectator` crate (separate repo) | **Complete** |
+| Axum web server (serve embedded UI) | **Complete** |
+| `GET /state` — full table snapshot (JSON, all cards) | **Complete** |
+| `GET /events` — SSE stream of table events | **Complete** |
+| gRPC `StreamEvents` subscriber (spectator token) | **Complete** |
+| Service-side `filter_cards` per-subscriber visibility | **Complete** |
+| Table UI — oval layout, seat positions, board, pot | **Complete** |
+| Card rendering (SVG) | **Complete** |
+| Action log sidebar | **Complete** |
+| Live chip count updates | **Complete** |
 
 ---
 
