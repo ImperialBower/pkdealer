@@ -42,7 +42,7 @@ browsers over Server-Sent Events.
 Browser
   │  EventSource("/events")          HTTP GET /state (initial load)
   ▼
-pkdealer_spectator  (Axum, port 3000)
+pkspectator  (Axum, port 3000)  — https://github.com/ImperialBower/pkspectator
   │  gRPC StreamEvents (spectator token)
   ▼
 pkdealer_service    (Tonic, port 50051)
@@ -51,72 +51,45 @@ pkdealer_service    (Tonic, port 50051)
 pkcore::PokerSession
 ```
 
-The spectator crate is a new workspace member. It owns no game state — it is
-purely a proxy and renderer.
+The spectator lives in its own repository and binary. It owns no game state —
+it is purely a proxy and renderer that connects to `pkdealer_service` like any
+other gRPC client.
 
 ---
 
 ## Design
 
-### New crate: `crates/pkdealer_spectator`
+### Separate repository: `ImperialBower/pkspectator`
 
-```
-crates/pkdealer_spectator/
-├── Cargo.toml
-└── src/
-    ├── main.rs          — Axum server entry point + gRPC subscriber task
-    ├── state.rs         — shared AppState (latest TableStatus snapshot)
-    └── handlers.rs      — route handlers: /, /state, /events
-```
+The spectator is not a workspace member of this repo. See
+[ImperialBower/pkspectator](https://github.com/ImperialBower/pkspectator) for
+its full source, including the Axum server, gRPC subscriber task, and frontend.
 
-**Key dependencies:**
-- `axum` — web framework
-- `tokio` + `tokio-stream` — async runtime and streaming
-- `tonic` — gRPC client for `StreamEvents`
-- `pkdealer_proto` — `TableEvent`, `TableStatus`, `StreamEventsRequest`
-- `serde_json` — serialize `TableStatus` for `/state` and SSE payloads
-- `tower-http` — static file serving for the frontend assets
+### Service-side changes (this repo)
 
-### Shared state
+- `filter_cards` in `pkdealer_service/src/main.rs` — enforces per-subscriber
+  card visibility based on `CardVisibility` (`Hidden`, `Player(seat)`,
+  `Spectator`). Spectator subscribers receive all hole cards; player subscribers
+  see only their own.
+- `web.rs` was removed — the in-process HTTP server is no longer part of the
+  service. The spectator connects over gRPC like any other client.
 
-```rust
-#[derive(Clone)]
-struct AppState {
-    /// Most recently received TableStatus from the service.
-    latest: Arc<RwLock<Option<TableStatus>>>,
-    /// SSE broadcast channel — one sender, many browser receivers.
-    sse_tx: broadcast::Sender<String>,   // JSON-serialized TableEvent
-}
-```
-
-On startup, a background task connects to `pkdealer_service` via gRPC
-`StreamEvents` (with the spectator token in metadata), receives each
-`TableEvent`, updates `latest`, and broadcasts the event to all connected
-SSE clients.
-
-### Routes
+### Routes (served by pkspectator)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/` | Serve the HTML/JS frontend (embedded via `include_str!` or static dir) |
-| `GET` | `/state` | Return current `TableStatus` as JSON (all cards visible) |
+| `GET` | `/` | Embedded HTML/JS frontend |
+| `GET` | `/state` | Current `TableStatus` as JSON (all cards visible) |
 | `GET` | `/events` | SSE stream; each message is a JSON-serialized `TableEvent` |
 
 ### Frontend
 
 A single-page app that:
-1. Fetches `/state` on load to render initial table snapshot
+1. Fetches `/state` on load to render the initial table snapshot
 2. Opens `EventSource("/events")` to receive live updates
-3. Re-renders the affected components on each event
+3. Re-renders affected components on each event
 
-**Technology:**
-- React (Vite build) or plain HTML/CSS/JS — TBD; either serves the goal
-- [SVG-cards](https://github.com/htdebeer/SVG-cards) for card assets
-- Tailwind CSS for layout
-- Oval table layout with 9 seat positions, dealer button, pot display
-- Action log panel showing last N events
-
-**Layout sketch:**
+**Layout:**
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -138,32 +111,21 @@ mode), and an indicator for the active seat.
 
 ---
 
-## Work Items
-
-1. Add `pkdealer_spectator` to the workspace `Cargo.toml` members list
-2. Create `crates/pkdealer_spectator/Cargo.toml` with required dependencies
-3. Implement `AppState` with `RwLock<Option<TableStatus>>` and SSE broadcast sender
-4. Write the background gRPC subscriber task:
-   - Connect to service with spectator token in metadata
-   - Receive each `TableEvent`, update `latest`, broadcast JSON to SSE channel
-   - Reconnect on disconnect with exponential backoff
-5. Implement Axum route handlers (`/`, `/state`, `/events`)
-6. Build the frontend (React/Vite or plain HTML):
-   - Oval table with 9 seat positions
-   - SVG card rendering
-   - SSE listener that patches the rendered state on each event
-   - Dealer button, blinds indicator, pot display
-7. Write integration test: start service + spectator, assert `/state` returns valid JSON
-8. Add `pkdealer_spectator` binary to workspace `[[bin]]` or as its own crate entry point
-
----
-
 ## Configuration
+
+### pkdealer_service (this repo)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PKDEALER_ADDR` | `127.0.0.1:50051` | gRPC listen address |
+| `PKDEALER_SPECTATOR_TOKEN` | `spectator` | Auth token for full card visibility |
+
+### pkspectator (separate repo)
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PKDEALER_ENDPOINT` | `http://127.0.0.1:50051` | gRPC service address |
-| `PKDEALER_SPECTATOR_TOKEN` | `spectator` | Auth token for full card visibility |
+| `PKDEALER_SPECTATOR_TOKEN` | `spectator` | Must match the service token |
 | `PKSPECTATOR_ADDR` | `127.0.0.1:3000` | Axum listen address |
 
 ---
@@ -171,14 +133,14 @@ mode), and an indicator for the active seat.
 ## Verification
 
 ```bash
-# Build
+# Build this repo
 cargo build --workspace
 
 # Start service (with EPIC-20 autonomous loop)
 cargo run --bin pkdealer_service &
 
-# Start spectator
-cargo run --bin pkdealer_spectator &
+# Start spectator (from the pkspectator repo)
+cargo run --bin pkspectator &
 
 # Open browser
 open http://localhost:3000
@@ -188,5 +150,5 @@ cargo run --bin pkdealer_agent_random -- --name alice --seat 0 &
 cargo run --bin pkdealer_agent_random -- --name bob --seat 1 &
 ```
 
-The browser should show both players' hole cards, the board, and the pot
-updating in real time as hands are played.
+The browser shows all players' hole cards, the board, and the pot updating in
+real time as hands are played.
