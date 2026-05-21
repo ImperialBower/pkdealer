@@ -1,0 +1,117 @@
+<h2>Design: The CardGame Trait</h2>
+<p class="subtitle">Section 2 of 5 — The central contract every game engine adapter must implement</p>
+
+<div class="section">
+  <p class="label">Trait definition (in cardgame_core)</p>
+  <div style="font-family:monospace;font-size:0.78em;padding:16px;background:rgba(0,0,0,0.18);border-radius:8px;line-height:1.9">
+    <span style="color:#fa8">pub trait CardGame: Send + Sync + 'static {</span><br>
+    &nbsp;&nbsp;<span style="color:#aaf">// ── Associated types ──────────────────────────</span><br>
+    &nbsp;&nbsp;<span style="color:#8df">type Action:</span> Send + Sync + fmt::Debug;<br>
+    &nbsp;&nbsp;<span style="color:#8df">type Config:</span> Send + Sync + Default;<br>
+    &nbsp;&nbsp;<span style="color:#8df">type Error:</span> error::Error + Send + Sync + Into&lt;tonic::Status&gt;;<br>
+    <br>
+    &nbsp;&nbsp;<span style="color:#aaf">// ── Lifecycle ─────────────────────────────────</span><br>
+    &nbsp;&nbsp;fn new(config: Self::Config) -&gt; Result&lt;Self, Self::Error&gt; where Self: Sized;<br>
+    &nbsp;&nbsp;fn start_round(&amp;mut self) -&gt; Result&lt;(), Self::Error&gt;;<br>
+    &nbsp;&nbsp;fn end_round(&amp;mut self) -&gt; Result&lt;<span style="color:#fa8">RoundResult</span>, Self::Error&gt;;<br>
+    <br>
+    &nbsp;&nbsp;<span style="color:#aaf">// ── Player actions ────────────────────────────</span><br>
+    &nbsp;&nbsp;fn apply_action(&amp;mut self, seat: u8, action: Self::Action)<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;-&gt; Result&lt;<span style="color:#fa8">ActionOutcome</span>, Self::Error&gt;;<br>
+    &nbsp;&nbsp;fn valid_actions(&amp;self, seat: u8) -&gt; Vec&lt;Self::Action&gt;;<br>
+    <br>
+    &nbsp;&nbsp;<span style="color:#aaf">// ── State queries (feed the base proto) ───────</span><br>
+    &nbsp;&nbsp;fn next_to_act(&amp;self) -&gt; Option&lt;u8&gt;;<br>
+    &nbsp;&nbsp;fn is_round_in_progress(&amp;self) -&gt; bool;<br>
+    &nbsp;&nbsp;fn seat_count(&amp;self) -&gt; u8;<br>
+    &nbsp;&nbsp;fn player_cards(&amp;self, seat: u8, vis: <span style="color:#fa8">CardVisibility</span>) -&gt; Vec&lt;String&gt;;<br>
+    &nbsp;&nbsp;fn shared_cards(&amp;self) -&gt; Vec&lt;String&gt;; <span style="color:#666">// empty for non-community-card games</span><br>
+    &nbsp;&nbsp;fn chips(&amp;self, seat: u8) -&gt; Option&lt;u64&gt;; <span style="color:#666">// None for chipless games</span><br>
+    &nbsp;&nbsp;fn pot(&amp;self) -&gt; u64;<br>
+    &nbsp;&nbsp;fn phase_name(&amp;self) -&gt; String; <span style="color:#666">// "Preflop" / "Bidding" / "Deal" / …</span><br>
+    &nbsp;&nbsp;fn event_log(&amp;self) -&gt; Vec&lt;String&gt;;<br>
+    <span style="color:#fa8">}</span>
+  </div>
+</div>
+
+<div class="section">
+  <p class="label">Shared result types (also in cardgame_core)</p>
+  <div style="display:flex;gap:16px;flex-wrap:wrap">
+    <div style="flex:1;min-width:220px;font-family:monospace;font-size:0.78em;padding:12px;background:rgba(0,0,0,0.15);border-radius:6px;line-height:1.8">
+      <span style="color:#fa8">struct RoundResult {</span><br>
+      &nbsp;&nbsp;winners: Vec&lt;Winner&gt;,<br>
+      &nbsp;&nbsp;final_chips: Vec&lt;(u8,u64)&gt;,<br>
+      &nbsp;&nbsp;description: String,<br>
+      <span style="color:#fa8">}</span>
+    </div>
+    <div style="flex:1;min-width:220px;font-family:monospace;font-size:0.78em;padding:12px;background:rgba(0,0,0,0.15);border-radius:6px;line-height:1.8">
+      <span style="color:#fa8">struct ActionOutcome {</span><br>
+      &nbsp;&nbsp;next_to_act: Option&lt;u8&gt;,<br>
+      &nbsp;&nbsp;round_complete: bool,<br>
+      &nbsp;&nbsp;events: Vec&lt;String&gt;,<br>
+      <span style="color:#fa8">}</span>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <p class="label">How each game maps its engine to the trait</p>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
+
+    <div style="padding:12px;background:rgba(80,120,255,0.12);border-radius:8px;border:1px solid rgba(80,120,255,0.3)">
+      <strong style="color:#8df">Poker (existing pkcore)</strong>
+      <div style="font-family:monospace;font-size:0.75em;margin-top:8px;line-height:1.7">
+        Action = PlayerAction<br>
+        Config = TableConfig<br>
+        phase_name → Street<br>
+        shared_cards → board<br>
+        chips → stack<br>
+        pot → pkcore pot
+      </div>
+    </div>
+
+    <div style="padding:12px;background:rgba(80,200,120,0.12);border-radius:8px;border:1px solid rgba(80,200,120,0.3)">
+      <strong style="color:#8fa">Blackjack (new bjcore)</strong>
+      <div style="font-family:monospace;font-size:0.75em;margin-top:8px;line-height:1.7">
+        Action = Hit|Stand|Double|Split<br>
+        Config = DealerRules<br>
+        phase_name → "PlayerTurn" | "DealerTurn"<br>
+        shared_cards → dealer hand<br>
+        chips → bet + stack<br>
+        pot → total wagered
+      </div>
+    </div>
+
+    <div style="padding:12px;background:rgba(255,160,80,0.12);border-radius:8px;border:1px solid rgba(255,160,80,0.3)">
+      <strong style="color:#fa8">Go Fish (new gofishcore)</strong>
+      <div style="font-family:monospace;font-size:0.75em;margin-top:8px;line-height:1.7">
+        Action = Ask(rank) | DrawFromPond<br>
+        Config = PlayerCount<br>
+        phase_name → "Ask" | "Draw"<br>
+        shared_cards → [] (none)<br>
+        chips → None (chipless)<br>
+        pot → 0
+      </div>
+    </div>
+
+    <div style="padding:12px;background:rgba(200,80,255,0.12);border-radius:8px;border:1px solid rgba(200,80,255,0.3)">
+      <strong style="color:#d8f">Bridge (new bridgecore)</strong>
+      <div style="font-family:monospace;font-size:0.75em;margin-top:8px;line-height:1.7">
+        Action = Bid(contract) | Play(card) | Pass<br>
+        Config = BiddingSystem<br>
+        phase_name → "Bidding" | "Play" | "Scoring"<br>
+        shared_cards → dummy hand (after opening lead)<br>
+        chips → None<br>
+        pot → 0
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="section">
+  <p class="label">Why associated types over generic parameters</p>
+  <p>Using <code>type Action</code> (associated type) rather than <code>CardGame&lt;A, C, E&gt;</code> (generic parameters) means you never write <code>GameServer&lt;G, G::Action, G::Config&gt;</code> — the compiler resolves everything through <code>G</code> alone. Cleaner bounds, cleaner error messages.</p>
+</div>
+
+<p style="margin-top:16px"><em>Does this trait shape look right? Any methods missing or that don't fit a game you have in mind?</em></p>

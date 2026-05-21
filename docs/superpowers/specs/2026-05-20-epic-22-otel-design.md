@@ -14,9 +14,10 @@ hand-level traces in Jaeger, four service metrics in Prometheus, a
 hand-authored Grafana dashboard, and W3C TraceContext propagation across
 gRPC so future agent clients (EPIC-23) nest naturally under service spans.
 
-This epic is the foundation for the platform's observability story. It does
-**not** ship a containerised service (EPIC-24), agent decision spans
-(EPIC-23), or Langfuse integration (EPIC-23 / EPIC-24).
+This epic is the foundation for the platform's observability story. It
+includes a containerised `pkdealer_service` so `docker compose up` brings
+the full backend stack online in one shot. It does **not** ship agent
+decision spans (EPIC-23) or Langfuse integration (EPIC-23 / EPIC-24).
 
 ---
 
@@ -56,10 +57,11 @@ This epic is the foundation for the platform's observability story. It does
                                                                        └─────────┘
 ```
 
-`pkdealer_service` runs on the host (via `cargo run`) and pushes OTLP over
-gRPC to `otel-collector` in compose. Backend containers are
-`otel-collector`, `jaeger`, `prometheus`, `grafana`. No service container in
-this epic — that's EPIC-24's job.
+`pkdealer_service` is **containerised in this epic** and runs in compose
+alongside `otel-collector`, `jaeger`, `prometheus`, and `grafana`. Host
+dev (`cargo run`) is still supported — the only thing that changes between
+the two is `OTEL_EXPORTER_OTLP_ENDPOINT` (`http://otel-collector:4317`
+in compose, `http://localhost:4317` on host).
 
 ---
 
@@ -277,6 +279,8 @@ New top-level files in pkdealer/:
 ```
 pkdealer/
 ├── docker-compose.yml                            (new)
+├── crates/pkdealer_service/Dockerfile            (new)
+├── .dockerignore                                 (new)
 └── ops/                                          (new)
     ├── otel-collector.yaml
     ├── prometheus.yml
@@ -288,17 +292,69 @@ pkdealer/
             └── pkdealer.json
 ```
 
+### `crates/pkdealer_service/Dockerfile`
+
+Multi-stage build — `cargo-chef` first stage caches deps, second stage
+compiles the workspace binary, runtime stage is a slim Debian image with
+only the compiled binary and a non-root user:
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+FROM rust:1.94-slim-bookworm AS chef
+RUN cargo install cargo-chef --locked
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --bin pkdealer_service --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --bin pkdealer_service
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates && rm -rf /var/lib/apt/lists/* && \
+    useradd --uid 10001 --create-home --shell /bin/false pkdealer
+USER pkdealer
+COPY --from=builder /app/target/release/pkdealer_service /usr/local/bin/
+EXPOSE 50051
+ENV OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 \
+    OTEL_SERVICE_NAME=pkdealer_service \
+    RUST_LOG=pkdealer_service=info,info
+ENTRYPOINT ["/usr/local/bin/pkdealer_service"]
+```
+
+`.dockerignore` excludes `target/`, `.git/`, `docs/`, and `generated/`
+to keep the build context small.
+
 ### `docker-compose.yml`
 
 ```yaml
 services:
+  pkdealer_service:
+    build:
+      context: .
+      dockerfile: crates/pkdealer_service/Dockerfile
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: pkdealer_service
+      RUST_LOG: pkdealer_service=info,info
+    ports: ["50051:50051"]
+    depends_on:
+      - otel-collector
+
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.115.1
     command: ["--config=/etc/otel-collector.yaml"]
     volumes: ["./ops/otel-collector.yaml:/etc/otel-collector.yaml:ro"]
     ports:
-      - "4317:4317"   # OTLP gRPC in
+      - "4317:4317"   # OTLP gRPC in (also reachable from host)
       - "8889:8889"   # Prometheus exporter out
+    depends_on:
+      - jaeger
 
   jaeger:
     image: jaegertracing/all-in-one:1.62
@@ -323,6 +379,10 @@ services:
       - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports: ["3001:3000"]
 ```
+
+Host-dev mode: `docker compose up -d otel-collector jaeger prometheus
+grafana` brings up only the backends; service runs locally via
+`cargo run` with `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`.
 
 ### `ops/otel-collector.yaml`
 
@@ -401,15 +461,28 @@ is used in tests.
 
 ## Verification (manual)
 
+Two modes are supported. Both produce identical traces and metrics.
+
+**Mode A — full compose (default for demos):**
+
 ```bash
-docker compose up -d
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
-  cargo run --bin pkdealer_service
-cargo run --example demo -p pkdealer_client
+docker compose up -d --build
+cargo run --example demo -p pkdealer_client    # host-side client → :50051
 
 open http://localhost:16686   # Jaeger: service "pkdealer_service"
 open http://localhost:9090    # Prometheus: pkdealer_hands_played_total
 open http://localhost:3001    # Grafana: "pkdealer" dashboard
+```
+
+**Mode B — host dev (faster iteration on the service):**
+
+```bash
+docker compose up -d otel-collector jaeger prometheus grafana
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  cargo run --bin pkdealer_service
+cargo run --example demo -p pkdealer_client
+
+# same three URLs as above
 ```
 
 Complete hand trace shows `hand` → `street` × N → `action` × N. Metrics
@@ -443,22 +516,25 @@ appear in Prometheus within one scrape interval (≤15s).
    `action_duration_ms` at the documented sites
 8. Add `action` span in `act` handler; extract `traceparent` via
    `MetadataExtractor`; link to current `hand` span
-9. Write `docker-compose.yml`, `ops/otel-collector.yaml`,
-   `ops/prometheus.yml`
-10. Write `ops/grafana/dashboards/pkdealer.json` and provisioning files
-11. Write tests listed above
-12. Update `crates/pkdealer_service/README.md`, `CLAUDE.md`, `DEVLOG.md`,
+9. Write `crates/pkdealer_service/Dockerfile` (multi-stage, cargo-chef)
+   and `.dockerignore`
+10. Write `docker-compose.yml` (service + collector + jaeger + prometheus
+    + grafana), `ops/otel-collector.yaml`, `ops/prometheus.yml`
+11. Write `ops/grafana/dashboards/pkdealer.json` and provisioning files
+12. Write tests listed above
+13. Update `crates/pkdealer_service/README.md`, `CLAUDE.md`, `DEVLOG.md`,
     `docs/EPIC-22_OTel.md`
 
 ---
 
 ## Out of scope
 
-- `pkdealer_service` Docker image (EPIC-24)
 - Langfuse / `gen_ai.*` semantic conventions (agent-emitted; EPIC-23)
 - Sampling configuration (defaults until volume warrants tuning)
 - Multi-table or per-table metric labels (single-table today)
 - Log export to OTLP (stdout `fmt` layer is enough for v1)
+- Published image registry (build is local-only via `docker compose build`;
+  pushing to ghcr/dockerhub waits for EPIC-24 / CI)
 
 ---
 
