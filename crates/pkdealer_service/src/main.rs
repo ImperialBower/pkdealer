@@ -68,6 +68,7 @@ use pkdealer_proto::dealer::{
     get_next_to_act_response, remove_player_response, seat_player_at_response,
     seat_player_response, start_hand_response,
 };
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, metadata::MetadataMap, transport::Server};
 use uuid::Uuid;
@@ -120,13 +121,60 @@ struct TableState {
     last_prompt_at:      Option<std::time::Instant>,
 }
 
+// ── Metrics ───────────────────────────────────────────────────────────────────
+
+/// Four OTel instruments emitted by the service. Construction reads the
+/// global meter provider, which `init_otel` configures with an OTLP
+/// periodic exporter. In tests (where `init_otel` was never called) the
+/// global meter is the no-op default, so instrument construction is a
+/// silent no-op too.
+///
+/// `ai_decision_latency_ms` is **reserved for agent clients (EPIC-23)** —
+/// the service does not record into it. Declared here so the dashboard
+/// can reference a stable instrument name from day one.
+#[derive(Debug)]
+struct Metrics {
+    hands_played:           Counter<u64>,
+    pot_size:               Histogram<u64>,
+    action_duration_ms:     Histogram<f64>,
+    #[allow(dead_code)]
+    ai_decision_latency_ms: Histogram<f64>,
+}
+
+impl Metrics {
+    fn new(meter: &Meter) -> Self {
+        Self {
+            hands_played: meter
+                .u64_counter("pkdealer.hands_played")
+                .with_description("Total hands completed")
+                .build(),
+            pot_size: meter
+                .u64_histogram("pkdealer.pot_size")
+                .with_description("Final pot size per hand")
+                .with_unit("chips")
+                .build(),
+            action_duration_ms: meter
+                .f64_histogram("pkdealer.action_duration_ms")
+                .with_description("Time from next_actor prompt to act receipt")
+                .with_unit("ms")
+                .build(),
+            ai_decision_latency_ms: meter
+                .f64_histogram("pkdealer.ai_decision_latency_ms")
+                .with_description("Agent-side decision latency")
+                .with_unit("ms")
+                .build(),
+        }
+    }
+}
+
 // ── DealerService ─────────────────────────────────────────────────────────────
 
 /// gRPC service implementation for the poker dealer.
 #[derive(Clone)]
 struct DealerService {
-    state: Arc<Mutex<TableState>>,
+    state:    Arc<Mutex<TableState>>,
     event_tx: broadcast::Sender<TableEvent>,
+    metrics:  Arc<Metrics>,
 }
 
 impl DealerService {
@@ -152,7 +200,9 @@ impl DealerService {
             last_prompt_at:      None,
         }));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        DealerService { state, event_tx }
+        let meter = opentelemetry::global::meter("pkdealer_service");
+        let metrics = Arc::new(Metrics::new(&meter));
+        DealerService { state, event_tx, metrics }
     }
 
     /// Acquires the state lock and returns an error `Status` if the lock is poisoned.
