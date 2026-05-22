@@ -677,6 +677,7 @@ impl DealerServiceTrait for DealerService {
                     guard.current_hand_span   = Some(span);
                     guard.current_street_span = None;
                     guard.hand_started_at     = Some(std::time::Instant::now());
+                    guard.last_prompt_at      = Some(std::time::Instant::now());
 
                     // Broadcast events carry full-visibility snapshots; per-subscriber
                     // filtering happens in `stream_events`.  The unauthenticated
@@ -764,6 +765,13 @@ impl DealerServiceTrait for DealerService {
             }
         }
 
+        // Compute action latency: time from the most recent NextActor prompt
+        // to this `act` arrival. Recorded as f64 ms with attributes.
+        let action_latency_ms: Option<f64> = {
+            let guard = self.lock()?;
+            guard.last_prompt_at.map(|t| t.elapsed().as_secs_f64() * 1000.0)
+        };
+
         let player_action = match action_type {
             ActionType::Unspecified => {
                 return Err(Status::invalid_argument(
@@ -777,6 +785,17 @@ impl DealerServiceTrait for DealerService {
             ActionType::AllIn => PlayerAction::AllIn,
             ActionType::Fold => PlayerAction::Fold,
         };
+
+        if let Some(ms) = action_latency_ms {
+            use opentelemetry::KeyValue;
+            self.metrics.action_duration_ms.record(
+                ms,
+                &[
+                    KeyValue::new("action_type", format!("{action_type:?}")),
+                    KeyValue::new("seat", i64::from(seat)),
+                ],
+            );
+        }
 
         // Hold the lock for the full apply + advance loop to keep state atomic.
         // `emit_event` only sends on the broadcast channel — it never re-acquires
@@ -862,6 +881,7 @@ impl DealerServiceTrait for DealerService {
                     match guard.session.next_step() {
                         SessionStep::PlayerToAct(s) => {
                             next_to_act_seat = s;
+                            guard.last_prompt_at = Some(std::time::Instant::now());
                             break;
                         }
                         SessionStep::StreetAdvanced => {
@@ -910,6 +930,11 @@ impl DealerServiceTrait for DealerService {
                                         EventType::HandEnded,
                                         format!("Hand ended. {desc}"),
                                         status,
+                                    );
+                                    self.metrics.hands_played.add(1, &[]);
+                                    self.metrics.pot_size.record(
+                                        guard.session.table.pot as u64,
+                                        &[],
                                     );
                                     // Tear down the hand span and timing state.
                                     let _ = guard.current_street_span.take();
