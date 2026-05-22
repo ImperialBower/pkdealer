@@ -35,3 +35,4 @@ opentelemetry-semantic-conventions = "0.30"
 
 [dev-dependencies]
 tracing-test = "0.2"
+serial_test = "3"

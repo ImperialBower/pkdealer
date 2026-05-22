@@ -89,13 +89,10 @@ impl Drop for OtelGuards {
 /// ```
 pub fn init_otel() -> Result<Option<OtelGuards>, Box<dyn Error>> {
     if std::env::var("OTEL_SDK_DISABLED").as_deref() == Ok("true") {
-        // Plain fmt subscriber so logs still appear under the disabled path.
-        Registry::default()
-            .with(EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("pkdealer_service=info,info")))
-            .with(fmt::layer())
-            .try_init()
-            .ok();
+        // No global subscriber installed — the disabled path is purely a
+        // skip. Callers that want stdout logging can wire `tracing-subscriber`
+        // themselves. (Installing a fmt subscriber here would clobber the
+        // thread-local subscribers integration tests rely on.)
         return Ok(None);
     }
 

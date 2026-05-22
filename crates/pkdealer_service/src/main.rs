@@ -380,6 +380,25 @@ impl DealerService {
     }
 }
 
+/// Returns a stable string label for the current street, suitable as a span
+/// attribute. Uses the same phase-detection methods as
+/// [`DealerService::map_game_phase_to_street`] but returns a fixed `&'static str`
+/// so the telemetry vocabulary doesn't churn with proto bumps.
+fn street_label(session: &PokerSession) -> &'static str {
+    let table = &session.table;
+    if table.is_preflop() {
+        "preflop"
+    } else if table.is_flop() {
+        "flop"
+    } else if table.is_turn() {
+        "turn"
+    } else if table.is_river() {
+        "river"
+    } else {
+        "showdown"
+    }
+}
+
 // ── gRPC trait implementation ─────────────────────────────────────────────────
 
 #[tonic::async_trait]
@@ -728,7 +747,28 @@ impl DealerServiceTrait for DealerService {
                             break;
                         }
                         SessionStep::StreetAdvanced => {
+                            // Close prior street span (if any) and open a fresh one
+                            // parented to the current hand span.
+                            guard.current_street_span = None;
+
                             let board = guard.session.table.board.to_string();
+                            let street_name = street_label(&guard.session);
+                            let street_span = if let Some(ref hand_span) = guard.current_hand_span {
+                                tracing::info_span!(
+                                    parent: hand_span,
+                                    "street",
+                                    street_name = %street_name,
+                                    board_cards = %board,
+                                )
+                            } else {
+                                tracing::info_span!(
+                                    "street",
+                                    street_name = %street_name,
+                                    board_cards = %board,
+                                )
+                            };
+                            guard.current_street_span = Some(street_span);
+
                             let status =
                                 Self::build_table_status(&guard.session, CardVisibility::Spectator);
                             self.emit_event(
@@ -2188,7 +2228,12 @@ mod tests {
 
     /// The `hand` span must be opened exactly once when `start_hand` succeeds
     /// and closed exactly once when the hand reaches `HandComplete`.
-    #[tokio::test]
+    // `flavor = "current_thread"` keeps the tokio future on a single thread,
+    // and `#[serial]` ensures no concurrent `#[tokio::test]` with a multi-
+    // thread runtime can land workers on this thread and create spans that
+    // bypass the test's thread-local SpanCounter subscriber.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "current_thread")]
     async fn hand_span_spans_full_hand_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
@@ -2209,6 +2254,14 @@ mod tests {
 
         assert_eq!(counter.count("hand", "new"), 1, "hand span must open exactly once");
         assert_eq!(counter.count("hand", "close"), 1, "hand span must close exactly once");
+
+        // A full heads-up check-down covers 4 streets (preflop -> flop -> turn -> river).
+        // Expect at least 3 StreetAdvanced events (flop, turn, river); showdown is the
+        // 4th street advance in some engines and adds a 4th span.
+        let opened = counter.count("street", "new");
+        let closed = counter.count("street", "close");
+        assert!(opened >= 3, "expected >=3 street spans opened, got {opened}");
+        assert_eq!(opened, closed, "every street span must be closed (got {opened} open, {closed} close)");
         Ok(())
     }
 }
