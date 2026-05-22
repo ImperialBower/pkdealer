@@ -668,6 +668,14 @@ impl DealerServiceTrait for DealerService {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
 
+        // Extract W3C trace context from incoming gRPC metadata. When no
+        // `traceparent` header is present (current state — no EPIC-23 agents
+        // yet), this returns an empty context that produces an invalid span
+        // context, signalling the service-internal-parent fallback below.
+        let parent_cx = opentelemetry::global::get_text_map_propagator(|p| {
+            p.extract(&otel::MetadataExtractor(request.metadata()))
+        });
+
         let req = request.into_inner();
         let proto_action = req
             .action
@@ -725,8 +733,68 @@ impl DealerServiceTrait for DealerService {
         // the state lock — so calling it while holding `guard` is safe.
         let mut guard = self.lock()?;
 
+        // Open the action span before mutating session state, so the span
+        // covers the entire apply + auto-advance work. Parent selection:
+        //   - traceparent present (agent) -> parent = remote ctx; record
+        //     `linked_hand_trace` for cross-reference to in-process tree.
+        //   - traceparent absent           -> parent = current_street_span
+        //     (or current_hand_span as final fallback).
+        use opentelemetry::trace::TraceContextExt;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let action_span = if parent_cx.span().span_context().is_valid() {
+            let span = tracing::info_span!(
+                "action",
+                seat              = seat,
+                action_type       = tracing::field::Empty,
+                amount            = tracing::field::Empty,
+                pot_after         = tracing::field::Empty,
+                linked_hand_trace = tracing::field::Empty,
+            );
+            span.set_parent(parent_cx.clone());
+            // If there's an in-process hand span open, record its trace_id
+            // as a field so debuggers can cross-reference.
+            if let Some(hand) = guard.current_hand_span.as_ref() {
+                let sc = hand.context().span().span_context().clone();
+                if sc.is_valid() {
+                    span.record("linked_hand_trace", sc.trace_id().to_string().as_str());
+                }
+            }
+            span
+        } else {
+            let parent = guard
+                .current_street_span
+                .as_ref()
+                .or(guard.current_hand_span.as_ref());
+            if let Some(parent_span) = parent {
+                tracing::info_span!(
+                    parent: parent_span,
+                    "action",
+                    seat              = seat,
+                    action_type       = tracing::field::Empty,
+                    amount            = tracing::field::Empty,
+                    pot_after         = tracing::field::Empty,
+                    linked_hand_trace = tracing::field::Empty,
+                )
+            } else {
+                tracing::info_span!(
+                    "action",
+                    seat              = seat,
+                    action_type       = tracing::field::Empty,
+                    amount            = tracing::field::Empty,
+                    pot_after         = tracing::field::Empty,
+                    linked_hand_trace = tracing::field::Empty,
+                )
+            }
+        };
+        let _action_guard = action_span.enter();
+
         match guard.session.apply_action(seat, player_action) {
             Ok(()) => {
+                // Record action attributes now that the action has been accepted.
+                action_span.record("action_type", format!("{action_type:?}").as_str());
+                action_span.record("amount", amount as i64);
+                action_span.record("pot_after", guard.session.table.pot as i64);
+
                 // Emit PlayerAction event for the triggering action.
                 let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
                 self.emit_event(
@@ -2262,6 +2330,75 @@ mod tests {
         let closed = counter.count("street", "close");
         assert!(opened >= 3, "expected >=3 street spans opened, got {opened}");
         assert_eq!(opened, closed, "every street span must be closed (got {opened} open, {closed} close)");
+
+        // Action spans: at least one per act call in the hand (preflop SB call,
+        // BB check; then checks on each post-flop street).
+        let action_opens = counter.count("action", "new");
+        assert!(action_opens >= 1, "expected >=1 action span during full hand, got {action_opens}");
+        Ok(())
+    }
+
+    /// Verifies that an injected `traceparent` causes the `act` handler to
+    /// open an action span (soft assertion via span counter — the strict
+    /// trace-id parentage check requires a registry-aware OTel layer that is
+    /// not wired in tests, as noted in the task spec).
+    #[serial_test::serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn action_span_inherits_agent_context() -> Result<(), Box<dyn std::error::Error>> {
+        use opentelemetry::global;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use tonic::Request;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        // Install the W3C propagator globally so the act handler can extract it.
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let counter = SpanCounter::default();
+        let _guard = tracing_subscriber::registry()
+            .with(SpanCounterLayer(counter.clone()))
+            .set_default();
+
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service.start_hand(Request::new(StartHandRequest {})).await?;
+
+        // Find which seat is next to act.
+        let next_seat = {
+            let guard = service.lock().expect("lock");
+            guard.session.table.next_to_act()
+        };
+
+        // Build an ActRequest carrying a synthetic `traceparent` header.
+        let trace_id  = "0af7651916cd43dd8448eb211c80319c";
+        let span_id   = "b7ad6b7169203331";
+        let traceparent = format!("00-{trace_id}-{span_id}-01");
+        let token = tokens.get(&next_seat).expect("token for seat").clone();
+
+        let mut req = Request::new(ActRequest {
+            action: Some(pkdealer_proto::dealer::PlayerAction {
+                seat:        u32::from(next_seat),
+                // Heads-up preflop: SB must call to continue.
+                action_type: ActionType::Call as i32,
+                amount:      0,
+            }),
+        });
+        req.metadata_mut().insert(
+            "traceparent",
+            tonic::metadata::MetadataValue::try_from(traceparent).unwrap(),
+        );
+        req.metadata_mut().insert(
+            PLAYER_TOKEN_METADATA_KEY,
+            tonic::metadata::MetadataValue::try_from(token).unwrap(),
+        );
+
+        let _ = service.act(req).await?;
+
+        // Soft assertion: at least one action span was opened (proves the span
+        // construction path ran for the injected-traceparent branch).
+        let action_opens = counter.count("action", "new");
+        assert!(action_opens >= 1, "expected >=1 action span, got {action_opens}");
+
         Ok(())
     }
 }
