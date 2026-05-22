@@ -40,24 +40,42 @@ impl<'a> Extractor for MetadataExtractor<'a> {
     }
 }
 
+use opentelemetry::global;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::{
+    metrics::SdkMeterProvider,
+    propagation::TraceContextPropagator,
+    trace::SdkTracerProvider,
+    Resource,
+};
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry, fmt};
+
 /// Holds the lifetime of the OTel tracer + meter providers. Dropping it
 /// flushes batched exports and shuts down the SDK. [`init_otel`] returns
 /// `None` when `OTEL_SDK_DISABLED=true` so callers can skip the rest of
 /// the OTel wiring (useful in tests and CI).
 pub struct OtelGuards {
-    // Real fields land in Task 4. Zero-sized placeholder so the
-    // disabled path can be tested in isolation.
-    _private: (),
+    tracer_provider: SdkTracerProvider,
+    meter_provider:  SdkMeterProvider,
+}
+
+impl Drop for OtelGuards {
+    fn drop(&mut self) {
+        let _ = self.tracer_provider.shutdown();
+        let _ = self.meter_provider.shutdown();
+    }
 }
 
 /// Initialises OpenTelemetry tracing + metrics.
 ///
-/// Returns `Ok(None)` when the `OTEL_SDK_DISABLED` env var is set to
-/// `true`. Real OTLP exporter construction lands in a follow-up task.
+/// Returns `Ok(None)` when `OTEL_SDK_DISABLED=true` so callers can skip
+/// the rest of the OTel wiring.
 ///
 /// # Errors
 ///
-/// Returns `Err` when the OTLP exporter cannot be constructed (e.g. an
+/// Returns `Err` when an OTLP exporter cannot be constructed (e.g. an
 /// unparseable endpoint URL). Network failures at startup are *not*
 /// errors — the exporter buffers and retries.
 ///
@@ -71,10 +89,58 @@ pub struct OtelGuards {
 /// ```
 pub fn init_otel() -> Result<Option<OtelGuards>, Box<dyn Error>> {
     if std::env::var("OTEL_SDK_DISABLED").as_deref() == Ok("true") {
+        // Plain fmt subscriber so logs still appear under the disabled path.
+        Registry::default()
+            .with(EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("pkdealer_service=info,info")))
+            .with(fmt::layer())
+            .try_init()
+            .ok();
         return Ok(None);
     }
-    // Real init lands in a follow-up task.
-    Ok(Some(OtelGuards { _private: () }))
+
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:4317".to_owned());
+    let service_name = std::env::var("OTEL_SERVICE_NAME")
+        .unwrap_or_else(|_| "pkdealer_service".to_owned());
+
+    // 1. Global W3C TraceContext propagator.
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
+    let resource = Resource::builder().with_service_name(service_name).build();
+
+    // 2. Tracer provider with batched OTLP gRPC exporter.
+    let span_exporter = SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(&endpoint)
+        .build()?;
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_resource(resource.clone())
+        .with_batch_exporter(span_exporter)
+        .build();
+    let tracer = tracer_provider.tracer("pkdealer_service");
+
+    // 3. Meter provider with periodic OTLP gRPC exporter.
+    let metric_exporter = MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(&endpoint)
+        .build()?;
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_periodic_exporter(metric_exporter)
+        .build();
+    global::set_meter_provider(meter_provider.clone());
+
+    // 4. tracing-subscriber: env filter + fmt + OTel layer.
+    Registry::default()
+        .with(EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("pkdealer_service=info,info")))
+        .with(fmt::layer())
+        .with(OpenTelemetryLayer::new(tracer))
+        .try_init()
+        .ok();
+
+    Ok(Some(OtelGuards { tracer_provider, meter_provider }))
 }
 
 #[cfg(test)]
