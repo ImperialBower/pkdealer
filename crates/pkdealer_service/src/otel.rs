@@ -1,8 +1,8 @@
 //! OpenTelemetry initialization and gRPC propagation helpers for
 //! `pkdealer_service`.
 
-use std::error::Error;
 use opentelemetry::propagation::Extractor;
+use std::error::Error;
 use tonic::metadata::MetadataMap;
 
 /// Newtype adapter implementing [`Extractor`] over an incoming
@@ -44,13 +44,11 @@ use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
-    metrics::SdkMeterProvider,
-    propagation::TraceContextPropagator,
+    Resource, metrics::SdkMeterProvider, propagation::TraceContextPropagator,
     trace::SdkTracerProvider,
-    Resource,
 };
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry, fmt};
+use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Holds the lifetime of the OTel tracer + meter providers. Dropping it
 /// flushes batched exports and shuts down the SDK. [`init_otel`] returns
@@ -58,7 +56,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// the OTel wiring (useful in tests and CI).
 pub struct OtelGuards {
     tracer_provider: SdkTracerProvider,
-    meter_provider:  SdkMeterProvider,
+    meter_provider: SdkMeterProvider,
 }
 
 impl Drop for OtelGuards {
@@ -98,8 +96,8 @@ pub fn init_otel() -> Result<Option<OtelGuards>, Box<dyn Error>> {
 
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4317".to_owned());
-    let service_name = std::env::var("OTEL_SERVICE_NAME")
-        .unwrap_or_else(|_| "pkdealer_service".to_owned());
+    let service_name =
+        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "pkdealer_service".to_owned());
 
     // 1. Global W3C TraceContext propagator.
     global::set_text_map_propagator(TraceContextPropagator::new());
@@ -130,14 +128,19 @@ pub fn init_otel() -> Result<Option<OtelGuards>, Box<dyn Error>> {
 
     // 4. tracing-subscriber: env filter + fmt + OTel layer.
     Registry::default()
-        .with(EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("pkdealer_service=info,info")))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("pkdealer_service=info,info")),
+        )
         .with(fmt::layer())
         .with(OpenTelemetryLayer::new(tracer))
         .try_init()
         .ok();
 
-    Ok(Some(OtelGuards { tracer_provider, meter_provider }))
+    Ok(Some(OtelGuards {
+        tracer_provider,
+        meter_provider,
+    }))
 }
 
 #[cfg(test)]
@@ -148,10 +151,14 @@ mod tests {
     fn init_otel_with_disabled_flag_is_noop() {
         // SAFETY: tests in this module are run with `--test-threads=1`;
         // env mutation is synchronous and confined to this test.
-        unsafe { std::env::set_var("OTEL_SDK_DISABLED", "true"); }
+        unsafe {
+            std::env::set_var("OTEL_SDK_DISABLED", "true");
+        }
         let guards = init_otel().expect("disabled path is infallible");
         assert!(guards.is_none(), "disabled flag must short-circuit init");
-        unsafe { std::env::remove_var("OTEL_SDK_DISABLED"); }
+        unsafe {
+            std::env::remove_var("OTEL_SDK_DISABLED");
+        }
     }
 
     #[test]
@@ -164,7 +171,7 @@ mod tests {
         // Inject a known traceparent into a MetadataMap.
         let mut md = MetadataMap::new();
         let trace_id = "0af7651916cd43dd8448eb211c80319c";
-        let span_id  = "b7ad6b7169203331";
+        let span_id = "b7ad6b7169203331";
         let header = format!("00-{trace_id}-{span_id}-01");
         md.insert("traceparent", MetadataValue::try_from(header).unwrap());
 
@@ -179,6 +186,6 @@ mod tests {
         let sc = span.span_context();
         assert!(sc.is_valid(), "propagator must produce a valid SpanContext");
         assert_eq!(sc.trace_id().to_string(), trace_id);
-        assert_eq!(sc.span_id().to_string(),  span_id);
+        assert_eq!(sc.span_id().to_string(), span_id);
     }
 }

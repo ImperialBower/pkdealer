@@ -45,6 +45,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::trace::TraceContextExt;
 use pkcore::analysis::name::HandRankName;
 use pkcore::casino::table::seats::seatbit::Seatbit;
 use pkcore::casino::table::winnings::Winnings;
@@ -68,9 +70,9 @@ use pkdealer_proto::dealer::{
     get_next_to_act_response, remove_player_response, seat_player_at_response,
     seat_player_response, start_hand_response,
 };
-use opentelemetry::metrics::{Counter, Histogram, Meter};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, metadata::MetadataMap, transport::Server};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 const DEFAULT_SERVICE_ADDR: &str = "127.0.0.1:50051";
@@ -110,33 +112,33 @@ struct TableState {
     token_to_seat: HashMap<Uuid, u8>,
     /// Maps seat numbers → player UUID tokens (for O(1) cleanup on `remove_player`).
     seat_to_token: HashMap<u8, Uuid>,
-    /// Open while a hand is in progress (start_hand → HandComplete). `None` between hands.
-    current_hand_span:   Option<tracing::Span>,
-    /// Open for the current street; replaced on every StreetAdvanced; cleared on HandComplete.
+    /// Open while a hand is in progress (`start_hand` → `HandComplete`). `None` between hands.
+    current_hand_span: Option<tracing::Span>,
+    /// Open for the current street; replaced on every `StreetAdvanced`; cleared on `HandComplete`.
     current_street_span: Option<tracing::Span>,
-    /// Set when start_hand succeeds; used to compute total hand duration.
-    hand_started_at:     Option<std::time::Instant>,
+    /// Set when `start_hand` succeeds; used to compute total hand duration.
+    hand_started_at: Option<std::time::Instant>,
     /// Set whenever the auto-advance loop decides the next actor.
     /// Difference against `now` at the top of `act` is `action_duration_ms`.
-    last_prompt_at:      Option<std::time::Instant>,
+    last_prompt_at: Option<std::time::Instant>,
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
-/// Four OTel instruments emitted by the service. Construction reads the
+/// Four `OTel` instruments emitted by the service. Construction reads the
 /// global meter provider, which `init_otel` configures with an OTLP
 /// periodic exporter. In tests (where `init_otel` was never called) the
 /// global meter is the no-op default, so instrument construction is a
 /// silent no-op too.
 ///
-/// `ai_decision_latency_ms` is **reserved for agent clients (EPIC-23)** —
+/// `ai_decision_latency_ms` is **reserved for agent clients (`EPIC-23`)** —
 /// the service does not record into it. Declared here so the dashboard
 /// can reference a stable instrument name from day one.
 #[derive(Debug)]
 struct Metrics {
-    hands_played:           Counter<u64>,
-    pot_size:               Histogram<u64>,
-    action_duration_ms:     Histogram<f64>,
+    hands_played: Counter<u64>,
+    pot_size: Histogram<u64>,
+    action_duration_ms: Histogram<f64>,
     #[allow(dead_code)]
     ai_decision_latency_ms: Histogram<f64>,
 }
@@ -172,9 +174,9 @@ impl Metrics {
 /// gRPC service implementation for the poker dealer.
 #[derive(Clone)]
 struct DealerService {
-    state:    Arc<Mutex<TableState>>,
+    state: Arc<Mutex<TableState>>,
     event_tx: broadcast::Sender<TableEvent>,
-    metrics:  Arc<Metrics>,
+    metrics: Arc<Metrics>,
 }
 
 impl DealerService {
@@ -194,15 +196,19 @@ impl DealerService {
             session,
             token_to_seat: HashMap::new(),
             seat_to_token: HashMap::new(),
-            current_hand_span:   None,
+            current_hand_span: None,
             current_street_span: None,
-            hand_started_at:     None,
-            last_prompt_at:      None,
+            hand_started_at: None,
+            last_prompt_at: None,
         }));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let meter = opentelemetry::global::meter("pkdealer_service");
         let metrics = Arc::new(Metrics::new(&meter));
-        DealerService { state, event_tx, metrics }
+        DealerService {
+            state,
+            event_tx,
+            metrics,
+        }
     }
 
     /// Acquires the state lock and returns an error `Status` if the lock is poisoned.
@@ -674,10 +680,10 @@ impl DealerServiceTrait for DealerService {
                         player_count = guard.session.count_funded(),
                         starting_pot = guard.session.table.pot,
                     );
-                    guard.current_hand_span   = Some(span);
+                    guard.current_hand_span = Some(span);
                     guard.current_street_span = None;
-                    guard.hand_started_at     = Some(std::time::Instant::now());
-                    guard.last_prompt_at      = Some(std::time::Instant::now());
+                    guard.hand_started_at = Some(std::time::Instant::now());
+                    guard.last_prompt_at = Some(std::time::Instant::now());
 
                     // Broadcast events carry full-visibility snapshots; per-subscriber
                     // filtering happens in `stream_events`.  The unauthenticated
@@ -769,7 +775,9 @@ impl DealerServiceTrait for DealerService {
         // to this `act` arrival. Recorded as f64 ms with attributes.
         let action_latency_ms: Option<f64> = {
             let guard = self.lock()?;
-            guard.last_prompt_at.map(|t| t.elapsed().as_secs_f64() * 1000.0)
+            guard
+                .last_prompt_at
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0)
         };
 
         let player_action = match action_type {
@@ -808,15 +816,13 @@ impl DealerServiceTrait for DealerService {
         //     `linked_hand_trace` for cross-reference to in-process tree.
         //   - traceparent absent           -> parent = current_street_span
         //     (or current_hand_span as final fallback).
-        use opentelemetry::trace::TraceContextExt;
-        use tracing_opentelemetry::OpenTelemetrySpanExt;
         let action_span = if parent_cx.span().span_context().is_valid() {
             let span = tracing::info_span!(
                 "action",
-                seat              = seat,
-                action_type       = tracing::field::Empty,
-                amount            = tracing::field::Empty,
-                pot_after         = tracing::field::Empty,
+                seat = seat,
+                action_type = tracing::field::Empty,
+                amount = tracing::field::Empty,
+                pot_after = tracing::field::Empty,
                 linked_hand_trace = tracing::field::Empty,
             );
             span.set_parent(parent_cx.clone());
@@ -847,10 +853,10 @@ impl DealerServiceTrait for DealerService {
             } else {
                 tracing::info_span!(
                     "action",
-                    seat              = seat,
-                    action_type       = tracing::field::Empty,
-                    amount            = tracing::field::Empty,
-                    pot_after         = tracing::field::Empty,
+                    seat = seat,
+                    action_type = tracing::field::Empty,
+                    amount = tracing::field::Empty,
+                    pot_after = tracing::field::Empty,
                     linked_hand_trace = tracing::field::Empty,
                 )
             }
@@ -861,8 +867,11 @@ impl DealerServiceTrait for DealerService {
             Ok(()) => {
                 // Record action attributes now that the action has been accepted.
                 action_span.record("action_type", format!("{action_type:?}").as_str());
-                action_span.record("amount", amount as i64);
-                action_span.record("pot_after", guard.session.table.pot as i64);
+                action_span.record("amount", i64::try_from(amount).unwrap_or(i64::MAX));
+                action_span.record(
+                    "pot_after",
+                    i64::try_from(guard.session.table.pot).unwrap_or(i64::MAX),
+                );
 
                 // Emit PlayerAction event for the triggering action.
                 let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
@@ -932,15 +941,14 @@ impl DealerServiceTrait for DealerService {
                                         status,
                                     );
                                     self.metrics.hands_played.add(1, &[]);
-                                    self.metrics.pot_size.record(
-                                        guard.session.table.pot as u64,
-                                        &[],
-                                    );
+                                    self.metrics
+                                        .pot_size
+                                        .record(guard.session.table.pot as u64, &[]);
                                     // Tear down the hand span and timing state.
                                     let _ = guard.current_street_span.take();
                                     let _ = guard.current_hand_span.take();
                                     guard.hand_started_at = None;
-                                    guard.last_prompt_at  = None;
+                                    guard.last_prompt_at = None;
                                 }
                                 Err(e) => {
                                     return Ok(Response::new(ActResponse {
@@ -2322,11 +2330,7 @@ mod tests {
                 .push((attrs.metadata().name().to_owned(), "new"));
         }
 
-        fn on_close(
-            &self,
-            id: tracing::span::Id,
-            ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
+        fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
             if let Some(s) = ctx.span(&id) {
                 self.0
                     .events
@@ -2395,27 +2399,44 @@ mod tests {
 
         play_hand_to_completion(&service, &tokens).await?;
 
-        assert_eq!(counter.count("hand", "new"), 1, "hand span must open exactly once");
-        assert_eq!(counter.count("hand", "close"), 1, "hand span must close exactly once");
+        assert_eq!(
+            counter.count("hand", "new"),
+            1,
+            "hand span must open exactly once"
+        );
+        assert_eq!(
+            counter.count("hand", "close"),
+            1,
+            "hand span must close exactly once"
+        );
 
         // A full heads-up check-down covers 4 streets (preflop -> flop -> turn -> river).
         // Expect at least 3 StreetAdvanced events (flop, turn, river); showdown is the
         // 4th street advance in some engines and adds a 4th span.
         let opened = counter.count("street", "new");
         let closed = counter.count("street", "close");
-        assert!(opened >= 3, "expected >=3 street spans opened, got {opened}");
-        assert_eq!(opened, closed, "every street span must be closed (got {opened} open, {closed} close)");
+        assert!(
+            opened >= 3,
+            "expected >=3 street spans opened, got {opened}"
+        );
+        assert_eq!(
+            opened, closed,
+            "every street span must be closed (got {opened} open, {closed} close)"
+        );
 
         // Action spans: at least one per act call in the hand (preflop SB call,
         // BB check; then checks on each post-flop street).
         let action_opens = counter.count("action", "new");
-        assert!(action_opens >= 1, "expected >=1 action span during full hand, got {action_opens}");
+        assert!(
+            action_opens >= 1,
+            "expected >=1 action span during full hand, got {action_opens}"
+        );
         Ok(())
     }
 
     /// Verifies that an injected `traceparent` causes the `act` handler to
     /// open an action span (soft assertion via span counter — the strict
-    /// trace-id parentage check requires a registry-aware OTel layer that is
+    /// trace-id parentage check requires a registry-aware `OTel` layer that is
     /// not wired in tests, as noted in the task spec).
     #[serial_test::serial]
     #[tokio::test(flavor = "current_thread")]
@@ -2436,7 +2457,9 @@ mod tests {
 
         let service = make_service();
         let tokens = seat_two_players(&service).await?;
-        service.start_hand(Request::new(StartHandRequest {})).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
 
         // Find which seat is next to act.
         let next_seat = {
@@ -2445,17 +2468,17 @@ mod tests {
         };
 
         // Build an ActRequest carrying a synthetic `traceparent` header.
-        let trace_id  = "0af7651916cd43dd8448eb211c80319c";
-        let span_id   = "b7ad6b7169203331";
+        let trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let span_id = "b7ad6b7169203331";
         let traceparent = format!("00-{trace_id}-{span_id}-01");
         let token = tokens.get(&next_seat).expect("token for seat").clone();
 
         let mut req = Request::new(ActRequest {
             action: Some(pkdealer_proto::dealer::PlayerAction {
-                seat:        u32::from(next_seat),
+                seat: u32::from(next_seat),
                 // Heads-up preflop: SB must call to continue.
                 action_type: ActionType::Call as i32,
-                amount:      0,
+                amount: 0,
             }),
         });
         req.metadata_mut().insert(
@@ -2472,7 +2495,10 @@ mod tests {
         // Soft assertion: at least one action span was opened (proves the span
         // construction path ran for the injected-traceparent branch).
         let action_opens = counter.count("action", "new");
-        assert!(action_opens >= 1, "expected >=1 action span, got {action_opens}");
+        assert!(
+            action_opens >= 1,
+            "expected >=1 action span, got {action_opens}"
+        );
 
         Ok(())
     }
