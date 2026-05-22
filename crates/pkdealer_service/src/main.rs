@@ -102,12 +102,22 @@ enum CardVisibility {
 ///
 /// [`PokerSession`] wraps [`TableNoCell`], which has no `Cell`/`RefCell` interior
 /// mutability, so it is `Send + Sync` without any unsafe code.
+#[allow(dead_code)]
 struct TableState {
     session: PokerSession,
     /// Maps player UUID tokens → seat numbers.
     token_to_seat: HashMap<Uuid, u8>,
     /// Maps seat numbers → player UUID tokens (for O(1) cleanup on `remove_player`).
     seat_to_token: HashMap<u8, Uuid>,
+    /// Open while a hand is in progress (start_hand → HandComplete). `None` between hands.
+    current_hand_span:   Option<tracing::Span>,
+    /// Open for the current street; replaced on every StreetAdvanced; cleared on HandComplete.
+    current_street_span: Option<tracing::Span>,
+    /// Set when start_hand succeeds; used to compute total hand duration.
+    hand_started_at:     Option<std::time::Instant>,
+    /// Set whenever the auto-advance loop decides the next actor.
+    /// Difference against `now` at the top of `act` is `action_duration_ms`.
+    last_prompt_at:      Option<std::time::Instant>,
 }
 
 // ── DealerService ─────────────────────────────────────────────────────────────
@@ -136,6 +146,10 @@ impl DealerService {
             session,
             token_to_seat: HashMap::new(),
             seat_to_token: HashMap::new(),
+            current_hand_span:   None,
+            current_street_span: None,
+            hand_started_at:     None,
+            last_prompt_at:      None,
         }));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         DealerService { state, event_tx }
