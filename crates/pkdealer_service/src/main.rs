@@ -597,6 +597,18 @@ impl DealerServiceTrait for DealerService {
             }
             match guard.session.start_hand() {
                 Ok(()) => {
+                    // Open the hand span for the full hand lifecycle.
+                    let hand_id = uuid::Uuid::new_v4();
+                    let span = tracing::info_span!(
+                        "hand",
+                        hand_id      = %hand_id,
+                        player_count = guard.session.count_funded(),
+                        starting_pot = guard.session.table.pot,
+                    );
+                    guard.current_hand_span   = Some(span);
+                    guard.current_street_span = None;
+                    guard.hand_started_at     = Some(std::time::Instant::now());
+
                     // Broadcast events carry full-visibility snapshots; per-subscriber
                     // filtering happens in `stream_events`.  The unauthenticated
                     // `StartHandResponse` itself must hide hole cards.
@@ -741,6 +753,11 @@ impl DealerServiceTrait for DealerService {
                                         format!("Hand ended. {desc}"),
                                         status,
                                     );
+                                    // Tear down the hand span and timing state.
+                                    let _ = guard.current_street_span.take();
+                                    let _ = guard.current_hand_span.take();
+                                    guard.hand_started_at = None;
+                                    guard.last_prompt_at  = None;
                                 }
                                 Err(e) => {
                                     return Ok(Response::new(ActResponse {
@@ -2079,6 +2096,119 @@ mod tests {
             tonic::Code::PermissionDenied,
             "revoked token must not be accepted"
         );
+        Ok(())
+    }
+
+    // ── hand span lifecycle ───────────────────────────────────────────────────
+
+    /// Records span open/close events into a shared `Vec`.  Used to assert
+    /// hand-span lifecycle without depending on `tracing-test`'s formatted
+    /// log buffer.
+    #[derive(Default, Clone)]
+    struct SpanCounter {
+        events: std::sync::Arc<std::sync::Mutex<Vec<(String, &'static str)>>>,
+    }
+
+    impl SpanCounter {
+        fn count(&self, span_name: &str, event: &str) -> usize {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, e)| n == span_name && *e == event)
+                .count()
+        }
+    }
+
+    struct SpanCounterLayer(SpanCounter);
+
+    impl<S> tracing_subscriber::Layer<S> for SpanCounterLayer
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0
+                .events
+                .lock()
+                .unwrap()
+                .push((attrs.metadata().name().to_owned(), "new"));
+        }
+
+        fn on_close(
+            &self,
+            id: tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(s) = ctx.span(&id) {
+                self.0
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push((s.metadata().name().to_owned(), "close"));
+            }
+        }
+    }
+
+    /// Plays a complete two-player hand to completion via the Act-only autonomous
+    /// flow, reusing the existing `seat_two_players` + token-map helpers.
+    ///
+    /// Strategy: preflop SB calls / BB checks, then every subsequent street
+    /// both players check until `hand_complete` is signalled.
+    async fn play_hand_to_completion(
+        service: &DealerService,
+        tokens: &HashMap<u8, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Preflop: SB calls, BB checks → auto-advances to flop.
+        complete_preflop_betting(service, tokens).await?;
+
+        // Post-preflop: check down through flop / turn / river.
+        for _ in 0..(DEFAULT_SEAT_COUNT * 4) {
+            let seat = {
+                let guard = service.lock().expect("lock");
+                guard.session.table.next_to_act()
+            };
+            let resp = service
+                .act(act_request_with_token(seat, ActionType::Check, tokens))
+                .await?
+                .into_inner();
+            match resp.result {
+                Some(act_response::Result::ActionResult(r)) if r.hand_complete => break,
+                Some(act_response::Result::ActionResult(_)) => {}
+                Some(act_response::Result::Error(e)) => return Err(e.into()),
+                None => return Err("empty act response".into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// The `hand` span must be opened exactly once when `start_hand` succeeds
+    /// and closed exactly once when the hand reaches `HandComplete`.
+    #[tokio::test]
+    async fn hand_span_spans_full_hand_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let counter = SpanCounter::default();
+        let _guard = tracing_subscriber::registry()
+            .with(SpanCounterLayer(counter.clone()))
+            .set_default();
+
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        play_hand_to_completion(&service, &tokens).await?;
+
+        assert_eq!(counter.count("hand", "new"), 1, "hand span must open exactly once");
+        assert_eq!(counter.count("hand", "close"), 1, "hand span must close exactly once");
         Ok(())
     }
 }
