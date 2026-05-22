@@ -83,6 +83,44 @@ This project follows the guidelines in `.github/copilot-instructions.md`:
 - No `unwrap()` or `panic!()` in library code
 - Comprehensive error handling
 
+## Observability
+
+`pkdealer_service` is instrumented with OpenTelemetry: three span kinds —
+`hand`, `street`, `action` — and four metrics — `pkdealer.hands_played`,
+`pkdealer.pot_size`, `pkdealer.action_duration_ms`, and
+`pkdealer.ai_decision_latency_ms` (reserved for EPIC-23 agent clients).
+
+### Quickstart (full compose stack)
+
+From the repo root:
+
+```bash
+docker compose up -d --build
+# drive a hand against the containerised service on localhost:50051
+# (e.g. via grpcurl or any gRPC client)
+
+open http://localhost:16686   # Jaeger
+open http://localhost:9090    # Prometheus
+open http://localhost:3001    # Grafana → "pkdealer" dashboard
+```
+
+### Host dev (faster iteration on the service)
+
+```bash
+docker compose up -d otel-collector jaeger prometheus grafana
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  cargo run --bin pkdealer_service
+```
+
+### Env vars
+
+| Var | Default | Purpose |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP gRPC target |
+| `OTEL_SERVICE_NAME` | `pkdealer_service` | `service.name` resource attribute |
+| `OTEL_SDK_DISABLED` | unset | If `true`, skips OTel init entirely (useful in tests/CI) |
+| `RUST_LOG` | `pkdealer_service=info,info` | tracing filter |
+
 ## License
 
 GPL-3.0-or-later

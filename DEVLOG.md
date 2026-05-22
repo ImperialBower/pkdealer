@@ -174,11 +174,82 @@ Run:
 
 ---
 
+---
+
+## EPIC-22 — OpenTelemetry Instrumentation
+
+**Status: ✅ Complete**
+
+### What was built
+
+- `crates/pkdealer_service/src/otel.rs` — `init_otel()`, `OtelGuards`,
+  `MetadataExtractor`. W3C TraceContext propagator + OTLP gRPC trace +
+  metric exporters; `OTEL_SDK_DISABLED=true` short-circuits init for
+  tests and CI.
+- Span hierarchy in `pkdealer_service`:
+  - `hand` span — opened in `start_hand`, closed on `SessionStep::HandComplete`.
+  - `street` span — opened on each `SessionStep::StreetAdvanced`, parent =
+    current hand span.
+  - `action` span — opened in `act` handler; parent = remote `traceparent`
+    context (when present) or `current_street_span` (service-internal
+    fallback). Records `seat`, `action_type`, `amount`, `pot_after`, and
+    `linked_hand_trace` for cross-reference to the in-process tree.
+- Four metrics: `pkdealer.hands_played` (counter on `HandComplete`),
+  `pkdealer.pot_size` (histogram, chips, on `HandComplete`),
+  `pkdealer.action_duration_ms` (histogram, ms, attributes `action_type`
+  + `seat`, recorded on every `act` call where a prior NextActor prompt
+  is known), and `pkdealer.ai_decision_latency_ms` (histogram, ms,
+  **reserved for EPIC-23 agent clients** — service does not emit).
+- `crates/pkdealer_service/Dockerfile` — multi-stage `cargo-chef` build,
+  non-root user, default `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317`,
+  default `PKDEALER_ADDR=0.0.0.0:50051` so the container is reachable
+  from other compose services and from the host.
+- `docker-compose.yml` — service + `otel-collector` + Jaeger + Prometheus +
+  Grafana. Host ports: 50051 (gRPC), 4317 (OTLP), 8889 (collector → Prom),
+  16686 (Jaeger UI), 9090 (Prometheus), 3001 (Grafana).
+- `ops/otel-collector.yaml`, `ops/prometheus.yml`, hand-authored
+  `ops/grafana/dashboards/pkdealer.json` with 6 panels (hands/min, pot
+  heatmap, action latency p50/p95/p99, action mix, agent latency
+  placeholder, Jaeger link).
+
+### Test infrastructure
+
+- New dev-dep `tracing-test = "0.2"` (currently unused — kept for future
+  span-attribute capture work).
+- New dev-dep `serial_test = "3"` to gate the span-lifecycle tests that
+  install thread-local subscribers.
+- Inline lifecycle test `hand_span_spans_full_hand_lifecycle` uses a
+  custom `SpanCounter` + `SpanCounterLayer` (instead of `tracing-test`'s
+  formatted-log scan) for reliable open/close counting; annotated
+  `#[serial_test::serial]` + `#[tokio::test(flavor = "current_thread")]`.
+- Propagation test `action_span_inherits_agent_context` soft-asserts
+  that injecting a `traceparent` header produces an action span — strict
+  parent trace_id matching is deferred to a future task (the
+  `tracing-opentelemetry` SDK doesn't expose the span's OTel context
+  from inside `Layer::on_new_span` without also installing the full OTel
+  layer in the test registry).
+
+### Notes
+
+- Action-span parent selection: when EPIC-23 agents inject `traceparent`,
+  action spans become children of the agent span; the in-process
+  cross-reference is preserved via the `linked_hand_trace` field
+  (`trace_id` of the local hand span). A true OTel span-link can replace
+  this when the SDK exposes the API on `tracing::Span`.
+- `init_otel`'s disabled path no longer installs a fmt subscriber as a
+  side effect — that would have clobbered the thread-local subscribers
+  test code relies on.
+- The `pkdealer_service` container defaults `PKDEALER_ADDR=0.0.0.0:50051`;
+  host `cargo run` still defaults to `127.0.0.1:50051` so the dev
+  experience is unchanged.
+- `jaegertracing/all-in-one:1.62` does not exist on Docker Hub; the
+  compose stack uses `:latest` for local dev (EPIC-24 will pin Jaeger
+  to a specific version as part of the production-packaging pass).
+
 ## Upcoming Phases
 
 | Phase | Goal |
 |-------|------|
 | Phase 2 | Web spectator app |
-| Phase 3 | OpenTelemetry instrumentation |
 | Phase 4 | AI agent clients |
 | Future | Multi-table support via `pkcore::TableManager` |

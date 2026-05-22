@@ -4,18 +4,18 @@
 
 | Component | Status |
 |---|---|
-| `tracing` + `tracing-subscriber` in `pkdealer_service` | Planned |
-| `opentelemetry` + `opentelemetry-otlp` integration | Planned |
-| `hand` span (deal → showdown) | Planned |
-| `street` span (child of `hand`) | Planned |
-| `action` span (child of `hand`) | Planned |
-| `pkdealer.hands_played` counter metric | Planned |
-| `pkdealer.pot_size` histogram metric | Planned |
-| `pkdealer.action_duration_ms` histogram metric | Planned |
-| `pkdealer.ai_decision_latency_ms` histogram metric | Planned |
-| Trace context propagation in gRPC metadata | Planned |
-| `docker-compose.yml` — Jaeger + Prometheus + Grafana | Planned |
-| Grafana dashboard JSON (committed) | Planned |
+| `tracing` + `tracing-subscriber` in `pkdealer_service` | Complete |
+| `opentelemetry` + `opentelemetry-otlp` integration | Complete |
+| `hand` span (deal → showdown) | Complete |
+| `street` span (child of `hand`) | Complete |
+| `action` span (child of `hand`) | Complete |
+| `pkdealer.hands_played` counter metric | Complete |
+| `pkdealer.pot_size` histogram metric | Complete |
+| `pkdealer.action_duration_ms` histogram metric | Complete |
+| `pkdealer.ai_decision_latency_ms` histogram metric | Complete |
+| Trace context propagation in gRPC metadata | Complete |
+| `docker-compose.yml` — Jaeger + Prometheus + Grafana | Complete |
+| Grafana dashboard JSON (committed) | Complete |
 
 ---
 
@@ -41,10 +41,10 @@ backend without code changes.
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry = { version = "0.26", features = ["metrics"] }
-opentelemetry-otlp = { version = "0.26", features = ["grpc-tonic", "metrics"] }
-opentelemetry_sdk = { version = "0.26", features = ["rt-tokio", "metrics"] }
-tracing-opentelemetry = "0.27"
+opentelemetry = { version = "0.30", features = ["metrics"] }
+opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic", "metrics"] }
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio", "metrics"] }
+tracing-opentelemetry = "0.31"
 ```
 
 ### Span hierarchy
@@ -84,8 +84,9 @@ current `hand` span via `tracing`'s context propagation.
 | `pkdealer.action_duration_ms` | Histogram | `action_type`, `seat` | Time from `next_actor` prompt to `act` receipt |
 | `pkdealer.ai_decision_latency_ms` | Histogram | `agent_type` | Emitted by agent clients (EPIC-23); tagged by model |
 
-Metrics are exported via OTLP to Prometheus (via `opentelemetry-otlp`) and
-scraped by the Prometheus container in the compose stack.
+Metrics are exported via OTLP to the `otel-collector` container, which
+exposes a Prometheus exporter (port 8889) scraped by the Prometheus container
+every 15 s.
 
 ### Trace context propagation (gRPC)
 
