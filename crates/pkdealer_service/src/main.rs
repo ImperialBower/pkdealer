@@ -34,6 +34,9 @@
 //!   with the spectator token returns all hole cards; with no token returns no hole
 //!   cards.
 
+#[allow(unused_imports)]
+use pkdealer_service::otel as _otel;
+
 use std::{
     collections::HashMap,
     env,
