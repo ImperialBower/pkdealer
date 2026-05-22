@@ -1,0 +1,8 @@
+target/
+.git/
+docs/
+generated/
+demo/
+*.md
+.idea/
+.vscode/
