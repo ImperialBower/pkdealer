@@ -34,8 +34,7 @@
 //!   with the spectator token returns all hole cards; with no token returns no hole
 //!   cards.
 
-#[allow(unused_imports)]
-use pkdealer_service::otel as _otel;
+use pkdealer_service::otel;
 
 use std::{
     collections::HashMap,
@@ -948,6 +947,19 @@ async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Install OpenTelemetry tracing + metrics. Held for the lifetime of
+    // main so OtelGuards::drop flushes batched exports at shutdown.
+    let _otel_guards = match otel::init_otel() {
+        Ok(guards) => guards,
+        Err(err) => {
+            eprintln!(
+                "warning: OpenTelemetry initialisation failed ({err}); \
+                 continuing without telemetry"
+            );
+            None
+        }
+    };
+
     let socket_addr: SocketAddr = addr.parse()?;
 
     println!("Poker Dealer Service v{}", env!("CARGO_PKG_VERSION"));
