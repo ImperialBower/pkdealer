@@ -1,0 +1,22 @@
+[package]
+name = "pkdealer_agent_rules"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rule-based poker bot agent driven by a pkcore BotProfile"
+keywords = ["poker", "grpc", "agent", "bot", "rules"]
+categories = ["games"]
+rust-version = "1.85"
+
+[[bin]]
+name = "pkdealer_agent_rules"
+path = "src/main.rs"
+
+[dependencies]
+pkdealer_agent_core = { path = "../pkdealer_agent_core", version = "0.1.10" }
+pkcore = { version = "0.0.48", features = ["bot-profiles"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+clap = { version = "4", features = ["derive", "env"] }
+async-trait = "0.1"

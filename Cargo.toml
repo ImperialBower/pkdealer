@@ -5,6 +5,7 @@ members = [
     "crates/pkdealer_proto",
     "crates/pkdealer_agent_core",
     "crates/pkdealer_agent_random",
+    "crates/pkdealer_agent_rules",
 ]
 resolver = "2"
 
