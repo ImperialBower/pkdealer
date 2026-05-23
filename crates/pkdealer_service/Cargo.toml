@@ -31,7 +31,6 @@ tracing-opentelemetry              = "0.31"
 opentelemetry                      = "0.30"
 opentelemetry_sdk                  = { version = "0.30", features = ["rt-tokio"] }
 opentelemetry-otlp                 = { version = "0.30", features = ["grpc-tonic", "metrics", "trace"] }
-opentelemetry-semantic-conventions = "0.30"
 
 [dev-dependencies]
 tracing-test = "0.2"
