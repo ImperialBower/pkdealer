@@ -1,0 +1,22 @@
+[package]
+name = "pkdealer_agent_random"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Random baseline bot agent for pkdealer"
+keywords = ["poker", "grpc", "agent", "bot", "random"]
+categories = ["games"]
+rust-version = "1.85"
+
+[[bin]]
+name = "pkdealer_agent_random"
+path = "src/main.rs"
+
+[dependencies]
+pkdealer_agent_core = { path = "../pkdealer_agent_core", version = "0.1.9" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.9"
+async-trait = "0.1"

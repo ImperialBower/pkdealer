@@ -1,0 +1,17 @@
+[package]
+name = "pkdealer_agent_core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared gRPC agent infrastructure for pkdealer bot agents"
+keywords = ["poker", "grpc", "agent", "bot"]
+categories = ["games"]
+rust-version = "1.85"
+
+[dependencies]
+pkdealer_proto = { path = "../pkdealer_proto", version = "0.1.9" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tonic = { version = "0.12", features = ["transport"] }
+async-trait = "0.1"
