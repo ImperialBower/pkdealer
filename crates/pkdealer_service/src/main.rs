@@ -952,9 +952,7 @@ impl DealerServiceTrait for DealerService {
                                         status,
                                     );
                                     self.metrics.hands_played.add(1, &[]);
-                                    self.metrics
-                                        .pot_size
-                                        .record(final_pot as u64, &[]);
+                                    self.metrics.pot_size.record(final_pot as u64, &[]);
 
                                     // Record the captured values on the closing hand span.
                                     if let Some(hand_span) = guard.current_hand_span.as_ref() {
