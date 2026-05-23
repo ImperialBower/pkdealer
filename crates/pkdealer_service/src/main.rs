@@ -676,9 +676,11 @@ impl DealerServiceTrait for DealerService {
                     let hand_id = uuid::Uuid::new_v4();
                     let span = tracing::info_span!(
                         "hand",
-                        hand_id      = %hand_id,
-                        player_count = guard.session.count_funded(),
-                        starting_pot = guard.session.table.pot,
+                        hand_id          = %hand_id,
+                        player_count     = guard.session.count_funded(),
+                        starting_pot     = guard.session.table.pot,
+                        final_pot        = tracing::field::Empty,
+                        hand_duration_ms = tracing::field::Empty,
                     );
                     guard.current_hand_span = Some(span);
                     guard.current_street_span = None;
@@ -925,6 +927,15 @@ impl DealerServiceTrait for DealerService {
                             );
                         }
                         SessionStep::HandComplete => {
+                            // `end_hand()` calls `TableNoCell::reset()` which zeroes
+                            // `table.pot` before returning. Snapshot pot + duration
+                            // BEFORE the call so the metric and span attribute see
+                            // the real final values.
+                            let final_pot = guard.session.table.pot;
+                            let hand_duration_ms = guard
+                                .hand_started_at
+                                .map(|t| t.elapsed().as_secs_f64() * 1000.0);
+
                             match guard.session.end_hand() {
                                 Ok(winnings) => {
                                     hand_complete = true;
@@ -943,7 +954,19 @@ impl DealerServiceTrait for DealerService {
                                     self.metrics.hands_played.add(1, &[]);
                                     self.metrics
                                         .pot_size
-                                        .record(guard.session.table.pot as u64, &[]);
+                                        .record(final_pot as u64, &[]);
+
+                                    // Record the captured values on the closing hand span.
+                                    if let Some(hand_span) = guard.current_hand_span.as_ref() {
+                                        hand_span.record(
+                                            "final_pot",
+                                            i64::try_from(final_pot).unwrap_or(i64::MAX),
+                                        );
+                                        if let Some(ms) = hand_duration_ms {
+                                            hand_span.record("hand_duration_ms", ms);
+                                        }
+                                    }
+
                                     // Tear down the hand span and timing state.
                                     let _ = guard.current_street_span.take();
                                     let _ = guard.current_hand_span.take();
