@@ -112,6 +112,11 @@ struct TableState {
     token_to_seat: HashMap<Uuid, u8>,
     /// Maps seat numbers → player UUID tokens (for O(1) cleanup on `remove_player`).
     seat_to_token: HashMap<u8, Uuid>,
+    /// Maps client-chosen secrets → player UUID tokens for seat resume.
+    /// See `SeatPlayerRequest.client_secret`. Entries are removed when a
+    /// seat is vacated via `remove_player`. Empty when no resume hints are
+    /// in play.
+    secret_to_token: HashMap<String, Uuid>,
     /// Open while a hand is in progress (`start_hand` → `HandComplete`). `None` between hands.
     current_hand_span: Option<tracing::Span>,
     /// Open for the current street; replaced on every `StreetAdvanced`; cleared on `HandComplete`.
@@ -196,6 +201,7 @@ impl DealerService {
             session,
             token_to_seat: HashMap::new(),
             seat_to_token: HashMap::new(),
+            secret_to_token: HashMap::new(),
             current_hand_span: None,
             current_street_span: None,
             hand_started_at: None,
@@ -303,6 +309,61 @@ impl DealerService {
             }
         }
         result
+    }
+
+    /// Allocates a fresh seat for `SeatPlayerAt`, returning the response-tuple
+    /// shape used by `seat_player_at`. Registers the player token and
+    /// (when non-empty) the `client_secret → token` binding.
+    fn fresh_seat_at_inner(
+        state: &mut TableState,
+        requested_seat: u8,
+        name: &str,
+        chips: usize,
+        client_secret: &str,
+    ) -> (
+        seat_player_at_response::Result,
+        String,
+        bool,
+        Option<(EventType, String, TableStatus)>,
+    ) {
+        let is_available = state
+            .session
+            .table
+            .seats
+            .get_seat(requested_seat)
+            .is_some_and(SeatNoCell::is_empty);
+        if !is_available {
+            let msg = format!("seat {requested_seat} is occupied or does not exist");
+            return (
+                seat_player_at_response::Result::Error(msg),
+                String::new(),
+                false,
+                None,
+            );
+        }
+        if let Some(s) = state.session.table.seats.get_seat_mut(requested_seat) {
+            s.player = PlayerNoCell::new_with_chips(name.to_owned(), chips);
+        }
+        let token = Uuid::new_v4();
+        state.token_to_seat.insert(token, requested_seat);
+        state.seat_to_token.insert(requested_seat, token);
+        if !client_secret.is_empty() {
+            state
+                .secret_to_token
+                .insert(client_secret.to_owned(), token);
+        }
+        let status = Self::build_table_status(&state.session, CardVisibility::Spectator);
+        let event = (
+            EventType::PlayerSeated,
+            format!("Player seated at seat {requested_seat}"),
+            status,
+        );
+        (
+            seat_player_at_response::Result::Success(true),
+            token.to_string(),
+            false,
+            Some(event),
+        )
     }
 
     /// Maps a `pkcore` [`PlayerState`] variant to the corresponding proto [`ProtoPlayerState`].
@@ -475,6 +536,25 @@ impl DealerServiceTrait for DealerService {
 
     // ── Seating ───────────────────────────────────────────────────────────────
 
+    /// Seats a new player at the next available seat, OR re-attaches an
+    /// existing seat if `client_secret` matches a previous call.
+    ///
+    /// # Resume contract
+    ///
+    /// If `request.client_secret` is non-empty and already bound to a live
+    /// token, the response carries the original `seat_number` and
+    /// `player_token` with `resumed = true`. The `name` and `chips` fields
+    /// in the request are **ignored on the resume path** — the seat keeps
+    /// its existing player handle and chip stack.
+    ///
+    /// Resume bindings are dropped automatically when the seat is removed
+    /// via [`Self::remove_player`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok` with an error variant in the `result` oneof when no
+    /// empty seat is available and no resume binding matched. The handler
+    /// itself does not return `tonic::Status::Err`.
     async fn seat_player(
         &self,
         request: Request<SeatPlayerRequest>,
@@ -486,43 +566,64 @@ impl DealerServiceTrait for DealerService {
             req.chips as usize
         };
 
-        let (response_result, player_token, maybe_event) = {
+        let (response_result, player_token, resumed, maybe_event) = {
             let mut guard = self.lock()?;
-            let size = guard.session.table.seats.size();
-            let seat_num = (0..size).find(|&i| {
-                guard
-                    .session
-                    .table
-                    .seats
-                    .get_seat(i)
-                    .is_some_and(SeatNoCell::is_empty)
-            });
-            match seat_num {
-                Some(i) => {
-                    if let Some(s) = guard.session.table.seats.get_seat_mut(i) {
-                        s.player = PlayerNoCell::new_with_chips(req.name.clone(), chips);
-                    }
-                    let token = Uuid::new_v4();
-                    guard.token_to_seat.insert(token, i);
-                    guard.seat_to_token.insert(i, token);
-                    let status =
-                        Self::build_table_status(&guard.session, CardVisibility::Spectator);
-                    let event = (
-                        EventType::PlayerSeated,
-                        format!("Player seated at seat {i}"),
-                        status,
-                    );
-                    (
-                        seat_player_response::Result::SeatNumber(u32::from(i)),
-                        token.to_string(),
-                        Some(event),
-                    )
-                }
-                None => (
-                    seat_player_response::Result::Error("no empty seat available".to_owned()),
-                    String::new(),
+
+            // Resume path: secret already bound to a token → return existing seat.
+            if !req.client_secret.is_empty()
+                && let Some(&token) = guard.secret_to_token.get(&req.client_secret)
+                && let Some(&seat) = guard.token_to_seat.get(&token)
+            {
+                (
+                    seat_player_response::Result::SeatNumber(u32::from(seat)),
+                    token.to_string(),
+                    true,
                     None,
-                ),
+                )
+            } else {
+                let size = guard.session.table.seats.size();
+                let seat_num = (0..size).find(|&i| {
+                    guard
+                        .session
+                        .table
+                        .seats
+                        .get_seat(i)
+                        .is_some_and(SeatNoCell::is_empty)
+                });
+                match seat_num {
+                    Some(i) => {
+                        if let Some(s) = guard.session.table.seats.get_seat_mut(i) {
+                            s.player = PlayerNoCell::new_with_chips(req.name.clone(), chips);
+                        }
+                        let token = Uuid::new_v4();
+                        guard.token_to_seat.insert(token, i);
+                        guard.seat_to_token.insert(i, token);
+                        if !req.client_secret.is_empty() {
+                            guard
+                                .secret_to_token
+                                .insert(req.client_secret.clone(), token);
+                        }
+                        let status =
+                            Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                        let event = (
+                            EventType::PlayerSeated,
+                            format!("Player seated at seat {i}"),
+                            status,
+                        );
+                        (
+                            seat_player_response::Result::SeatNumber(u32::from(i)),
+                            token.to_string(),
+                            false,
+                            Some(event),
+                        )
+                    }
+                    None => (
+                        seat_player_response::Result::Error("no empty seat available".to_owned()),
+                        String::new(),
+                        false,
+                        None,
+                    ),
+                }
             }
         };
 
@@ -533,9 +634,20 @@ impl DealerServiceTrait for DealerService {
         Ok(Response::new(SeatPlayerResponse {
             result: Some(response_result),
             player_token,
+            resumed,
         }))
     }
 
+    /// Seats a new player at a specific seat, OR re-attaches if
+    /// `client_secret` matches a previous call to either seat-player RPC.
+    ///
+    /// # Resume contract
+    ///
+    /// Same as [`Self::seat_player`], with one extra constraint: the
+    /// requested `seat` must equal the seat the secret was originally
+    /// bound to. Mismatch returns an error in the response (not a
+    /// `tonic::Status`); fresh-seat allocation is not attempted in the
+    /// mismatch case so the caller learns about the conflict.
     async fn seat_player_at(
         &self,
         request: Request<SeatPlayerAtRequest>,
@@ -547,40 +659,53 @@ impl DealerServiceTrait for DealerService {
             req.chips as usize
         };
         #[allow(clippy::cast_possible_truncation)]
-        let seat_number = req.seat as u8;
+        let requested_seat = req.seat as u8;
 
-        let (response_result, player_token, maybe_event) = {
+        let (response_result, player_token, resumed, maybe_event) = {
             let mut guard = self.lock()?;
-            let is_available = guard
-                .session
-                .table
-                .seats
-                .get_seat(seat_number)
-                .is_some_and(SeatNoCell::is_empty);
-            if is_available {
-                if let Some(s) = guard.session.table.seats.get_seat_mut(seat_number) {
-                    s.player = PlayerNoCell::new_with_chips(req.name.clone(), chips);
+
+            // Resume path: secret bound to a token → require its seat to match.
+            if !req.client_secret.is_empty()
+                && let Some(&token) = guard.secret_to_token.get(&req.client_secret)
+            {
+                if let Some(&bound_seat) = guard.token_to_seat.get(&token) {
+                    if bound_seat == requested_seat {
+                        (
+                            seat_player_at_response::Result::Success(true),
+                            token.to_string(),
+                            true,
+                            None,
+                        )
+                    } else {
+                        (
+                            seat_player_at_response::Result::Error(format!(
+                                "client_secret already bound to seat {bound_seat}; \
+                                 requested seat {requested_seat} mismatch",
+                            )),
+                            String::new(),
+                            false,
+                            None,
+                        )
+                    }
+                } else {
+                    // Secret known but token no longer maps to a seat — stale entry.
+                    // Drop it and fall through to fresh-seat allocation.
+                    guard.secret_to_token.remove(&req.client_secret);
+                    Self::fresh_seat_at_inner(
+                        &mut guard,
+                        requested_seat,
+                        &req.name,
+                        chips,
+                        &req.client_secret,
+                    )
                 }
-                let token = Uuid::new_v4();
-                guard.token_to_seat.insert(token, seat_number);
-                guard.seat_to_token.insert(seat_number, token);
-                let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
-                let event = (
-                    EventType::PlayerSeated,
-                    format!("Player seated at seat {seat_number}"),
-                    status,
-                );
-                (
-                    seat_player_at_response::Result::Success(true),
-                    token.to_string(),
-                    Some(event),
-                )
             } else {
-                let msg = format!("seat {seat_number} is occupied or does not exist");
-                (
-                    seat_player_at_response::Result::Error(msg),
-                    String::new(),
-                    None,
+                Self::fresh_seat_at_inner(
+                    &mut guard,
+                    requested_seat,
+                    &req.name,
+                    chips,
+                    &req.client_secret,
                 )
             }
         };
@@ -592,6 +717,7 @@ impl DealerServiceTrait for DealerService {
         Ok(Response::new(SeatPlayerAtResponse {
             result: Some(response_result),
             player_token,
+            resumed,
         }))
     }
 
@@ -629,9 +755,10 @@ impl DealerServiceTrait for DealerService {
                 })
                 .unwrap_or_default();
 
-            // Clean up the auth token for the removed seat.
+            // Clean up the auth token AND any resume binding for the removed seat.
             if let Some(uuid) = guard.seat_to_token.remove(&seat) {
                 guard.token_to_seat.remove(&uuid);
+                guard.secret_to_token.retain(|_, t| *t != uuid);
             }
 
             let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
@@ -1185,7 +1312,11 @@ async fn main() {
 }
 
 async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = env::var("PKDEALER_ADDR").unwrap_or_else(|_| DEFAULT_SERVICE_ADDR.to_owned());
+    let addr = if let Ok(port) = env::var("PKDEALER_PORT") {
+        format!("127.0.0.1:{port}")
+    } else {
+        env::var("PKDEALER_ADDR").unwrap_or_else(|_| DEFAULT_SERVICE_ADDR.to_owned())
+    };
     run(&addr).await
 }
 
@@ -1254,6 +1385,7 @@ mod tests {
             .seat_player(Request::new(SeatPlayerRequest {
                 name: "Alice".to_owned(),
                 chips: 1_000,
+                client_secret: String::new(),
             }))
             .await?
             .into_inner();
@@ -1265,6 +1397,7 @@ mod tests {
             .seat_player(Request::new(SeatPlayerRequest {
                 name: "Bob".to_owned(),
                 chips: 1_000,
+                client_secret: String::new(),
             }))
             .await?
             .into_inner();
@@ -1366,6 +1499,7 @@ mod tests {
         let request = Request::new(SeatPlayerRequest {
             name: "Alice".to_owned(),
             chips: 1_000,
+            client_secret: String::new(),
         });
         let inner = service.seat_player(request).await?.into_inner();
         match inner.result {
@@ -1386,6 +1520,7 @@ mod tests {
         let request = Request::new(SeatPlayerRequest {
             name: "Bob".to_owned(),
             chips: 0, // should default to DEFAULT_CHIPS
+            client_secret: String::new(),
         });
         let inner = service.seat_player(request).await?.into_inner();
         assert!(matches!(
@@ -1405,6 +1540,7 @@ mod tests {
             let req = Request::new(SeatPlayerRequest {
                 name: format!("Player{i}"),
                 chips: 1_000,
+                client_secret: String::new(),
             });
             service.seat_player(req).await?;
         }
@@ -1413,6 +1549,7 @@ mod tests {
             .seat_player(Request::new(SeatPlayerRequest {
                 name: "Extra".to_owned(),
                 chips: 1_000,
+                client_secret: String::new(),
             }))
             .await?
             .into_inner();
@@ -1433,6 +1570,7 @@ mod tests {
             seat: 3,
             name: "Carol".to_owned(),
             chips: 2_000,
+            client_secret: String::new(),
         });
         let inner = service.seat_player_at(request).await?.into_inner();
         assert!(matches!(
@@ -1454,6 +1592,7 @@ mod tests {
                 seat: 0,
                 name: "Dave".to_owned(),
                 chips: 1_000,
+                client_secret: String::new(),
             }))
             .await?;
         let response = service
@@ -1609,6 +1748,7 @@ mod tests {
             .seat_player(Request::new(SeatPlayerRequest {
                 name: "Solo".to_owned(),
                 chips: 1_000,
+                client_secret: String::new(),
             }))
             .await?;
         let response = service
@@ -1805,6 +1945,7 @@ mod tests {
             .seat_player(Request::new(SeatPlayerRequest {
                 name: "Eve".to_owned(),
                 chips: 1_000,
+                client_secret: String::new(),
             }))
             .await?;
 
@@ -2177,6 +2318,7 @@ mod tests {
             .seat_player(Request::new(SeatPlayerRequest {
                 name: "Alice".to_owned(),
                 chips: 1_000,
+                client_secret: String::new(),
             }))
             .await?
             .into_inner();
@@ -2191,6 +2333,7 @@ mod tests {
             .seat_player(Request::new(SeatPlayerRequest {
                 name: "Bob".to_owned(),
                 chips: 1_000,
+                client_secret: String::new(),
             }))
             .await?
             .into_inner();
@@ -2292,6 +2435,7 @@ mod tests {
                 seat: 4,
                 name: "Dave".to_owned(),
                 chips: 1_000,
+                client_secret: String::new(),
             }))
             .await?
             .into_inner();

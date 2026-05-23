@@ -89,6 +89,7 @@ impl PlayerClient {
             .seat_player(Request::new(SeatPlayerRequest {
                 name: name.to_owned(),
                 chips,
+                client_secret: String::new(),
             }))
             .await?
             .into_inner();
