@@ -1189,8 +1189,21 @@ async fn run(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let service = DealerService::new();
 
+    // gRPC reflection so `grpcurl` (and other dynamic clients) can
+    // introspect the API without a local copy of the .proto file.
+    // Register both v1 and v1alpha — different grpcurl versions probe
+    // different paths first.
+    let reflection_v1 = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(pkdealer_proto::DEALER_FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+    let reflection_v1alpha = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(pkdealer_proto::DEALER_FILE_DESCRIPTOR_SET)
+        .build_v1alpha()?;
+
     Server::builder()
         .add_service(DealerServiceServer::new(service))
+        .add_service(reflection_v1)
+        .add_service(reflection_v1alpha)
         .serve(socket_addr)
         .await
         .map_err(Into::into)

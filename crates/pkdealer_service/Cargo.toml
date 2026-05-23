@@ -24,6 +24,7 @@ pkdealer_proto = { version = "0.1.7", path = "../pkdealer_proto" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["transport"] }
+tonic-reflection = "0.12"
 uuid = { version = "1", features = ["v4"] }
 tracing                            = "0.1"
 tracing-subscriber                 = { version = "0.3", features = ["env-filter", "fmt"] }

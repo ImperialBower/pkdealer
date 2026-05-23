@@ -6,6 +6,13 @@
 /// The protobuf package name used by generated gRPC types.
 pub const DEALER_PROTO_PACKAGE: &str = "pkdealer.dealer.v1";
 
+/// Binary `FileDescriptorSet` emitted by `tonic-build`, suitable for
+/// feeding to `tonic_reflection::server::Builder::register_encoded_file_descriptor_set`.
+/// Lets `pkdealer_service` serve gRPC reflection so `grpcurl` and other
+/// dynamic clients can introspect the API without a local `.proto` file.
+pub const DEALER_FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/dealer_descriptor.bin"));
+
 /// Generated protobuf messages and gRPC definitions for the dealer API.
 pub mod dealer {
     tonic::include_proto!("pkdealer.dealer.v1");
