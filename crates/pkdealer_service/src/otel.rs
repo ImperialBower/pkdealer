@@ -51,9 +51,26 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Holds the lifetime of the OTel tracer + meter providers. Dropping it
-/// flushes batched exports and shuts down the SDK. [`init_otel`] returns
-/// `None` when `OTEL_SDK_DISABLED=true` so callers can skip the rest of
-/// the OTel wiring (useful in tests and CI).
+/// flushes batched exports and shuts down the SDK.
+///
+/// `OtelGuards` has no public constructor — it is obtained exclusively
+/// from [`init_otel`], which returns `None` when `OTEL_SDK_DISABLED=true`
+/// so callers can skip the rest of the OTel wiring (useful in tests and
+/// CI). Bind the guard to a `let _name = ...` for the lifetime of `main`
+/// so `Drop` flushes batched spans / metrics at shutdown.
+///
+/// # Examples
+///
+/// ```
+/// # // SAFETY: single-threaded doctest.
+/// unsafe { std::env::set_var("OTEL_SDK_DISABLED", "true"); }
+/// // `init_otel` returns `Ok(None)` under the disabled flag, so no
+/// // `OtelGuards` is constructed here — that path is exercised by
+/// // CI / tests where there's no collector running.
+/// let guards: Option<pkdealer_service::otel::OtelGuards> =
+///     pkdealer_service::otel::init_otel().expect("disabled path");
+/// assert!(guards.is_none());
+/// ```
 pub struct OtelGuards {
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,

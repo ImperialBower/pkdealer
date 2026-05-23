@@ -39,7 +39,9 @@ services:
     image: grafana/grafana:11.3.1
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      # Viewer is sufficient for the demo — datasources and dashboards
+      # are file-provisioned, so anonymous users never need to write.
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
     volumes:
       - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
