@@ -208,10 +208,24 @@ async fn decide_and_act<A: PokerAgent>(
     };
 
     let decision = agent.decide(&hand_state).await;
-    // Clamp raises to the service-reported minimum so pkcore never rejects
-    // them as insufficient increment.
+    // Raise(n) takes a total-amount; min_raise is the minimum increment above
+    // the call.  Minimum valid total = amount_to_call + min_raise.  When
+    // min_raise is 0 (blinds not yet swept into pot preflop) fall back to
+    // 2× BB per standard NLHE rules.
+    let floor_raise = if info.min_raise > 0 {
+        info.amount_to_call.saturating_add(info.min_raise)
+    } else if info.amount_to_call > 0 {
+        ctx.big_blind.saturating_mul(2)
+    } else {
+        0
+    };
     let decision = match decision {
-        Decision::Raise(n) if n < info.min_raise => Decision::Raise(info.min_raise),
+        Decision::Raise(n) if n < floor_raise => Decision::Raise(floor_raise),
+        // Preflop the blind is a live bet; Bet is invalid when to_call==0
+        // (BB's option). Convert to Check so the service never rejects it.
+        Decision::Bet(_) if hand_state.street == "preflop" && info.amount_to_call == 0 => {
+            Decision::Check
+        }
         other => other,
     };
     eprintln!(
