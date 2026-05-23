@@ -7,11 +7,12 @@
 | All 16 RPC handlers implemented | **Complete** |
 | UUID-based auth (`x-player-token`) | **Complete** |
 | Event broadcast via `tokio::sync::broadcast` | **Complete** |
-| E2E tests (`e2e_ping`, `e2e_two_players`) | **Complete** |
-| pkcore dependency update (0.0.39 → latest) | **Planned** |
-| Migrate from `Dealer` → `PokerSession` (removes `unsafe impl Send`) | **Planned** |
-| Auto-advance street when betting is complete | **Planned** |
-| Auto-end hand when game is over | **Planned** |
+| E2E tests (`e2e_ping`, `e2e_two_players`, `e2e_seat_resume`) | **Complete** |
+| pkcore dependency update (0.0.39 → 0.0.48) | **Complete** |
+| Migrate from `Dealer` → `PokerSession` (removes `unsafe impl Send`) | **Complete** |
+| Auto-advance street when betting is complete | **Complete** |
+| Auto-end hand when game is over | **Complete** |
+| Seat resume via `client_secret` (EPIC-23 prerequisite) | **Complete** |
 
 ---
 
@@ -180,3 +181,19 @@ cargo run --bin pkdealer_service &
 
 The `e2e_two_players` test should complete a full hand (preflop through
 showdown) using only `StartHand` + repeated `Act` calls.
+
+---
+
+## Close-out (2026-05-23)
+
+The status table above was updated retroactively: by the time we audited
+the code for EPIC-23 prerequisites we found `PokerSession`, auto-advance,
+and auto-end-hand had already been implemented in earlier commits. The
+only EPIC-20 item not yet shipped was the **seat resume via
+`client_secret`** mechanism added in this round of work — a required
+prerequisite for EPIC-23 bot agents to survive process restarts without
+losing their seats.
+
+See `docs/superpowers/plans/2026-05-23-epic-20-closeout-token-persistence.md`
+for the implementation plan and `crates/pkdealer_service/tests/e2e_seat_resume.rs`
+for the contract tests.

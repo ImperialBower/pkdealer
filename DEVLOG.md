@@ -253,3 +253,55 @@ Run:
 | Phase 2 | Web spectator app |
 | Phase 4 | AI agent clients |
 | Future | Multi-table support via `pkcore::TableManager` |
+
+---
+
+## EPIC-20 close-out — Seat resume via `client_secret` (2026-05-23)
+
+**Status: ✅ Complete**
+
+### What was added
+
+A client-chosen `client_secret` string can now be passed on `SeatPlayer` and
+`SeatPlayerAt`. If the same secret is seen on a later call (and the seat
+has not been removed), the service returns the original seat number and
+`x-player-token` and sets `resumed: true` in the response. This lets a
+crashed agent process re-attach to its seat on restart without losing
+chips or identity.
+
+### Why this matters
+
+The service is the only authoritative state for an agent's seat — when an
+agent crashed, the proto offered no way to re-claim the seat without
+either (a) calling `RemovePlayer` and starting fresh (losing chips) or
+(b) the user manually arranging seat numbers. Both are unacceptable for
+EPIC-23's autonomous bot agents.
+
+### Scope of changes
+
+- `proto/dealer.proto`: added `client_secret` (request) and `resumed`
+  (response) to both `SeatPlayer*` message pairs.
+- `crates/pkdealer_service/src/main.rs`: added `secret_to_token` map to
+  `TableState`; resume branches in both handlers; cleanup in
+  `remove_player`. Also added `PKDEALER_PORT` env-var support to
+  `run_from_env` (the e2e harness uses it; the original code only
+  honored `PKDEALER_ADDR`).
+- `crates/pkdealer_service/tests/e2e_seat_resume.rs`: 5 new e2e tests
+  covering happy path, no-secret path, `SeatPlayerAt` happy path, seat
+  mismatch, and removal cleanup.
+
+### Out of scope (deliberately)
+
+- **Service-side persistence to disk.** Service restart wipes the map.
+- **Authentication of the secret.** Anyone with the file can take over
+  the seat; acceptable for local-demo scope.
+- **Action timeout / auto-fold.** A bot that crashes mid-turn does not
+  block the table only because nothing forces it to act yet. If demos
+  surface this, add it in a future EPIC.
+
+### Sets up
+
+EPIC-23 (`pkdealer_agent_core`) can now ship a `load_or_create_secret`
+helper that persists a per-agent UUID to `~/.pkdealer/agents/<name>.secret`
+and threads it into every `SeatPlayer` call. See
+`docs/EPIC-23_Bot_Agents.md`.
