@@ -1,0 +1,95 @@
+<h2>Three Architectural Approaches</h2>
+<p class="subtitle">All three use a shared-crate workspace. They differ in how much the shared layer does.</p>
+
+<div class="options">
+
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Layered Workspace — Explicit wiring</h3>
+      <p>Extract infrastructure into <code>cardgame-infra</code>. Each game implements <code>CardGame</code> trait manually and wires it to a service binary by hand.</p>
+      <div style="font-family:monospace;font-size:0.78em;margin:10px 0;padding:10px;background:rgba(0,0,0,0.15);border-radius:6px;line-height:1.7">
+        cardgame-infra  ← auth, events, seat mgmt, base gRPC<br>
+        cardgame-proto  ← shared base proto<br>
+        ├── pkcore (ext) + pkdealer-proto + pkdealer-service<br>
+        ├── bjcore      + bj-proto       + bj-service<br>
+        ├── gofishcore  + gofish-proto   + gofish-service<br>
+        └── bridgecore  + bridge-proto   + bridge-service
+      </div>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Crystal-clear, no magic</li>
+          <li>Each game fully independent</li>
+          <li>Easy to reason about</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Most boilerplate per new game</li>
+          <li>Easy for wiring to diverge across games</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Generic Server Shell — Compile-time parameterization ★ Recommended</h3>
+      <p>The shared crate provides a <code>GameServer&lt;G: CardGame&gt;</code>. Each game just implements the trait and writes a ~20-line <code>main.rs</code>. No runtime overhead — Rust monomorphizes at compile time.</p>
+      <div style="font-family:monospace;font-size:0.78em;margin:10px 0;padding:10px;background:rgba(0,0,0,0.15);border-radius:6px;line-height:1.7">
+        cardgame-core  ← CardGame trait + GameServer&lt;G&gt; + infra<br>
+        cardgame-proto ← shared base proto<br>
+        ├── pkcore (ext) + pkdealer-proto + pkdealer/main.rs (10 lines)<br>
+        ├── bjcore      + bj-proto       + bj/main.rs      (10 lines)<br>
+        ├── gofishcore  + gofish-proto   + gofish/main.rs  (10 lines)<br>
+        └── bridgecore  + bridge-proto   + bridge/main.rs  (10 lines)
+      </div>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Very low boilerplate per new game</li>
+          <li>Trait enforces consistency</li>
+          <li>Zero runtime cost (monomorphized)</li>
+          <li>Natural Rust idiom</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Trait design must accommodate all games upfront</li>
+          <li>More complex shared crate to understand initially</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Macro-Assisted — Derive the service glue</h3>
+      <p>Approach B + a proc-macro <code>#[derive(GameService)]</code> that generates the gRPC service impl and proto glue from the <code>CardGame</code> impl. Absolute minimum per-game code.</p>
+      <div style="font-family:monospace;font-size:0.78em;margin:10px 0;padding:10px;background:rgba(0,0,0,0.15);border-radius:6px;line-height:1.7">
+        cardgame-core       ← CardGame trait + GameServer&lt;G&gt; + infra<br>
+        cardgame-macros     ← #[derive(GameService)] proc-macro<br>
+        cardgame-proto      ← shared base proto<br>
+        ├── pkcore + pkdealer-proto<br>
+        │   └── #[derive(GameService)] struct PokerGame; (3 lines)<br>
+        ├── bjcore + bj-proto<br>
+        │   └── #[derive(GameService)] struct BlackjackGame;<br>
+        └── ...
+      </div>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Absolute minimum per-game boilerplate</li>
+          <li>Strongly enforced structure</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Proc-macros are complex to write and maintain</li>
+          <li>Harder to debug ("magic" errors)</li>
+          <li>Likely premature at this stage</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="section" style="margin-top:24px">
+  <p class="label">My recommendation</p>
+  <p><strong>Start with B.</strong> The generic <code>GameServer&lt;G: CardGame&gt;</code> approach gives you the structural discipline of a well-defined trait and near-zero per-game overhead — without the maintenance burden of proc-macros. C can be added later once the trait stabilizes across 2–3 games.</p>
+</div>

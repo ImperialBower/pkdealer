@@ -10,6 +10,10 @@ keywords = ["poker", "grpc", "dealer", "service"]
 categories = ["games"]
 rust-version = "1.94.1"
 
+[lib]
+name = "pkdealer_service"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pkdealer_service"
 path = "src/main.rs"
@@ -20,6 +24,15 @@ pkdealer_proto = { version = "0.1.7", path = "../pkdealer_proto" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["transport"] }
+tonic-reflection = "0.12"
 uuid = { version = "1", features = ["v4"] }
+tracing                            = "0.1"
+tracing-subscriber                 = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-opentelemetry              = "0.31"
+opentelemetry                      = "0.30"
+opentelemetry_sdk                  = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-otlp                 = { version = "0.30", features = ["grpc-tonic", "metrics", "trace"] }
 
 [dev-dependencies]
+tracing-test = "0.2"
+serial_test = "3"

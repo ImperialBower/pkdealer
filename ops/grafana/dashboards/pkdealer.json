@@ -1,0 +1,73 @@
+{
+  "uid": "pkdealer",
+  "title": "pkdealer",
+  "schemaVersion": 39,
+  "timezone": "browser",
+  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1, "type": "stat",
+      "title": "Hands played (per min)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [{
+        "expr": "rate(pkdealer_hands_played_total[1m]) * 60",
+        "datasource": { "type": "prometheus", "uid": "prometheus" }
+      }]
+    },
+    {
+      "id": 2, "type": "heatmap",
+      "title": "Pot size distribution",
+      "gridPos": { "x": 6, "y": 0, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "sum(rate(pkdealer_pot_size_chips_bucket[1m])) by (le)",
+        "format": "heatmap",
+        "datasource": { "type": "prometheus", "uid": "prometheus" }
+      }]
+    },
+    {
+      "id": 3, "type": "timeseries",
+      "title": "Action latency (p50/p95/p99)",
+      "gridPos": { "x": 0, "y": 4, "w": 6, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(pkdealer_action_duration_ms_milliseconds_bucket[1m])) by (le))",
+          "legendFormat": "p50",
+          "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "expr": "histogram_quantile(0.95, sum(rate(pkdealer_action_duration_ms_milliseconds_bucket[1m])) by (le))",
+          "legendFormat": "p95",
+          "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "expr": "histogram_quantile(0.99, sum(rate(pkdealer_action_duration_ms_milliseconds_bucket[1m])) by (le))",
+          "legendFormat": "p99",
+          "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 4, "type": "timeseries",
+      "title": "Actions by type",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 6 },
+      "targets": [{
+        "expr": "sum by (action_type) (rate(pkdealer_action_duration_ms_milliseconds_count[1m]))",
+        "datasource": { "type": "prometheus", "uid": "prometheus" }
+      }]
+    },
+    {
+      "id": 5, "type": "timeseries",
+      "title": "AI decision latency by agent (EPIC-23)",
+      "gridPos": { "x": 12, "y": 8, "w": 6, "h": 10 },
+      "description": "No data until EPIC-23 agents are running.",
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum(rate(pkdealer_ai_decision_latency_ms_milliseconds_bucket[1m])) by (le, agent_type))",
+        "datasource": { "type": "prometheus", "uid": "prometheus" }
+      }]
+    },
+    {
+      "id": 6, "type": "text",
+      "title": "Trace lookup",
+      "gridPos": { "x": 0, "y": 18, "w": 18, "h": 3 },
+      "options": {
+        "mode": "markdown",
+        "content": "[Open Jaeger UI](http://localhost:16686/search?service=pkdealer_service)"
+      }
+    }
+  ]
+}

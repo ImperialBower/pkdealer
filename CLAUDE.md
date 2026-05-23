@@ -229,3 +229,11 @@ impl std::error::Error for MyError {}
 - [Writing Unsafe Rust](https://doc.rust-lang.org/book/ch19-01-unsafe-rust.html)
 - [Effective Rust](https://effective-rust.dev/)
 
+## Observability
+
+The service is OpenTelemetry-instrumented. Stack config lives in `ops/`;
+`docker compose up -d --build` brings up service + collector + Jaeger +
+Prometheus + Grafana. See `crates/pkdealer_service/README.md` for env
+vars and the full quickstart. Toggle OTel off with `OTEL_SDK_DISABLED=true`
+when running tests or `cargo run` without a collector.
+
