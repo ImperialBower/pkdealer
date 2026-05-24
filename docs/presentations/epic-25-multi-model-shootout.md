@@ -258,3 +258,17 @@ If you intend to re-run the demo within an hour, skip the Ollama and Docker step
 - **Jaeger shows zero `llm.decision` spans.** OTel collector not up, or `OTEL_SDK_DISABLED=true` is set in one of the agent shells. Confirm `docker compose ps otel-collector` and that the launch script's environment is clean.
 - **`gemma2:2b` produces empty action text.** Gemma occasionally returns just whitespace for short prompts; the parser falls back to check/fold. If it persists for a whole demo, swap `gemma2:2b` → `gemma2:9b` (~5 GB) in `shootout.sh` line 13.
 - **1B model never wins a hand.** Working as intended. That's the talking point, not the bug.
+
+```txt
+★ Insight ─────────────────────────────────────
+  - The runbook's most fragile assumption is single-daemon residency. Ollama 0.3+ keeps multiple models warm if you set
+  OLLAMA_MAX_LOADED_MODELS before launching, but the macOS Ollama.app silently ignores the env var — that's why Step 1 of Setup kills it and
+  re-launches from the shell. Skip that and the demo turns into a swap-fest.
+  - I chose gto and tight_aggressive as the "soundest" two profiles out of nine in pkdealer_agent_rules — tight_aggressive because TAG is the
+   universally-recommended winning style in NLHE literature, gto because it's the math-driven optimum. Surfaced the rationale in the runbook
+  so you can swap to abc or tight_passive without rewriting anything but two CLI flags in demo/shootout.sh.
+  - I deliberately did not run a live smoke of the 8-agent path — that's a 30-60 second loop spinning up 8 cargo processes, eating 13 GB of
+  model residency. The runbook flags everything I didn't verify (the helper script doesn't exist yet — Step 5 of Setup creates it) so dress
+  rehearsal catches surprises before stage.
+  ─────────────────────────────────────────────────
+```
