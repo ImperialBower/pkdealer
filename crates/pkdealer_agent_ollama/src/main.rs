@@ -1,29 +1,27 @@
 #![warn(clippy::pedantic, clippy::unwrap_used, clippy::expect_used)]
-//! # `pkdealer_agent_claude` (binary)
+//! # `pkdealer_agent_ollama` (binary)
 //!
-//! A poker agent that uses the Anthropic Claude API to make decisions. The
-//! current hand state is formatted into a natural-language prompt and sent
-//! to Claude; the text response is parsed back into a `Decision`.
-//!
-//! All LLM-agnostic logic (prompt construction, response parsing, `OTel`
-//! span emission, fallback decisions) lives in `pkdealer_agent_llm`. This
-//! binary is a thin wiring layer: parse args, build a [`ClaudeBackend`],
-//! wrap it in an `LlmPokerAgent`, and hand the result to
-//! `run_agent`.
+//! A poker agent that uses a locally-served Ollama model to make decisions.
+//! Mirrors `pkdealer_agent_claude`: the same poker prompt is built, the same
+//! response parsing is applied, only the HTTP backend differs.
 //!
 //! ## Usage
 //!
 //! ```text
-//! ANTHROPIC_API_KEY=sk-... cargo run --bin pkdealer_agent_claude -- --name claude
+//! # one-time setup:
+//! #   ollama serve
+//! #   ollama pull llama3.1
+//!
+//! cargo run --bin pkdealer_agent_ollama -- --name llama
 //! ```
 //!
 //! ## Environment variables
 //!
 //! | Variable | Default | Purpose |
 //! |----------|---------|---------|
-//! | `ANTHROPIC_API_KEY` | — | **Required.** Anthropic API key |
+//! | `OLLAMA_HOST` | `http://localhost:11434` | Ollama HTTP host |
+//! | `OLLAMA_MODEL` | `llama3.1` | Ollama model identifier override |
 //! | `PKDEALER_ENDPOINT` | `http://127.0.0.1:50051` | gRPC service address |
-//! | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Claude model override |
 //! | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTel collector |
 //! | `OTEL_SDK_DISABLED` | — | Set to `true` to skip OTel init |
 
@@ -34,19 +32,19 @@ use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig as _};
 use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
-use pkdealer_agent_claude::ClaudeBackend;
 use pkdealer_agent_core::{AgentConfig, run_agent};
 use pkdealer_agent_llm::LlmPokerAgent;
+use pkdealer_agent_ollama::OllamaBackend;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{
     EnvFilter, Registry, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
 };
 
-/// Claude LLM poker agent connected to a pkdealer gRPC service.
+/// Ollama LLM poker agent connected to a pkdealer gRPC service.
 #[derive(Debug, Parser)]
 #[command(
-    name = "pkdealer_agent_claude",
-    about = "LLM poker agent powered by Anthropic Claude"
+    name = "pkdealer_agent_ollama",
+    about = "LLM poker agent powered by Ollama"
 )]
 struct Args {
     /// gRPC service address.
@@ -58,7 +56,7 @@ struct Args {
     endpoint: String,
 
     /// Player name displayed at the table.
-    #[arg(long, default_value = "claude")]
+    #[arg(long, default_value = "ollama")]
     name: String,
 
     /// Optional specific seat number (0–8). Omit to take the next available seat.
@@ -73,13 +71,13 @@ struct Args {
     #[arg(long, default_value = "")]
     client_secret: String,
 
-    /// Claude model identifier.
-    #[arg(long, env = "ANTHROPIC_MODEL", default_value = "claude-sonnet-4-6")]
+    /// Ollama model identifier.
+    #[arg(long, env = "OLLAMA_MODEL", default_value = "llama3.1")]
     model: String,
 
-    /// Maximum tokens Claude may generate per response.
-    #[arg(long, default_value_t = 16)]
-    max_tokens: u32,
+    /// Ollama HTTP host.
+    #[arg(long, env = "OLLAMA_HOST", default_value = "http://localhost:11434")]
+    host: String,
 }
 
 /// Holds the `OTel` tracer provider; flushes batched spans on drop.
@@ -142,23 +140,12 @@ fn init_otel(service_name: &str) -> Option<OtelGuard> {
 async fn main() {
     let args = Args::parse();
 
-    let _otel = init_otel("pkdealer_agent_claude");
+    let _otel = init_otel("pkdealer_agent_ollama");
 
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            eprintln!("ANTHROPIC_API_KEY is not set or empty");
-            process::exit(1);
-        }
-    };
+    let backend = OllamaBackend::new(args.host.clone(), args.model.clone());
+    let agent = LlmPokerAgent::with_model(backend, "ollama", args.model.clone());
 
-    let backend = ClaudeBackend::new(api_key, args.model.clone(), args.max_tokens);
-    let agent = LlmPokerAgent::with_model(backend, "anthropic", args.model.clone());
-
-    eprintln!(
-        "[{}] model={} max_tokens={}",
-        args.name, args.model, args.max_tokens
-    );
+    eprintln!("[{}] host={} model={}", args.name, args.host, args.model);
 
     let config = AgentConfig {
         endpoint: args.endpoint,
@@ -182,44 +169,44 @@ mod tests {
     #[test]
     fn args_defaults() {
         let args =
-            Args::try_parse_from(["pkdealer_agent_claude"]).expect("default args should parse");
+            Args::try_parse_from(["pkdealer_agent_ollama"]).expect("default args should parse");
         assert_eq!(args.endpoint, "http://127.0.0.1:50051");
-        assert_eq!(args.name, "claude");
+        assert_eq!(args.name, "ollama");
         assert!(args.seat.is_none());
         assert_eq!(args.chips, 10_000);
-        assert_eq!(args.model, "claude-sonnet-4-6");
-        assert_eq!(args.max_tokens, 16);
+        assert_eq!(args.model, "llama3.1");
+        assert_eq!(args.host, "http://localhost:11434");
         assert!(args.client_secret.is_empty());
     }
 
     #[test]
-    fn args_model_override() {
+    fn args_model_and_host_override() {
         let args = Args::try_parse_from([
-            "pkdealer_agent_claude",
+            "pkdealer_agent_ollama",
             "--model",
-            "claude-opus-4-7",
-            "--max-tokens",
-            "32",
+            "mistral",
+            "--host",
+            "http://192.168.1.10:11434",
         ])
-        .expect("model args should parse");
-        assert_eq!(args.model, "claude-opus-4-7");
-        assert_eq!(args.max_tokens, 32);
+        .expect("override args should parse");
+        assert_eq!(args.model, "mistral");
+        assert_eq!(args.host, "http://192.168.1.10:11434");
     }
 
     #[test]
     fn args_with_seat_and_name() {
         let args = Args::try_parse_from([
-            "pkdealer_agent_claude",
+            "pkdealer_agent_ollama",
             "--name",
-            "claude-bot",
+            "llama-bot",
             "--seat",
-            "4",
+            "3",
             "--chips",
-            "5000",
+            "7500",
         ])
         .expect("seat/name args should parse");
-        assert_eq!(args.name, "claude-bot");
-        assert_eq!(args.seat, Some(4));
-        assert_eq!(args.chips, 5_000);
+        assert_eq!(args.name, "llama-bot");
+        assert_eq!(args.seat, Some(3));
+        assert_eq!(args.chips, 7_500);
     }
 }
