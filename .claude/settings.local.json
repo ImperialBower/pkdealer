@@ -20,7 +20,8 @@
       "Read(//Users/christoph/src/**)",
       "Bash(grep *)",
       "Bash(cargo check *)",
-      "Bash(OTEL_SDK_DISABLED=true cargo test *)"
+      "Bash(OTEL_SDK_DISABLED=true cargo test *)",
+      "Bash(cargo update *)"
     ]
   }
 }

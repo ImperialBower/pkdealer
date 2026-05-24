@@ -36,7 +36,9 @@ use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::Sd
 use pkdealer_agent_core::{AgentConfig, Decision, HandState, PokerAgent, run_agent};
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+use tracing_subscriber::{
+    EnvFilter, Registry, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -178,7 +180,7 @@ impl ClaudeAgent {
 #[async_trait]
 impl PokerAgent for ClaudeAgent {
     /// Builds a natural-language prompt, calls the Anthropic API, and parses
-    /// the response into a [`Decision`]. Emits an OTel span with `gen_ai.*`
+    /// the response into a [`Decision`]. Emits an `OTel` span with `gen_ai.*`
     /// attributes for every API call.
     ///
     /// Falls back to `Check` (or `Fold` if facing a bet) on any API error.
@@ -209,7 +211,9 @@ impl PokerAgent for ClaudeAgent {
                 span.record("gen_ai.usage.output_tokens", out_tok);
                 let decision = parse_action(&text, to_call);
                 span.record("poker.action_chosen", tracing::field::debug(&decision));
-                eprintln!("[claude] {street} → {text:?} → {decision:?}  (in={in_tok} out={out_tok})");
+                eprintln!(
+                    "[claude] {street} → {text:?} → {decision:?}  (in={in_tok} out={out_tok})"
+                );
                 decision
             }
             Err(e) => {
@@ -387,7 +391,7 @@ fn pot_odds(state: &HandState) -> f64 {
 
 // ── OTel init ─────────────────────────────────────────────────────────────────
 
-/// Holds the OTel tracer provider; flushes batched spans on drop.
+/// Holds the `OTel` tracer provider; flushes batched spans on drop.
 struct OtelGuard(SdkTracerProvider);
 
 impl Drop for OtelGuard {
@@ -396,10 +400,10 @@ impl Drop for OtelGuard {
     }
 }
 
-/// Initialises OTel tracing with a batched OTLP gRPC exporter.
+/// Initialises `OTel` tracing with a batched OTLP gRPC exporter.
 ///
 /// Returns `None` when `OTEL_SDK_DISABLED=true`, leaving the caller without
-/// an OTel subscriber (useful in tests and `cargo run` without a collector).
+/// an `OTel` subscriber (useful in tests and `cargo run` without a collector).
 fn init_otel(service_name: &str) -> Option<OtelGuard> {
     if std::env::var("OTEL_SDK_DISABLED").as_deref() == Ok("true") {
         return None;
@@ -434,10 +438,7 @@ fn init_otel(service_name: &str) -> Option<OtelGuard> {
     let tracer = tracer_provider.tracer(service_name.to_owned());
 
     Registry::default()
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(fmt::layer())
         .with(OpenTelemetryLayer::new(tracer))
         .try_init()
@@ -485,6 +486,7 @@ async fn main() {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -693,8 +695,8 @@ mod tests {
 
     #[test]
     fn test_args_defaults() {
-        let args = Args::try_parse_from(["pkdealer_agent_claude"])
-            .expect("default args should parse");
+        let args =
+            Args::try_parse_from(["pkdealer_agent_claude"]).expect("default args should parse");
         assert_eq!(args.endpoint, "http://127.0.0.1:50051");
         assert_eq!(args.name, "claude");
         assert!(args.seat.is_none());
