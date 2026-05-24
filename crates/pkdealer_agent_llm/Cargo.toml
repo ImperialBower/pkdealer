@@ -1,0 +1,19 @@
+[package]
+name = "pkdealer_agent_llm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared LlmBackend trait and poker-prompt logic used by LLM-backed pkdealer agents"
+keywords = ["poker", "agent", "llm", "claude", "ollama"]
+categories = ["games"]
+rust-version = "1.85"
+
+[dependencies]
+pkdealer_agent_core = { path = "../pkdealer_agent_core", version = "0.1.11" }
+async-trait = "0.1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,12 +1,12 @@
 [package]
-name = "pkdealer_agent_claude"
+name = "pkdealer_agent_ollama"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Claude LLM poker agent for pkdealer with OTel gen_ai instrumentation"
-keywords = ["poker", "grpc", "agent", "claude", "llm"]
+description = "Ollama-backed LLM poker agent for pkdealer with OTel gen_ai instrumentation"
+keywords = ["poker", "grpc", "agent", "ollama", "llm"]
 categories = ["games"]
 rust-version = "1.85"
 
@@ -14,7 +14,7 @@ rust-version = "1.85"
 path = "src/lib.rs"
 
 [[bin]]
-name = "pkdealer_agent_claude"
+name = "pkdealer_agent_ollama"
 path = "src/main.rs"
 
 [dependencies]
