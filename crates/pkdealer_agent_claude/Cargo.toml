@@ -1,0 +1,30 @@
+[package]
+name = "pkdealer_agent_claude"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Claude LLM poker agent for pkdealer with OTel gen_ai instrumentation"
+keywords = ["poker", "grpc", "agent", "claude", "llm"]
+categories = ["games"]
+rust-version = "1.85"
+
+[[bin]]
+name = "pkdealer_agent_claude"
+path = "src/main.rs"
+
+[dependencies]
+pkdealer_agent_core = { path = "../pkdealer_agent_core", version = "0.1.10" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+clap = { version = "4", features = ["derive", "env"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+# OTel — same versions as pkdealer_service
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic", "trace"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.31"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
