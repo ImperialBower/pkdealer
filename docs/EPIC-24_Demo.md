@@ -4,13 +4,34 @@
 
 | Component | Status |
 |---|---|
-| `docker-compose.yml` — full platform stack | Planned |
-| `demo.sh` — one-command launcher | Planned |
-| `prometheus.yml` — scrape config | Planned |
-| Grafana dashboard JSON (committed) | Planned |
-| Langfuse (self-hosted) in compose stack | Planned |
-| `DEMO.md` — presenter guide | Planned |
-| Dockerfiles for service + spectator + agents | Planned |
+| `docker-compose.yml` — full platform stack | **Complete** |
+| `demo.sh` — one-command launcher | **Complete** |
+| `ops/prometheus.yml` — scrape config | **Complete** |
+| `ops/grafana/dashboards/pkdealer.json` (committed) | **Complete** |
+| Langfuse (self-hosted) in compose stack | Deferred — Jaeger already shows `gen_ai` spans |
+| `DEMO.md` — presenter guide | **Complete** |
+| `Dockerfile.agent` (shared, parameterized by `BIN_NAME`) | **Complete** |
+| `crates/pkdealer_service/Dockerfile` | **Complete** (landed in EPIC-22) |
+| Spectator | External — runs from the separate `pkspectator` repo |
+| `.env.example` | **Complete** |
+
+### Scope notes vs. original design
+
+- **Spectator** — extracted to its own repo in EPIC-21. The demo runs
+  pkspectator side-by-side rather than embedding it in compose.
+- **Langfuse** — deferred. Postgres + Langfuse adds significant weight
+  for a feature already covered by `gen_ai` spans in Jaeger.
+- **Claude agent** — not enabled in the default compose stack to avoid
+  hard-coding an `ANTHROPIC_API_KEY` requirement. DEMO.md documents the
+  one-block addition to opt in.
+- **Ollama** — runs on the host via `host.docker.internal:11434`, not
+  in compose. Matches the pkspectator pattern and avoids shipping a
+  ~5 GB model image.
+- **Prometheus scrape topology** — metrics flow
+  `service → otel-collector (:8889) → prometheus`, not direct as the
+  original design proposed. Reflects the topology landed in EPIC-22.
+- **Agent Dockerfiles** — one shared `Dockerfile.agent` parameterized
+  by `BIN_NAME` build arg instead of N near-duplicates.
 
 ---
 

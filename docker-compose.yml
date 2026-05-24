@@ -46,3 +46,95 @@ services:
       - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports: ["3001:3000"]
+
+  # ── agent containers ──────────────────────────────────────────────────
+  # All agents share Dockerfile.agent; BIN_NAME selects the binary.
+  # Rule-based bots use pkcore built-in profile names (gto, loose_aggressive,
+  # tight_aggressive). The ollama agent talks to a host-side `ollama serve`
+  # via host.docker.internal.
+
+  agent_gto:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_rules
+    command: ["--name", "gto", "--profile", "gto"]
+    environment:
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_gto
+      RUST_LOG: info
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_lag:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_rules
+    command: ["--name", "lag", "--profile", "loose_aggressive"]
+    environment:
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_lag
+      RUST_LOG: info
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_tag:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_rules
+    command: ["--name", "tag", "--profile", "tight_aggressive"]
+    environment:
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_tag
+      RUST_LOG: info
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_random:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_random
+    command: ["--name", "random"]
+    environment:
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_random
+      RUST_LOG: info
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_ollama:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_ollama
+    command: ["--name", "llama"]
+    environment:
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_ollama
+      RUST_LOG: info
+    extra_hosts:
+      # Lets the container resolve host.docker.internal on Linux.
+      # No-op (already mapped) on Docker Desktop for macOS/Windows.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - pkdealer_service
+      - otel-collector
