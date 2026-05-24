@@ -14,5 +14,5 @@ resolver = "2"
 version = "0.1.11"
 edition = "2024"
 authors = ["electronicpanopticon <gaoler@electronicpanopticon.com>"]
-license = "GPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/ImperialBower/pkgrpc"

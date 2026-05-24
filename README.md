@@ -2,7 +2,8 @@
 [![Workspace Check](https://github.com/ImperialBower/pkdealer/actions/workflows/workspace-check.yaml/badge.svg)](https://github.com/ImperialBower/pkdealer/actions/workflows/workspace-check.yaml)
 [![Security Audit](https://github.com/ImperialBower/pkdealer/actions/workflows/audit.yml/badge.svg)](https://github.com/ImperialBower/pkdealer/actions/workflows/audit.yml)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.en.html)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE-MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE-APACHE)
 
 ---
 
@@ -319,7 +320,21 @@ expected to follow the [Contributor Covenant](https://www.contributor-covenant.o
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE-GPL3.0).
+Licensed under either of
+
+* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+* MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
 
 ---
 

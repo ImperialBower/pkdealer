@@ -38,7 +38,9 @@ use pkcore::bot::profile::BotProfile;
 use pkcore::bot::table_snapshot::{SeatInfo, TableSnapshot};
 use pkcore::cards::Cards;
 use pkcore::games::GamePhase;
+use pkcore::games::betting_structure::{BetTier, BettingStructure};
 use pkdealer_agent_core::{AgentConfig, Decision, HandState, PokerAgent, run_agent};
+use uuid::Uuid;
 
 /// Rule-based poker bot connected to a pkdealer gRPC service.
 #[derive(Debug, Parser)]
@@ -96,11 +98,12 @@ impl PokerAgent for RulesAgent {
 /// the runner's floor-raise correction handles any undersized raise amounts.
 /// `board` and `hole_cards` are left empty because [`RuleBasedDecider`] does
 /// not use them for its probabilistic decisions.
-fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot {
-    let stacks = state
+fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot<'static> {
+    let stacks: Vec<SeatInfo> = state
         .stacks
         .iter()
         .map(|(seat, name, chips)| SeatInfo {
+            id: Uuid::new_v4(),
             seat: *seat,
             name: name.clone(),
             #[allow(clippy::cast_possible_truncation)]
@@ -117,6 +120,8 @@ fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot {
         _ => GamePhase::BettingPreFlop,
     };
 
+    let seat_count = u8::try_from(stacks.len()).unwrap_or(u8::MAX);
+
     #[allow(clippy::cast_possible_truncation)]
     TableSnapshot {
         seat: state.seat,
@@ -130,6 +135,13 @@ fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot {
         my_chips: state.my_chips as usize,
         stacks,
         big_blind: state.big_blind as usize,
+        betting_structure: BettingStructure::default(),
+        bet_tier: BetTier::default(),
+        checked_this_street: false,
+        dealer_button: None,
+        seat_count,
+        logical_seat: None,
+        opponent_stats: None,
     }
 }
 

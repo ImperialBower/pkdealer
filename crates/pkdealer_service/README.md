@@ -123,7 +123,12 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
 
 ## License
 
-GPL-3.0-or-later
+Licensed under either of
 
-See [LICENSE-GPL3.0](../../LICENSE-GPL3.0) for details.
+* Apache License, Version 2.0 ([LICENSE-APACHE](../../LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+* MIT license ([LICENSE-MIT](../../LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
 
