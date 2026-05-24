@@ -54,7 +54,7 @@ crates/
 ✅ Fully documented with doc tests
 ✅ Unit tests for all functions
 ✅ Proper error handling (no unwrap)
-✅ GPL-3.0-or-later licensed
+✅ Dual-licensed MIT OR Apache-2.0
 ✅ CI/CD integrated
 ✅ Ready for gRPC implementation
 

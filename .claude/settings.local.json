@@ -19,7 +19,10 @@
       "Bash(find ~/.cargo/registry/src/*/pkcore-0.0.40/src -name \"*.rs\" -type f)",
       "Read(//Users/christoph/src/**)",
       "Bash(grep *)",
-      "Bash(cargo check *)"
+      "Bash(cargo check *)",
+      "Bash(OTEL_SDK_DISABLED=true cargo test *)",
+      "Bash(cargo update *)",
+      "Bash(git log *)"
     ]
   }
 }

@@ -36,7 +36,7 @@ Your GitHub Actions workflows have been restructured to properly handle your Car
 
 **Cargo-deny configuration:**
 - Security advisory checking
-- License compliance (MIT, Apache-2.0, GPL-3.0)
+- License compliance (MIT, Apache-2.0, and other permissive licenses)
 - Dependency version consistency
 - Source registry validation
 
