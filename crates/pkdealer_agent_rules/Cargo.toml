@@ -15,7 +15,7 @@ name = "pkdealer_agent_rules"
 path = "src/main.rs"
 
 [dependencies]
-pkdealer_agent_core = { path = "../pkdealer_agent_core", version = "0.1.10" }
+pkdealer_agent_core = { path = "../pkdealer_agent_core", version = "0.1.11" }
 pkcore = { version = "0.1.1", features = ["bot-profiles"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 clap = { version = "4", features = ["derive", "env"] }

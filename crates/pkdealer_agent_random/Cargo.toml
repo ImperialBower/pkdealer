@@ -15,7 +15,7 @@ name = "pkdealer_agent_random"
 path = "src/main.rs"
 
 [dependencies]
-pkdealer_agent_core = { path = "../pkdealer_agent_core", version = "0.1.9" }
+pkdealer_agent_core = { path = "../pkdealer_agent_core", version = "0.1.11" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.9"
