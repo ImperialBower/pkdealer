@@ -1,4 +1,4 @@
-# EPIC-25: Local-LLM Backend & Multi-Model Agents
+# EPIC-40: Local-LLM Backend & Multi-Model Agents
 
 ## Status
 
@@ -26,7 +26,7 @@ response parsing, OTel span emission, and fallback logic. The poker-side code
 would drift between agents over time, and adding a fourth backend would mean a
 fourth near-duplicate crate.
 
-EPIC-25 fixes the abstraction. The poker-side logic — turning a `HandState`
+EPIC-40 fixes the abstraction. The poker-side logic — turning a `HandState`
 into a prompt, parsing free text into a `Decision`, choosing a safe fallback
 on error — is extracted into `pkdealer_agent_llm`. Each model provider becomes
 a thin `LlmBackend` impl owning only its HTTP transport, auth, and

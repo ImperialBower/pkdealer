@@ -1,20 +1,20 @@
-# Demo: EPIC-25 — Eight-Player Multi-Model Shootout
+# Demo: EPIC-40 — Eight-Player Multi-Model Shootout
 
 > Six small local LLMs (Llama 3.2 3B, Qwen 2.5 3B, Phi-3.5, Gemma 2 2B, Llama 3.2 1B, Mistral 7B) seated against two sound rule-based bots (`gto`, `tight_aggressive`) at the same nine-max table. The audience sees eight independent agents — six talking to a single Ollama daemon, two pure-Rust — playing real hands while Jaeger streams a `gen_ai.system=ollama` span per LLM decision next to deterministic `pkdealer_agent_rules` decisions, all under one autonomous game loop.
 
 ## Audience & framing
 
-Engineering peers (or curious onlookers) interested in *what falls out of the EPIC-25 abstraction once you push on it*. The angle is **the trait pays for itself the second time you re-use it, and the sixth**: one `LlmBackend` impl + six CLI flags = six model personalities at the same table, no per-model crate. The bots are the control group — the audience can see by eye whether the models behave like poker players or like coin-flippers.
+Engineering peers (or curious onlookers) interested in *what falls out of the EPIC-40 abstraction once you push on it*. The angle is **the trait pays for itself the second time you re-use it, and the sixth**: one `LlmBackend` impl + six CLI flags = six model personalities at the same table, no per-model crate. The bots are the control group — the audience can see by eye whether the models behave like poker players or like coin-flippers.
 
 **Bot pick justification (raise this verbally, in case anyone asks):** of `pkdealer_agent_rules`'s nine built-in profiles, `gto` is the math-driven optimum and `tight_aggressive` (TAG) is the textbook winning style in NLHE literature. Swap to `abc` or `tight_passive` if your audience prefers a more "human" baseline.
 
-> Verified during prep: all six recommended models are already pulled on this machine. `cargo check` was not re-run for the runbook; the prior EPIC-25 presentation confirms the workspace builds. **Docker daemon was not running at prep time** — the OTel stack is down. The runbook offers two paths: (A) start Docker for the full Jaeger story, or (B) run with `OTEL_SDK_DISABLED=true` for a service-only demo. Pick before the audience arrives.
+> Verified during prep: all six recommended models are already pulled on this machine. `cargo check` was not re-run for the runbook; the prior EPIC-40 presentation confirms the workspace builds. **Docker daemon was not running at prep time** — the OTel stack is down. The runbook offers two paths: (A) start Docker for the full Jaeger story, or (B) run with `OTEL_SDK_DISABLED=true` for a service-only demo. Pick before the audience arrives.
 
 ---
 
 ## Prerequisites
 
-- Repo at `/Users/christoph/src/github.com/ImperialBower/pkdealer`, branch `main` (or `epic-25` if you want the in-flight version).
+- Repo at `/Users/christoph/src/github.com/ImperialBower/pkdealer`, branch `main` (EPIC-40 was merged via PR #12; no live feature branch).
 - Rust 1.85+ (`cargo --version`).
 - Ollama daemon listening on `127.0.0.1:11434`.
   - Smoke: `curl -s http://localhost:11434/api/tags | python3 -m json.tool | head`
@@ -178,7 +178,7 @@ Engineering peers (or curious onlookers) interested in *what falls out of the EP
    - Click any recent trace.
 
    _Expected:_ A `hand` span with nested `action` spans; each `action` from an LLM seat has a child `llm.decision` span with `gen_ai.system=ollama` and `gen_ai.request.model=<the model>`.
-   _Talking point:_ Six different `gen_ai.request.model` values in one trace — that's the whole EPIC-25 punchline rendered visually.
+   _Talking point:_ Six different `gen_ai.request.model` values in one trace — that's the whole EPIC-40 punchline rendered visually.
 
 7. **Filter to one model's spans**
    - Jaeger search → Tags: `gen_ai.request.model=qwen2.5:3b`
@@ -200,7 +200,7 @@ Engineering peers (or curious onlookers) interested in *what falls out of the EP
 
 ## What to highlight verbally
 
-- **The trait paid for itself.** Six models in one demo cost six CLI flags, not six crates. That's the EPIC-25 thesis stated by the price tag, not the slide deck.
+- **The trait paid for itself.** Six models in one demo cost six CLI flags, not six crates. That's the EPIC-40 thesis stated by the price tag, not the slide deck.
 - **Same prompt, six personalities.** Identical `build_prompt` output goes to all six LLMs — divergence is *purely* model behavior. That's a free A/B harness for any future prompt edit.
 - **The parser is a load-bearing safety net.** With a 1.3 GB model at the table, malformed outputs happen. `parse_action`'s fallback at `parse.rs:59-63` is why the table doesn't deadlock when a model hallucinates `"I think we should fold."` instead of `"fold"`.
 - **The bots are the control group.** Deterministic deciders make it obvious when the LLMs are gambling vs. reasoning. Without them, the audience has no baseline.
@@ -217,7 +217,7 @@ A: Each agent process owns one seat at the table; one model per process is the c
 A: Both. The prompt includes hole cards, board, pot, to-call, and stack; the parser only checks the action *grammar*, not whether it's good poker. So the 7B and 3B models often play recognizable lines; the 1B model is closer to "structured noise that the parser laundered into a legal call."
 
 **Q: Why no Claude or OpenAI in this demo?**
-A: Cost and reproducibility. This runbook is meant to run anywhere with Ollama installed and no API keys. The previous EPIC-25 presentation covers the Claude side-by-side story.
+A: Cost and reproducibility. This runbook is meant to run anywhere with Ollama installed and no API keys. The previous EPIC-40 presentation covers the Claude side-by-side story.
 
 **Q: What about DeepSeek-R1, which is also on this machine?**
 A: It's an R1 reasoning model — emits `<think>...</think>` blocks before the answer, which the strict-prefix parser in `parse.rs` discards. R1 would fold-or-check every hand. Including it would be a worked example of why output format matters more than model size for agent design — fair to mention if a question opens the door.
