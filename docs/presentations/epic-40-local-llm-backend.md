@@ -1,10 +1,10 @@
-# Demo: EPIC-25 — Local-LLM Backend & Multi-Model Agents
+# Demo: EPIC-40 — Local-LLM Backend & Multi-Model Agents
 
 > One Claude monolith became a shared `LlmBackend` trait plus two thin per-provider crates. The audience sees two LLM agents — Claude and Ollama — at the same table, each emitting its own `gen_ai.*` spans, with no copy-pasted poker code between them.
 
 ## Audience & framing
 
-Engineering peers reviewing EPIC-25 progress. The angle is **the cost and shape of the abstraction**: EPIC-23 shipped one LLM agent as a 740-line monolith; EPIC-25 split it into a shared library + two backends, and the dividend is a free, local, no-API-key second agent that lights up the same OTel spans as Claude. The visible punchline is two `gen_ai.system` values side-by-side in Jaeger from the same hand.
+Engineering peers reviewing EPIC-40 progress. The angle is **the cost and shape of the abstraction**: EPIC-23 shipped one LLM agent as a 740-line monolith; EPIC-40 split it into a shared library + two backends, and the dividend is a free, local, no-API-key second agent that lights up the same OTel spans as Claude. The visible punchline is two `gen_ai.system` values side-by-side in Jaeger from the same hand.
 
 > Verified during smoke: workspace builds clean, OTel stack + service container + Ollama daemon already up on this machine, `llama2:latest` returns parseable text with token counts populated. **`llama3.1` is not yet pulled** — pull it before the demo (see Prerequisites). The currently-running `pkdealer_service` Docker image is v0.1.7 while the workspace agents are v0.1.11; gRPC proto is unchanged so this works, but the version banner will look mismatched.
 
@@ -12,7 +12,7 @@ Engineering peers reviewing EPIC-25 progress. The angle is **the cost and shape 
 
 ## Prerequisites
 
-- Repo at `/Users/christoph/src/github.com/ImperialBower/pkdealer` on `main`. EPIC-25 code is uncommitted (untracked dirs `crates/pkdealer_agent_llm/`, `crates/pkdealer_agent_ollama/`, modified `crates/pkdealer_agent_claude/`). Do **not** clean before demoing — that is the work.
+- Repo at `/Users/christoph/src/github.com/ImperialBower/pkdealer` on `main`. EPIC-40 code is uncommitted (untracked dirs `crates/pkdealer_agent_llm/`, `crates/pkdealer_agent_ollama/`, modified `crates/pkdealer_agent_claude/`). Do **not** clean before demoing — that is the work.
 - Rust toolchain present (`cargo --version`, 1.85+).
 - `ANTHROPIC_API_KEY` exported in the shell that will run the Claude agent. Smoke check: `echo "len=${#ANTHROPIC_API_KEY}"` should print non-zero.
 - Docker running with the compose stack up: `otel-collector`, `jaeger`, `prometheus`, `grafana`, and `pkdealer_service`. All five containers are currently up on this machine — leave them.
@@ -160,7 +160,7 @@ A: First-token latency on local CPU/GPU. `llama3.1` cold-starts in seconds; cach
 A: No. The trait lives in a new shared crate that only the LLM-backed agents depend on. Random and rules agents stay LLM-free; the service is untouched. The refactor is additive at the workspace level.
 
 **Q: What's next?**
-A: Live smoke against `ollama serve` is the last open work item in EPIC-25. After that: a third backend (OpenAI or Gemini) to prove the trait shape generalizes, then a comparison harness that runs one `HandState` through every backend and logs the chosen actions side-by-side.
+A: Live smoke against `ollama serve` is the last open work item in EPIC-40. After that: a third backend (OpenAI or Gemini) to prove the trait shape generalizes, then a comparison harness that runs one `HandState` through every backend and logs the chosen actions side-by-side.
 
 ---
 
@@ -179,7 +179,7 @@ docker compose down
 pkill -f "ollama serve"
 ```
 
-The EPIC-25 code remains uncommitted on `main`. When ready:
+The EPIC-40 code remains uncommitted on `main`. When ready:
 ```bash
 git status
 # (review, then branch + commit per CLAUDE.md global rules)
