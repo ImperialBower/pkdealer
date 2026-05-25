@@ -36,9 +36,12 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     # Other permissive licenses already pulled in by transitive deps
     "BSD-3-Clause",
+    "ISC",                  # ring, rustls-webpki, untrusted (rustls TLS stack)
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
+    # Permissive data license used by webpki-roots (Mozilla CA root store)
+    "CDLA-Permissive-2.0",
 ]
 
 # ============================================================================

@@ -22,7 +22,8 @@
       "Bash(cargo check *)",
       "Bash(OTEL_SDK_DISABLED=true cargo test *)",
       "Bash(cargo update *)",
-      "Bash(git log *)"
+      "Bash(git log *)",
+      "Bash(curl -fsS http://localhost:11434/api/tags)"
     ]
   }
 }

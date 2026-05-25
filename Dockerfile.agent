@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1.7
+#
+# Shared multi-stage Dockerfile for pkdealer agent binaries.
+# Build with: docker build --build-arg BIN_NAME=pkdealer_agent_<name> -f Dockerfile.agent .
+# Mirrors the cargo-chef layered pattern from crates/pkdealer_service/Dockerfile.
+
+# ── deps planner ───────────────────────────────────────────────────────
+FROM rust:1.94-slim-bookworm AS chef
+RUN cargo install cargo-chef --locked --version 0.1.77
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── build ──────────────────────────────────────────────────────────────
+FROM chef AS builder
+ARG BIN_NAME
+RUN test -n "$BIN_NAME" || (echo "BIN_NAME build arg is required" && exit 1)
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --bin "$BIN_NAME" --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --bin "$BIN_NAME"
+RUN cp "/app/target/release/$BIN_NAME" /app/agent_bin
+
+# ── runtime ────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --uid 10001 --create-home --shell /bin/false pkdealer
+USER pkdealer
+COPY --from=builder /app/agent_bin /usr/local/bin/agent
+ENV RUST_LOG=info
+ENTRYPOINT ["/usr/local/bin/agent"]
