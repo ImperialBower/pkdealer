@@ -19,7 +19,7 @@ name = "pkdealer_service"
 path = "src/main.rs"
 
 [dependencies]
-pkcore = "0.1.1"
+pkcore = "0.1.2"
 pkdealer_proto = { version = "0.1.11", path = "../pkdealer_proto" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
