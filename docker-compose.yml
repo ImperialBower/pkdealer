@@ -54,6 +54,7 @@ services:
   # via host.docker.internal.
 
   agent_gto:
+    image: pkdealer/agent_rules:latest
     build:
       context: .
       dockerfile: Dockerfile.agent
@@ -70,6 +71,7 @@ services:
       - otel-collector
 
   agent_lag:
+    image: pkdealer/agent_rules:latest
     build:
       context: .
       dockerfile: Dockerfile.agent
@@ -86,6 +88,7 @@ services:
       - otel-collector
 
   agent_tag:
+    image: pkdealer/agent_rules:latest
     build:
       context: .
       dockerfile: Dockerfile.agent
@@ -102,6 +105,7 @@ services:
       - otel-collector
 
   agent_random:
+    image: pkdealer/agent_random:latest
     build:
       context: .
       dockerfile: Dockerfile.agent
@@ -118,6 +122,7 @@ services:
       - otel-collector
 
   agent_ollama:
+    image: pkdealer/agent_ollama:latest
     build:
       context: .
       dockerfile: Dockerfile.agent
