@@ -56,6 +56,9 @@ Configuration options will be loaded from:
 - `PKDEALER_PORT` - Service port (default: 50051)
 - `PKDEALER_HOST` - Bind address (default: 0.0.0.0)
 - `PKDEALER_LOG_LEVEL` - Logging level (default: info)
+- `PKDEALER_REBUY_AMOUNT` - Default chips granted when a `Rebuy` request specifies `chips == 0` (default: 10000)
+- `PKDEALER_REBUY_ON_BUST_ENABLED` - When `true`, auto-reloads any seat that finished a hand with `chips == 0`, and allows the `Rebuy` RPC for seats with `chips == 0` (default: false)
+- `PKDEALER_TOPUP_ENABLED` - When `true`, allows the `Rebuy` RPC for seats that still have chips; mid-hand top-ups are always rejected (default: false)
 
 ## API
 
