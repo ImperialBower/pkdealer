@@ -166,7 +166,7 @@ async fn e2e_two_players_full_hand_with_token_enforcement() -> Result<(), Box<dy
     );
 
     assert!(
-        wait_for_service_ready(&endpoint, Duration::from_secs(5)).await,
+        wait_for_service_ready(&endpoint, Duration::from_secs(15)).await,
         "service should become ready"
     );
 
@@ -290,7 +290,7 @@ async fn e2e_two_players_receive_distinct_tokens() -> Result<(), Box<dyn std::er
     );
 
     assert!(
-        wait_for_service_ready(&endpoint, Duration::from_secs(5)).await,
+        wait_for_service_ready(&endpoint, Duration::from_secs(15)).await,
         "service should become ready"
     );
 

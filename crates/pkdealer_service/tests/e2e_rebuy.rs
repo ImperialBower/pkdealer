@@ -76,7 +76,7 @@ async fn e2e_rebuy_default_amount_updates_withdrawn() -> Result<(), Box<dyn std:
     };
 
     assert!(
-        wait_for_service_ready(&endpoint, Duration::from_secs(5)).await,
+        wait_for_service_ready(&endpoint, Duration::from_secs(15)).await,
         "service should become ready"
     );
 

@@ -50,10 +50,12 @@ mod tests {
     use pkdealer_proto::dealer::{
         ActRequest, ActResponse, GetBoardRequest, GetBoardResponse, GetChipsRequest,
         GetChipsResponse, GetEventLogRequest, GetEventLogResponse, GetNextToActRequest,
-        GetNextToActResponse, GetPotRequest, GetPotResponse, GetStatusRequest, GetStatusResponse,
-        GetTableConfigRequest, GetTableConfigResponse, PingReply, PingRequest, RemovePlayerRequest,
-        RemovePlayerResponse, SeatPlayerAtRequest, SeatPlayerAtResponse, SeatPlayerRequest,
-        SeatPlayerResponse, StartHandRequest, StartHandResponse, StreamEventsRequest, TableEvent,
+        GetNextToActResponse, GetPlayerStatsRequest, GetPlayerStatsResponse, GetPotRequest,
+        GetPotResponse, GetStatusRequest, GetStatusResponse, GetTableConfigRequest,
+        GetTableConfigResponse, PingReply, PingRequest, RebuyRequest, RebuyResponse,
+        RemovePlayerRequest, RemovePlayerResponse, SeatPlayerAtRequest, SeatPlayerAtResponse,
+        SeatPlayerRequest, SeatPlayerResponse, StartHandRequest, StartHandResponse,
+        StreamEventsRequest, TableEvent,
         dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
     };
     use tokio::net::TcpListener;
@@ -153,6 +155,20 @@ mod tests {
             &self,
             _request: Request<GetTableConfigRequest>,
         ) -> Result<Response<GetTableConfigResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn rebuy(
+            &self,
+            _request: Request<RebuyRequest>,
+        ) -> Result<Response<RebuyResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_player_stats(
+            &self,
+            _request: Request<GetPlayerStatsRequest>,
+        ) -> Result<Response<GetPlayerStatsResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
         }
 
