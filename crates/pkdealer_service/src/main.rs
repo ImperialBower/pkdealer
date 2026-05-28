@@ -204,7 +204,7 @@ struct TableState {
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
-/// Four `OTel` instruments emitted by the service. Construction reads the
+/// Six `OTel` instruments emitted by the service. Construction reads the
 /// global meter provider, which `init_otel` configures with an OTLP
 /// periodic exporter. In tests (where `init_otel` was never called) the
 /// global meter is the no-op default, so instrument construction is a
@@ -1462,7 +1462,9 @@ impl DealerServiceTrait for DealerService {
     /// Auth: requires a valid `x-player-token` metadata value bound to a seat.
     ///
     /// Flag gating (based on the seat's *current* chips, not its `state`):
-    /// - `chips == 0` (busted) → requires `rebuy_on_bust_enabled`.
+    /// - `chips == 0` (busted) → requires `rebuy_on_bust_enabled` AND the
+    ///   table must not have a hand in progress (an all-in busted seat has
+    ///   `chips_in_play > 0`; reloading mid-hand would corrupt accounting).
     /// - `chips  > 0` (top-up) → requires `topup_enabled` AND the table must
     ///   not have a hand in progress (mid-hand top-ups would corrupt
     ///   `chips_in_play` accounting).
@@ -1524,6 +1526,16 @@ impl DealerServiceTrait for DealerService {
                     return Ok(Response::new(RebuyResponse {
                         result: Some(rebuy_response::Result::Error(
                             "rebuy-on-bust is disabled".to_owned(),
+                        )),
+                    }));
+                }
+                if hand_in_progress {
+                    // An all-in player can have chips == 0 while chips_in_play > 0.
+                    // Reloading mid-hand would corrupt the same invariant the
+                    // top-up branch guards against.
+                    return Ok(Response::new(RebuyResponse {
+                        result: Some(rebuy_response::Result::Error(
+                            "cannot rebuy during a hand".to_owned(),
                         )),
                     }));
                 }
@@ -3241,6 +3253,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bust_rebuy_rejected_mid_hand() -> Result<(), Box<dyn std::error::Error>> {
+        // An all-in busted seat (chips == 0, chips_in_play > 0) must not be
+        // reloaded while a hand is in progress, even with rebuy_on_bust_enabled.
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 500,
+            rebuy_on_bust_enabled: true,
+            topup_enabled: false,
+        });
+        let tokens = seat_two_players(&service).await?;
+        let (&seat, token) = tokens.iter().next().expect("token");
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        zero_seat_chips(&service, seat);
+
+        let resp = service
+            .rebuy(rebuy_request_with_token(0, token))
+            .await?
+            .into_inner();
+        match resp.result {
+            Some(rebuy_response::Result::Error(msg)) => {
+                assert!(msg.contains("during a hand"), "unexpected error msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let (chips, _) = read_chip_state(&service, seat);
+        assert_eq!(0, chips, "seat must not be reloaded mid-hand");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rebuy_missing_token_permission_denied() -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service_with_config(DealerConfig {
             default_rebuy_amount: 500,
@@ -3309,7 +3352,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let service = make_service_with_config(DealerConfig::default());
         let _ = seat_two_players(&service).await?;
-        // Force a known loss state directly: chips=0, withdrawn=1000 (initial).
+        // Force a known loss state directly: chips=0, chips_in_play=0,
+        // withdrawn=1000 (initial). chips_in_play is zeroed explicitly so the
+        // profit_loss assertion below stays valid regardless of seat_two_players
+        // internals (profit = chips + chips_in_play - withdrawn).
         {
             let mut guard = service.lock().expect("lock");
             for i in 0..guard.session.table.seats.size() {
@@ -3317,6 +3363,7 @@ mod tests {
                     && !s.is_empty()
                 {
                     s.player.chips = 0;
+                    s.player.chips_in_play = 0;
                 }
             }
         }

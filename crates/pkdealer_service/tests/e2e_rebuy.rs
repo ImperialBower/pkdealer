@@ -1,10 +1,11 @@
-//! End-to-end test: explicit `Rebuy` and `GetPlayerStats` over real gRPC.
+//! End-to-end test: rebuy config and stats wiring over real gRPC.
 //!
-//! Verifies that with `PKDEALER_REBUY_ON_BUST_ENABLED=true` and a custom
-//! `PKDEALER_REBUY_AMOUNT`, a player whose stack has been zeroed can call
-//! `Rebuy` over the wire, that the reload amount falls back to the service
-//! default when `chips == 0`, and that `GetPlayerStats` surfaces the updated
-//! `withdrawn` and `profit_loss` fields.
+//! Verifies that with `PKDEALER_REBUY_ON_BUST_ENABLED=true` and
+//! `PKDEALER_REBUY_AMOUNT` set, `GetTableConfig` reflects the env-driven
+//! values, the explicit `Rebuy` RPC rejects a top-up on a healthy stack when
+//! top-up is disabled, and `GetPlayerStats` returns the initial per-seat
+//! `chips`/`withdrawn`/`profit_loss`. Happy-path reload math is covered by
+//! the unit tests in `main.rs`.
 
 use std::{
     io,
@@ -60,7 +61,8 @@ async fn wait_for_service_ready(endpoint: &str, timeout: Duration) -> bool {
 }
 
 #[tokio::test]
-async fn e2e_rebuy_default_amount_updates_withdrawn() -> Result<(), Box<dyn std::error::Error>> {
+async fn e2e_rebuy_config_visible_and_topup_disabled_rejects()
+-> Result<(), Box<dyn std::error::Error>> {
     let service_path = service_bin_path()?;
     let port = reserve_local_port()?;
     let service_addr = format!("127.0.0.1:{port}");
