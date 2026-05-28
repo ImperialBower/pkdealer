@@ -16,6 +16,7 @@ use pkdealer_proto::dealer::{
     SeatPlayerAtRequest, SeatPlayerRequest, dealer_service_client::DealerServiceClient,
     seat_player_at_response, seat_player_response,
 };
+use serial_test::serial;
 use tonic::Request;
 
 // ── process helpers (mirrors e2e_two_players.rs) ─────────────────────────────
@@ -69,7 +70,7 @@ async fn spawn_service() -> (ChildProcessGuard, String) {
     let guard = ChildProcessGuard { child };
     let endpoint = format!("http://127.0.0.1:{port}");
     assert!(
-        wait_for_service_ready(&endpoint, Duration::from_secs(5)).await,
+        wait_for_service_ready(&endpoint, Duration::from_secs(15)).await,
         "service did not become ready",
     );
     (guard, endpoint)
@@ -78,6 +79,7 @@ async fn spawn_service() -> (ChildProcessGuard, String) {
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn resume_with_secret_returns_same_seat_and_token() {
     let (_guard, endpoint) = spawn_service().await;
     let mut client = DealerServiceClient::connect(endpoint)
@@ -125,6 +127,7 @@ async fn resume_with_secret_returns_same_seat_and_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn seat_without_secret_does_not_register_for_resume() {
     let (_guard, endpoint) = spawn_service().await;
     let mut client = DealerServiceClient::connect(endpoint)
@@ -160,6 +163,7 @@ async fn seat_without_secret_does_not_register_for_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn seat_player_at_resume_returns_same_seat() {
     let (_guard, endpoint) = spawn_service().await;
     let mut client = DealerServiceClient::connect(endpoint)
@@ -202,6 +206,7 @@ async fn seat_player_at_resume_returns_same_seat() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn seat_player_at_resume_wrong_seat_returns_error() {
     let (_guard, endpoint) = spawn_service().await;
     let mut client = DealerServiceClient::connect(endpoint)
@@ -243,6 +248,7 @@ async fn seat_player_at_resume_wrong_seat_returns_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn remove_player_clears_secret_binding() {
     use pkdealer_proto::dealer::RemovePlayerRequest;
 

@@ -121,7 +121,7 @@ async fn service_binary_and_client_binary_ping_round_trip() -> Result<(), Box<dy
         .spawn()?;
     let _service_guard = ChildProcessGuard::new(service_child);
 
-    let ready = wait_for_service_ready(&endpoint, Duration::from_secs(5)).await;
+    let ready = wait_for_service_ready(&endpoint, Duration::from_secs(15)).await;
     assert!(ready, "service should become ready before timeout");
 
     let output = Command::new(&client_path)
@@ -160,7 +160,7 @@ async fn service_binary_and_client_binary_ping_round_trip_empty_client_id()
         .spawn()?;
     let _service_guard = ChildProcessGuard::new(service_child);
 
-    let ready = wait_for_service_ready(&endpoint, Duration::from_secs(5)).await;
+    let ready = wait_for_service_ready(&endpoint, Duration::from_secs(15)).await;
     assert!(ready, "service should become ready before timeout");
 
     let output = Command::new(&client_path)

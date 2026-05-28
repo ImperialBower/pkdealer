@@ -14,10 +14,13 @@
 //!
 //! ## Configuration
 //!
-//! | Variable                    | Default           | Purpose                                                     |
-//! |-----------------------------|-------------------|-------------------------------------------------------------|
-//! | `PKDEALER_ADDR`             | 127.0.0.1:50051   | gRPC listen address                                         |
-//! | `PKDEALER_SPECTATOR_TOKEN`  | `spectator`       | Shared secret for full-table card visibility                |
+//! | Variable                          | Default           | Purpose                                                                 |
+//! |-----------------------------------|-------------------|-------------------------------------------------------------------------|
+//! | `PKDEALER_ADDR`                   | 127.0.0.1:50051   | gRPC listen address                                                     |
+//! | `PKDEALER_SPECTATOR_TOKEN`        | `spectator`       | Shared secret for full-table card visibility                            |
+//! | `PKDEALER_REBUY_AMOUNT`           | 10000             | Default chips granted when `Rebuy.chips == 0`                           |
+//! | `PKDEALER_REBUY_ON_BUST_ENABLED`  | false             | Auto-reload busted seats at hand-end; allow `Rebuy` when `chips == 0`   |
+//! | `PKDEALER_TOPUP_ENABLED`          | false             | Allow `Rebuy` for healthy stacks (between hands only)                   |
 //!
 //! For the browser spectator UI, run [`pkspectator`](https://github.com/ImperialBower/pkspectator)
 //! as a separate process. It subscribes to this service via gRPC `StreamEvents`.
@@ -45,7 +48,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use opentelemetry::trace::TraceContextExt;
 use pkcore::analysis::name::HandRankName;
 use pkcore::casino::table::seats::seatbit::Seatbit;
@@ -60,14 +64,15 @@ use pkcore::casino::{
 use pkdealer_proto::dealer::{
     ActRequest, ActResponse, ActionResult, ActionType, EventType, GetBoardRequest,
     GetBoardResponse, GetChipsRequest, GetChipsResponse, GetEventLogRequest, GetEventLogResponse,
-    GetNextToActRequest, GetNextToActResponse, GetPotRequest, GetPotResponse, GetStatusRequest,
-    GetStatusResponse, GetTableConfigRequest, GetTableConfigResponse, HandResult, NextToActInfo,
-    PingReply, PingRequest, PlayerChips, PlayerState as ProtoPlayerState, RemovePlayerRequest,
-    RemovePlayerResponse, SeatInfo, SeatPlayerAtRequest, SeatPlayerAtResponse, SeatPlayerRequest,
-    SeatPlayerResponse, StartHandRequest, StartHandResponse, StreamEventsRequest, Street,
-    TableConfig, TableEvent, TableStatus, WinnerInfo, act_response,
+    GetNextToActRequest, GetNextToActResponse, GetPlayerStatsRequest, GetPlayerStatsResponse,
+    GetPotRequest, GetPotResponse, GetStatusRequest, GetStatusResponse, GetTableConfigRequest,
+    GetTableConfigResponse, HandResult, NextToActInfo, PingReply, PingRequest, PlayerChips,
+    PlayerState as ProtoPlayerState, PlayerStats, RebuyInfo, RebuyRequest, RebuyResponse,
+    RemovePlayerRequest, RemovePlayerResponse, SeatInfo, SeatPlayerAtRequest, SeatPlayerAtResponse,
+    SeatPlayerRequest, SeatPlayerResponse, StartHandRequest, StartHandResponse,
+    StreamEventsRequest, Street, TableConfig, TableEvent, TableStatus, WinnerInfo, act_response,
     dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
-    get_next_to_act_response, remove_player_response, seat_player_at_response,
+    get_next_to_act_response, rebuy_response, remove_player_response, seat_player_at_response,
     seat_player_response, start_hand_response,
 };
 use tokio::sync::broadcast;
@@ -85,6 +90,75 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 const PLAYER_TOKEN_METADATA_KEY: &str = "x-player-token";
 /// Default spectator token used when `PKDEALER_SPECTATOR_TOKEN` is not set.
 const DEFAULT_SPECTATOR_TOKEN: &str = "spectator";
+/// Default chip amount granted on a `Rebuy` call when `chips == 0`.
+const DEFAULT_REBUY_AMOUNT: usize = 10_000;
+
+// ── DealerConfig ──────────────────────────────────────────────────────────────
+
+/// Service-level toggles for the rebuy / top-up feature.
+///
+/// Populated from environment variables in [`DealerConfig::from_env`] when the
+/// service boots, and overridable in tests via [`DealerService::new_with_config`].
+///
+/// # Examples
+///
+/// ```ignore
+/// // (private type — used internally by the binary)
+/// let cfg = DealerConfig {
+///     default_rebuy_amount: 500,
+///     rebuy_on_bust_enabled: true,
+///     topup_enabled: false,
+/// };
+/// assert_eq!(500, cfg.default_rebuy_amount);
+/// ```
+#[derive(Clone, Debug)]
+struct DealerConfig {
+    /// Fallback chip amount used when a `Rebuy` request specifies `chips == 0`.
+    default_rebuy_amount: usize,
+    /// When true, the service auto-reloads any seat that finished a hand with
+    /// `chips == 0`, and `Rebuy` is allowed for seats with `chips == 0`.
+    rebuy_on_bust_enabled: bool,
+    /// When true, `Rebuy` is allowed for seats that still have chips
+    /// (between hands only; mid-hand top-ups are always rejected).
+    topup_enabled: bool,
+}
+
+impl DealerConfig {
+    /// Reads the three rebuy env vars with safe fallbacks. Unparseable values
+    /// silently fall back to defaults so a typo doesn't crash boot.
+    fn from_env() -> Self {
+        DealerConfig {
+            default_rebuy_amount: env::var("PKDEALER_REBUY_AMOUNT")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_REBUY_AMOUNT),
+            rebuy_on_bust_enabled: parse_env_bool("PKDEALER_REBUY_ON_BUST_ENABLED"),
+            topup_enabled: parse_env_bool("PKDEALER_TOPUP_ENABLED"),
+        }
+    }
+}
+
+impl Default for DealerConfig {
+    fn default() -> Self {
+        DealerConfig {
+            default_rebuy_amount: DEFAULT_REBUY_AMOUNT,
+            rebuy_on_bust_enabled: false,
+            topup_enabled: false,
+        }
+    }
+}
+
+/// Parses an env var as a boolean. Recognizes `"true"`, `"1"`, `"yes"` (case
+/// insensitive) as true; everything else (including unset) as false.
+fn parse_env_bool(key: &str) -> bool {
+    match env::var(key) {
+        Ok(s) => {
+            let lower = s.to_lowercase();
+            matches!(lower.as_str(), "true" | "1" | "yes")
+        }
+        Err(_) => false,
+    }
+}
 
 // ── CardVisibility ────────────────────────────────────────────────────────────
 
@@ -130,7 +204,7 @@ struct TableState {
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
-/// Four `OTel` instruments emitted by the service. Construction reads the
+/// Six `OTel` instruments emitted by the service. Construction reads the
 /// global meter provider, which `init_otel` configures with an OTLP
 /// periodic exporter. In tests (where `init_otel` was never called) the
 /// global meter is the no-op default, so instrument construction is a
@@ -146,6 +220,11 @@ struct Metrics {
     action_duration_ms: Histogram<f64>,
     #[allow(dead_code)]
     ai_decision_latency_ms: Histogram<f64>,
+    /// Total rebuys (auto-on-bust + explicit RPC). Labels: `reason`, `seat`.
+    rebuys_total: Counter<u64>,
+    /// Per-seat cumulative profit/loss recorded after every completed hand.
+    /// Labels: `seat`, `handle`.
+    player_profit_loss: Gauge<i64>,
 }
 
 impl Metrics {
@@ -170,6 +249,15 @@ impl Metrics {
                 .with_description("Agent-side decision latency")
                 .with_unit("ms")
                 .build(),
+            rebuys_total: meter
+                .u64_counter("pkdealer.rebuys_total")
+                .with_description("Total chip reloads (auto-on-bust + explicit Rebuy)")
+                .build(),
+            player_profit_loss: meter
+                .i64_gauge("pkdealer.player.profit_loss")
+                .with_description("Per-seat cumulative profit/loss in chips")
+                .with_unit("chips")
+                .build(),
         }
     }
 }
@@ -182,11 +270,19 @@ struct DealerService {
     state: Arc<Mutex<TableState>>,
     event_tx: broadcast::Sender<TableEvent>,
     metrics: Arc<Metrics>,
+    config: Arc<DealerConfig>,
 }
 
 impl DealerService {
-    /// Creates a fresh table with default blind/seat configuration.
+    /// Creates a fresh table with default blind/seat configuration and
+    /// rebuy/top-up settings sourced from environment variables.
     fn new() -> Self {
+        Self::new_with_config(DealerConfig::from_env())
+    }
+
+    /// Creates a fresh table with explicit [`DealerConfig`]. Tests use this
+    /// to avoid env-var races between parallel test cases.
+    fn new_with_config(config: DealerConfig) -> Self {
         let seats = SeatsNoCell::new(
             (0..DEFAULT_SEAT_COUNT)
                 .map(|_| SeatNoCell::default())
@@ -214,6 +310,7 @@ impl DealerService {
             state,
             event_tx,
             metrics,
+            config: Arc::new(config),
         }
     }
 
@@ -253,6 +350,9 @@ impl DealerService {
                     chips: seat.player.chips as u32,
                     cards,
                     state: Self::map_player_state(seat.player.state) as i32,
+                    withdrawn: seat.player.withdrawn as u32,
+                    chips_in_play: seat.player.chips_in_play as u32,
+                    profit_loss: compute_profit_loss(&seat.player),
                 });
             }
         }
@@ -451,6 +551,55 @@ impl DealerService {
             .map_or(0, |d| d.as_millis() as u64)
     }
 
+    /// Auto-reloads any occupied seat whose `chips == 0` to the configured
+    /// default rebuy amount, when `rebuy_on_bust_enabled` is true. Returns
+    /// `(events_to_emit, seats_for_metrics)` — the caller emits events and
+    /// records the `rebuys_total` counter outside this method. Mutates `state`
+    /// in place.
+    ///
+    /// Trigger condition is `chips == 0` on an occupied seat (NOT
+    /// `PlayerState::Out`, which pkcore only sets on empty seats — by the
+    /// time this runs at end-of-hand, the seat's state is already
+    /// `YetToAct`).
+    fn run_auto_rebuy(
+        &self,
+        state: &mut TableState,
+    ) -> (Vec<(EventType, String, TableStatus)>, Vec<u8>) {
+        let mut events: Vec<(EventType, String, TableStatus)> = Vec::new();
+        let mut labels: Vec<u8> = Vec::new();
+        if !self.config.rebuy_on_bust_enabled {
+            return (events, labels);
+        }
+        let reload_amount = self.config.default_rebuy_amount;
+        let mut reloaded: Vec<(u8, String, usize)> = Vec::new();
+        {
+            let table = &mut state.session.table;
+            let size = table.seats.size();
+            for i in 0..size {
+                if let Some(seat) = table.seats.get_seat_mut(i)
+                    && !seat.is_empty()
+                    && seat.player.chips == 0
+                {
+                    let new_total = seat.player.reload(reload_amount);
+                    reloaded.push((i, seat.player.handle.clone(), new_total));
+                }
+            }
+        }
+        if reloaded.is_empty() {
+            return (events, labels);
+        }
+        let status = Self::build_table_status(&state.session, CardVisibility::Spectator);
+        for (seat_idx, handle, new_total) in reloaded {
+            events.push((
+                EventType::PlayerRebought,
+                format!("Seat {seat_idx} ({handle}) auto-rebuy: +{reload_amount} → {new_total}"),
+                status.clone(),
+            ));
+            labels.push(seat_idx);
+        }
+        (events, labels)
+    }
+
     /// Constructs and enqueues a [`TableEvent`] on the broadcast channel.
     ///
     /// Errors from `send` (no active subscribers) are silently discarded.
@@ -495,6 +644,19 @@ impl DealerService {
 
         CardVisibility::Hidden
     }
+}
+
+/// Computes a player's cumulative profit/loss as a signed `i32`.
+///
+/// Uses the invariant `profit = chips + chips_in_play - withdrawn` maintained
+/// by `pkcore`. Values outside the `i32` range saturate at `i32::MIN` /
+/// `i32::MAX` rather than panicking — `unwrap()` is forbidden by the project
+/// lint set.
+fn compute_profit_loss(player: &PlayerNoCell) -> i32 {
+    let pl = i64::try_from(player.chips).unwrap_or(i64::MAX)
+        + i64::try_from(player.chips_in_play).unwrap_or(i64::MAX)
+        - i64::try_from(player.withdrawn).unwrap_or(i64::MAX);
+    i32::try_from(pl).unwrap_or(if pl < 0 { i32::MIN } else { i32::MAX })
 }
 
 /// Returns a stable string label for the current street, suitable as a span
@@ -924,7 +1086,6 @@ impl DealerServiceTrait for DealerService {
         };
 
         if let Some(ms) = action_latency_ms {
-            use opentelemetry::KeyValue;
             self.metrics.action_duration_ms.record(
                 ms,
                 &[
@@ -1080,6 +1241,55 @@ impl DealerServiceTrait for DealerService {
                                     );
                                     self.metrics.hands_played.add(1, &[]);
                                     self.metrics.pot_size.record(final_pot as u64, &[]);
+
+                                    // Auto-rebuy any busted seats when the flag is on. Trigger
+                                    // condition is `chips == 0` on an occupied seat (NOT
+                                    // PlayerState::Out, which pkcore only sets on empty seats —
+                                    // end_hand has already reset state to YetToAct here).
+                                    let (rebuy_events, rebuy_labels) =
+                                        self.run_auto_rebuy(&mut guard);
+
+                                    // Record per-seat cumulative profit/loss gauge for every
+                                    // occupied seat (uses post-rebuy state, which is invariant
+                                    // under reload anyway).
+                                    {
+                                        let table = &guard.session.table;
+                                        for i in 0..table.seats.size() {
+                                            if let Some(seat) = table.seats.get_seat(i)
+                                                && !seat.is_empty()
+                                            {
+                                                let pl =
+                                                    i64::from(compute_profit_loss(&seat.player));
+                                                self.metrics.player_profit_loss.record(
+                                                    pl,
+                                                    &[
+                                                        KeyValue::new("seat", i64::from(i)),
+                                                        KeyValue::new(
+                                                            "handle",
+                                                            seat.player.handle.clone(),
+                                                        ),
+                                                    ],
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    // Emit any auto-rebuy events + counters now (still under the
+                                    // lock — `emit_event` and metric recording are non-blocking).
+                                    for (et, desc, status) in rebuy_events {
+                                        self.emit_event(et, desc, status);
+                                    }
+                                    {
+                                        for seat_idx in rebuy_labels {
+                                            self.metrics.rebuys_total.add(
+                                                1,
+                                                &[
+                                                    KeyValue::new("reason", "bust"),
+                                                    KeyValue::new("seat", i64::from(seat_idx)),
+                                                ],
+                                            );
+                                        }
+                                    }
 
                                     // Record the captured values on the closing hand span.
                                     if let Some(hand_span) = guard.current_hand_span.as_ref() {
@@ -1238,8 +1448,186 @@ impl DealerServiceTrait for DealerService {
                 big_blind: DEFAULT_BIG_BLIND as u32,
                 variant: "No-Limit Hold'em".to_owned(),
                 default_chips: DEFAULT_CHIPS as u32,
+                default_rebuy_amount: self.config.default_rebuy_amount as u32,
+                rebuy_on_bust_enabled: self.config.rebuy_on_bust_enabled,
+                topup_enabled: self.config.topup_enabled,
             }),
         }))
+    }
+
+    // ── Rebuy ─────────────────────────────────────────────────────────────────
+
+    /// Adds chips to the caller's seat.
+    ///
+    /// Auth: requires a valid `x-player-token` metadata value bound to a seat.
+    ///
+    /// Flag gating (based on the seat's *current* chips, not its `state`):
+    /// - `chips == 0` (busted) → requires `rebuy_on_bust_enabled` AND the
+    ///   table must not have a hand in progress (an all-in busted seat has
+    ///   `chips_in_play > 0`; reloading mid-hand would corrupt accounting).
+    /// - `chips  > 0` (top-up) → requires `topup_enabled` AND the table must
+    ///   not have a hand in progress (mid-hand top-ups would corrupt
+    ///   `chips_in_play` accounting).
+    ///
+    /// Amount: `request.chips == 0` falls back to `config.default_rebuy_amount`.
+    ///
+    /// On success, both `player.chips` and `player.withdrawn` increase by the
+    /// reload amount (pkcore invariant `profit = chips + chips_in_play - withdrawn`
+    /// is preserved). After a bust, `end_hand` already reset the seat's state
+    /// to `YetToAct`, so no manual state fixup is needed — the seat is ready
+    /// for the next `StartHand`.
+    async fn rebuy(
+        &self,
+        request: Request<RebuyRequest>,
+    ) -> Result<Response<RebuyResponse>, Status> {
+        // Resolve the auth token before consuming the request body.
+        let token_str: Option<String> = request
+            .metadata()
+            .get(PLAYER_TOKEN_METADATA_KEY)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let Some(uuid) = token_str.as_deref().and_then(|t| t.parse::<Uuid>().ok()) else {
+            return Err(Status::permission_denied(
+                "missing or invalid x-player-token metadata",
+            ));
+        };
+
+        let req = request.into_inner();
+        let requested = req.chips as usize;
+        let amount = if requested == 0 {
+            self.config.default_rebuy_amount
+        } else {
+            requested
+        };
+
+        let span = tracing::info_span!(
+            "rebuy",
+            seat = tracing::field::Empty,
+            reason = tracing::field::Empty,
+            amount = i64::try_from(amount).unwrap_or(i64::MAX),
+        );
+        let _enter = span.enter();
+
+        let (response_result, maybe_event, recorded_reason, recorded_seat) = {
+            let mut guard = self.lock()?;
+
+            let Some(&seat_idx) = guard.token_to_seat.get(&uuid) else {
+                return Err(Status::permission_denied("unknown player token"));
+            };
+
+            let hand_in_progress = guard.session.is_hand_in_progress();
+
+            let Some(seat) = guard.session.table.seats.get_seat_mut(seat_idx) else {
+                return Err(Status::internal("token mapped to missing seat"));
+            };
+
+            let reason: &'static str = if seat.player.chips == 0 {
+                if !self.config.rebuy_on_bust_enabled {
+                    return Ok(Response::new(RebuyResponse {
+                        result: Some(rebuy_response::Result::Error(
+                            "rebuy-on-bust is disabled".to_owned(),
+                        )),
+                    }));
+                }
+                if hand_in_progress {
+                    // An all-in player can have chips == 0 while chips_in_play > 0.
+                    // Reloading mid-hand would corrupt the same invariant the
+                    // top-up branch guards against.
+                    return Ok(Response::new(RebuyResponse {
+                        result: Some(rebuy_response::Result::Error(
+                            "cannot rebuy during a hand".to_owned(),
+                        )),
+                    }));
+                }
+                "bust"
+            } else {
+                if !self.config.topup_enabled {
+                    return Ok(Response::new(RebuyResponse {
+                        result: Some(rebuy_response::Result::Error(
+                            "top-up is disabled".to_owned(),
+                        )),
+                    }));
+                }
+                if hand_in_progress {
+                    return Ok(Response::new(RebuyResponse {
+                        result: Some(rebuy_response::Result::Error(
+                            "cannot top up during a hand".to_owned(),
+                        )),
+                    }));
+                }
+                "topup"
+            };
+
+            let new_chips = seat.player.reload(amount);
+            let new_withdrawn = seat.player.withdrawn;
+            span.record("seat", i64::from(seat_idx));
+            span.record("reason", reason);
+
+            let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
+            let info = RebuyInfo {
+                seat: u32::from(seat_idx),
+                new_chips: new_chips as u32,
+                new_withdrawn: new_withdrawn as u32,
+                reason: reason.to_owned(),
+            };
+            let event = (
+                EventType::PlayerRebought,
+                format!("Seat {seat_idx} {reason}: +{amount} → {new_chips}"),
+                status,
+            );
+            (
+                rebuy_response::Result::Info(info),
+                Some(event),
+                reason,
+                seat_idx,
+            )
+        };
+
+        // Lock is dropped at this point; emit event + metric outside it.
+        if let Some((et, desc, status)) = maybe_event {
+            self.emit_event(et, desc, status);
+        }
+        self.metrics.rebuys_total.add(
+            1,
+            &[
+                KeyValue::new("reason", recorded_reason),
+                KeyValue::new("seat", i64::from(recorded_seat)),
+            ],
+        );
+
+        Ok(Response::new(RebuyResponse {
+            result: Some(response_result),
+        }))
+    }
+
+    // ── GetPlayerStats ────────────────────────────────────────────────────────
+
+    /// Returns per-seat aggregates (`chips`, `withdrawn`, `chips_in_play`, profit/loss)
+    /// for every occupied seat. Useful for tracking cumulative win/loss across
+    /// long bot sessions. Profit/loss is computed via the pkcore invariant
+    /// `profit = chips + chips_in_play - withdrawn`.
+    async fn get_player_stats(
+        &self,
+        _request: Request<GetPlayerStatsRequest>,
+    ) -> Result<Response<GetPlayerStatsResponse>, Status> {
+        let guard = self.lock()?;
+        let table = &guard.session.table;
+        let mut stats = Vec::new();
+        for i in 0..table.seats.size() {
+            if let Some(seat) = table.seats.get_seat(i)
+                && !seat.is_empty()
+            {
+                stats.push(PlayerStats {
+                    seat: u32::from(i),
+                    player_name: seat.player.handle.clone(),
+                    chips: seat.player.chips as u32,
+                    chips_in_play: seat.player.chips_in_play as u32,
+                    withdrawn: seat.player.withdrawn as u32,
+                    profit_loss: compute_profit_loss(&seat.player),
+                });
+            }
+        }
+        Ok(Response::new(GetPlayerStatsResponse { stats }))
     }
 
     // ── Event stream ──────────────────────────────────────────────────────────
@@ -2678,6 +3066,354 @@ mod tests {
             "expected >=1 action span, got {action_opens}"
         );
 
+        Ok(())
+    }
+
+    // ── Rebuy / GetPlayerStats ────────────────────────────────────────────────
+
+    fn make_service_with_config(config: DealerConfig) -> DealerService {
+        DealerService::new_with_config(config)
+    }
+
+    /// Builds a `Rebuy` request with the `x-player-token` metadata set.
+    fn rebuy_request_with_token(chips: u32, token: &str) -> Request<RebuyRequest> {
+        let mut req = Request::new(RebuyRequest { chips });
+        req.metadata_mut().insert(
+            PLAYER_TOKEN_METADATA_KEY,
+            token.parse().expect("valid token"),
+        );
+        req
+    }
+
+    /// Reaches into the locked state to set a seat's chips to zero, simulating
+    /// a bust without playing a hand to completion.
+    fn zero_seat_chips(service: &DealerService, seat: u8) {
+        let mut guard = service.lock().expect("lock");
+        if let Some(s) = guard.session.table.seats.get_seat_mut(seat) {
+            s.player.chips = 0;
+        }
+    }
+
+    /// Reads a seat's `(chips, withdrawn)` for an assertion.
+    fn read_chip_state(service: &DealerService, seat: u8) -> (usize, usize) {
+        let guard = service.lock().expect("lock");
+        let s = guard.session.table.seats.get_seat(seat).expect("seat");
+        (s.player.chips, s.player.withdrawn)
+    }
+
+    #[tokio::test]
+    async fn rebuy_on_bust_disabled_rejects() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig::default()); // both flags off
+        let tokens = seat_two_players(&service).await?;
+        let (&seat, token) = tokens.iter().next().expect("token");
+        zero_seat_chips(&service, seat);
+
+        let resp = service
+            .rebuy(rebuy_request_with_token(0, token))
+            .await?
+            .into_inner();
+        assert!(
+            matches!(resp.result, Some(rebuy_response::Result::Error(_))),
+            "expected Error variant, got {:?}",
+            resp.result
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuy_on_bust_enabled_reloads_default() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 5_000,
+            rebuy_on_bust_enabled: true,
+            topup_enabled: false,
+        });
+        let tokens = seat_two_players(&service).await?;
+        let (&seat, token) = tokens.iter().next().expect("token");
+
+        // After seat_two_players, withdrawn == 1_000 (initial stack). Then bust.
+        let (_, w_before) = read_chip_state(&service, seat);
+        assert_eq!(1_000, w_before);
+        zero_seat_chips(&service, seat);
+
+        let resp = service
+            .rebuy(rebuy_request_with_token(0, token))
+            .await?
+            .into_inner();
+        let info = match resp.result {
+            Some(rebuy_response::Result::Info(i)) => i,
+            other => panic!("expected Info, got {other:?}"),
+        };
+        assert_eq!("bust", info.reason);
+        assert_eq!(5_000, info.new_chips);
+        assert_eq!(6_000, info.new_withdrawn);
+
+        let (chips, withdrawn) = read_chip_state(&service, seat);
+        assert_eq!(5_000, chips);
+        assert_eq!(6_000, withdrawn);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuy_on_bust_enabled_reloads_custom_amount() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 5_000,
+            rebuy_on_bust_enabled: true,
+            topup_enabled: false,
+        });
+        let tokens = seat_two_players(&service).await?;
+        let (&seat, token) = tokens.iter().next().expect("token");
+        zero_seat_chips(&service, seat);
+
+        let resp = service
+            .rebuy(rebuy_request_with_token(250, token))
+            .await?
+            .into_inner();
+        let info = match resp.result {
+            Some(rebuy_response::Result::Info(i)) => i,
+            other => panic!("expected Info, got {other:?}"),
+        };
+        assert_eq!(250, info.new_chips);
+        assert_eq!(1_250, info.new_withdrawn);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topup_disabled_rejects_with_healthy_stack() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 5_000,
+            rebuy_on_bust_enabled: true, // bust flag on, topup flag off
+            topup_enabled: false,
+        });
+        let tokens = seat_two_players(&service).await?;
+        let (_, token) = tokens.iter().next().expect("token");
+
+        let resp = service
+            .rebuy(rebuy_request_with_token(100, token))
+            .await?
+            .into_inner();
+        assert!(matches!(
+            resp.result,
+            Some(rebuy_response::Result::Error(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topup_enabled_reloads_between_hands() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 500,
+            rebuy_on_bust_enabled: false,
+            topup_enabled: true,
+        });
+        let tokens = seat_two_players(&service).await?;
+        let (&seat, token) = tokens.iter().next().expect("token");
+
+        let (chips_before, withdrawn_before) = read_chip_state(&service, seat);
+        assert_eq!(1_000, chips_before);
+
+        let resp = service
+            .rebuy(rebuy_request_with_token(0, token))
+            .await?
+            .into_inner();
+        let info = match resp.result {
+            Some(rebuy_response::Result::Info(i)) => i,
+            other => panic!("expected Info, got {other:?}"),
+        };
+        assert_eq!("topup", info.reason);
+        assert_eq!(1_500, info.new_chips);
+        assert_eq!(withdrawn_before + 500, info.new_withdrawn as usize);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topup_rejected_mid_hand() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 500,
+            rebuy_on_bust_enabled: false,
+            topup_enabled: true,
+        });
+        let tokens = seat_two_players(&service).await?;
+        let (_, token) = tokens.iter().next().expect("token");
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let resp = service
+            .rebuy(rebuy_request_with_token(100, token))
+            .await?
+            .into_inner();
+        match resp.result {
+            Some(rebuy_response::Result::Error(msg)) => {
+                assert!(msg.contains("during a hand"), "unexpected error msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bust_rebuy_rejected_mid_hand() -> Result<(), Box<dyn std::error::Error>> {
+        // An all-in busted seat (chips == 0, chips_in_play > 0) must not be
+        // reloaded while a hand is in progress, even with rebuy_on_bust_enabled.
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 500,
+            rebuy_on_bust_enabled: true,
+            topup_enabled: false,
+        });
+        let tokens = seat_two_players(&service).await?;
+        let (&seat, token) = tokens.iter().next().expect("token");
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        zero_seat_chips(&service, seat);
+
+        let resp = service
+            .rebuy(rebuy_request_with_token(0, token))
+            .await?
+            .into_inner();
+        match resp.result {
+            Some(rebuy_response::Result::Error(msg)) => {
+                assert!(msg.contains("during a hand"), "unexpected error msg: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let (chips, _) = read_chip_state(&service, seat);
+        assert_eq!(0, chips, "seat must not be reloaded mid-hand");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuy_missing_token_permission_denied() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 500,
+            rebuy_on_bust_enabled: true,
+            topup_enabled: true,
+        });
+        let _ = seat_two_players(&service).await?;
+        let result = service.rebuy(Request::new(RebuyRequest { chips: 0 })).await;
+        match result {
+            Err(s) => assert_eq!(s.code(), tonic::Code::PermissionDenied),
+            Ok(_) => panic!("expected permission_denied"),
+        }
+        Ok(())
+    }
+
+    /// Exercises the auto-rebuy helper directly against a manipulated state,
+    /// avoiding pkcore's `start_hand` chip-validity checks. Verifies that:
+    /// - flag off → busted seats stay at 0
+    /// - flag on  → busted seats are reloaded to `default_rebuy_amount` and
+    ///   their `withdrawn` ledger is bumped
+    #[tokio::test]
+    async fn auto_rebuy_at_hand_end_only_when_flag_on() -> Result<(), Box<dyn std::error::Error>> {
+        // Flag OFF.
+        let service_off = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 999,
+            rebuy_on_bust_enabled: false,
+            topup_enabled: false,
+        });
+        let tokens_off = seat_two_players(&service_off).await?;
+        let busted_off = *tokens_off.keys().next().expect("seat");
+        zero_seat_chips(&service_off, busted_off);
+        {
+            let mut guard = service_off.lock().expect("lock");
+            let (events, labels) = service_off.run_auto_rebuy(&mut guard);
+            assert!(events.is_empty());
+            assert!(labels.is_empty());
+        }
+        let (chips_off, _) = read_chip_state(&service_off, busted_off);
+        assert_eq!(0, chips_off, "flag-off busted seat must not be reloaded");
+
+        // Flag ON.
+        let service_on = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 999,
+            rebuy_on_bust_enabled: true,
+            topup_enabled: false,
+        });
+        let tokens_on = seat_two_players(&service_on).await?;
+        let busted_on = *tokens_on.keys().next().expect("seat");
+        zero_seat_chips(&service_on, busted_on);
+        let (events, labels) = {
+            let mut guard = service_on.lock().expect("lock");
+            service_on.run_auto_rebuy(&mut guard)
+        };
+        assert_eq!(1, labels.len());
+        assert_eq!(busted_on, labels[0]);
+        assert_eq!(1, events.len());
+        let (chips_on, withdrawn_on) = read_chip_state(&service_on, busted_on);
+        assert_eq!(999, chips_on, "flag-on busted seat reloaded to default");
+        // Initial withdrawn = 1_000 (buy-in); after auto-reload of 999, == 1_999.
+        assert_eq!(1_999, withdrawn_on);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_player_stats_returns_signed_pl_after_loss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig::default());
+        let _ = seat_two_players(&service).await?;
+        // Force a known loss state directly: chips=0, chips_in_play=0,
+        // withdrawn=1000 (initial). chips_in_play is zeroed explicitly so the
+        // profit_loss assertion below stays valid regardless of seat_two_players
+        // internals (profit = chips + chips_in_play - withdrawn).
+        {
+            let mut guard = service.lock().expect("lock");
+            for i in 0..guard.session.table.seats.size() {
+                if let Some(s) = guard.session.table.seats.get_seat_mut(i)
+                    && !s.is_empty()
+                {
+                    s.player.chips = 0;
+                    s.player.chips_in_play = 0;
+                }
+            }
+        }
+        let resp = service
+            .get_player_stats(Request::new(GetPlayerStatsRequest {}))
+            .await?
+            .into_inner();
+        assert!(!resp.stats.is_empty());
+        for s in resp.stats {
+            assert_eq!(-1_000, s.profit_loss, "seat {}", s.seat);
+            assert_eq!(1_000, s.withdrawn);
+            assert_eq!(0, s.chips);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seat_info_includes_pl_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig::default());
+        let _ = seat_two_players(&service).await?;
+        let resp = service
+            .get_status(Request::new(GetStatusRequest {}))
+            .await?
+            .into_inner();
+        let status = resp.status.expect("status present");
+        assert!(!status.seats.is_empty());
+        for seat in status.seats {
+            assert_eq!(1_000, seat.chips);
+            assert_eq!(1_000, seat.withdrawn);
+            assert_eq!(0, seat.chips_in_play);
+            assert_eq!(0, seat.profit_loss);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_table_config_includes_rebuy_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: 777,
+            rebuy_on_bust_enabled: true,
+            topup_enabled: true,
+        });
+        let resp = service
+            .get_table_config(Request::new(GetTableConfigRequest {}))
+            .await?
+            .into_inner();
+        let cfg = resp.config.expect("config");
+        assert_eq!(777, cfg.default_rebuy_amount);
+        assert!(cfg.rebuy_on_bust_enabled);
+        assert!(cfg.topup_enabled);
         Ok(())
     }
 }

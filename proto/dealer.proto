@@ -51,6 +51,16 @@ service DealerService {
   // Get static table configuration (blinds, seat count, variant).
   rpc GetTableConfig(GetTableConfigRequest) returns (GetTableConfigResponse);
 
+  // Add chips to the caller's seat. Requires x-player-token. If the seat has
+  // zero chips, the rebuy-on-bust flag must be enabled. If the seat still has
+  // chips, the top-up flag must be enabled AND no hand may be in progress.
+  // `chips == 0` falls back to the service default rebuy amount.
+  rpc Rebuy(RebuyRequest) returns (RebuyResponse);
+
+  // Per-player aggregates (chips, withdrawn, profit/loss) for every occupied
+  // seat. Useful for tracking cumulative win/loss across long bot sessions.
+  rpc GetPlayerStats(GetPlayerStatsRequest) returns (GetPlayerStatsResponse);
+
   // Stream all table events as they happen. Supply player_token to receive
   // your own hole cards in event status snapshots.
   rpc StreamEvents(StreamEventsRequest) returns (stream TableEvent);
@@ -76,6 +86,7 @@ enum EventType {
   EVENT_TYPE_PLAYER_ACTION = 4;
   EVENT_TYPE_STREET_ADVANCED = 5;
   EVENT_TYPE_HAND_ENDED = 6;
+  EVENT_TYPE_PLAYER_REBOUGHT = 7;
 }
 
 // Represents the player's action state within the current betting round.
@@ -208,11 +219,17 @@ message TableStatus {
 }
 
 message SeatInfo {
-  uint32      seat_number = 1;
-  string      player_name = 2;
-  uint32      chips       = 3;
-  string      cards       = 4;  // hole cards; redacted unless caller owns this seat
-  PlayerState state       = 5;
+  uint32      seat_number   = 1;
+  string      player_name   = 2;
+  uint32      chips         = 3;
+  string      cards         = 4;  // hole cards; redacted unless caller owns this seat
+  PlayerState state         = 5;
+  // Cumulative chips brought to the table (initial buy-in + every rebuy).
+  uint32      withdrawn     = 6;
+  // Chips committed to the current pot this hand.
+  uint32      chips_in_play = 7;
+  // chips + chips_in_play - withdrawn. Signed; negative means net loss.
+  sint32      profit_loss   = 8;
 }
 
 message GetNextToActRequest {}
@@ -254,11 +271,43 @@ message GetEventLogResponse { string log = 1; }
 message GetTableConfigRequest {}
 message GetTableConfigResponse { TableConfig config = 1; }
 message TableConfig {
-  uint32 seat_count    = 1;
-  uint32 small_blind   = 2;
-  uint32 big_blind     = 3;
-  string variant       = 4;  // e.g. "No-Limit Hold'em"
-  uint32 default_chips = 5;
+  uint32 seat_count             = 1;
+  uint32 small_blind            = 2;
+  uint32 big_blind              = 3;
+  string variant                = 4;  // e.g. "No-Limit Hold'em"
+  uint32 default_chips          = 5;
+  uint32 default_rebuy_amount   = 6;
+  bool   rebuy_on_bust_enabled  = 7;
+  bool   topup_enabled          = 8;
+}
+
+message RebuyRequest {
+  // Chips to add to the caller's seat. 0 = use service default rebuy amount.
+  // Seat is resolved via x-player-token metadata.
+  uint32 chips = 1;
+}
+message RebuyResponse {
+  oneof result {
+    RebuyInfo info  = 1;
+    string    error = 2;
+  }
+}
+message RebuyInfo {
+  uint32 seat          = 1;
+  uint32 new_chips     = 2;
+  uint32 new_withdrawn = 3;
+  string reason        = 4;  // "bust" | "topup"
+}
+
+message GetPlayerStatsRequest {}
+message GetPlayerStatsResponse { repeated PlayerStats stats = 1; }
+message PlayerStats {
+  uint32 seat          = 1;
+  string player_name   = 2;
+  uint32 chips         = 3;
+  uint32 chips_in_play = 4;
+  uint32 withdrawn     = 5;
+  sint32 profit_loss   = 6;
 }
 
 message StreamEventsRequest {
