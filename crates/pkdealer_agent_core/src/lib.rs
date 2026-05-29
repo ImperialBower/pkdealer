@@ -18,7 +18,7 @@
 //! | Variable | Default | Effect |
 //! |----------|---------|--------|
 //! | `PKDEALER_ACTION_DELAY_SECS`   | `1` | Pause before this seat submits each action. Only the acting agent waits, so it spaces consecutive actions across the table. Set `0` to disable. |
-//! | `PKDEALER_SHOWDOWN_DELAY_SECS` | `5` | Extra pause after a hand that reaches showdown (two or more seats still live), before the next hand starts. Fold-wins are not delayed. |
+//! | `PKDEALER_HAND_END_DELAY_SECS` | `5` | Pause after every hand ends — showdown or fold-win alike — before the next hand starts, so viewers can see how it resolved. Set `0` to disable. |
 //!
 //! Values are (possibly fractional) seconds; an unparseable, negative, or
 //! non-finite value falls back to the default.

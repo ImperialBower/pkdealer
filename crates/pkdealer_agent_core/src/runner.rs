@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use pkdealer_proto::dealer::{
     ActRequest, ActionType, EventType, GetNextToActRequest, GetStatusRequest,
-    GetTableConfigRequest, NextToActInfo, PlayerAction as ProtoAction, PlayerState,
-    SeatPlayerAtRequest, SeatPlayerRequest, StartHandRequest, StreamEventsRequest, Street,
-    TableStatus, act_response, dealer_service_client::DealerServiceClient,
-    get_next_to_act_response, seat_player_at_response, seat_player_response,
+    GetTableConfigRequest, NextToActInfo, PlayerAction as ProtoAction, SeatPlayerAtRequest,
+    SeatPlayerRequest, StartHandRequest, StreamEventsRequest, Street, TableStatus, act_response,
+    dealer_service_client::DealerServiceClient, get_next_to_act_response, seat_player_at_response,
+    seat_player_response,
 };
 
 use crate::{AgentError, Decision, HandState, PokerAgent, hand_state::street_name};
@@ -106,7 +106,7 @@ pub async fn run_agent<A: PokerAgent>(agent: A, config: AgentConfig) -> Result<(
 
     let big_blind = fetch_big_blind(&mut client).await?;
     let action_delay = delay_from_env("PKDEALER_ACTION_DELAY_SECS", DEFAULT_ACTION_DELAY);
-    let showdown_delay = delay_from_env("PKDEALER_SHOWDOWN_DELAY_SECS", DEFAULT_SHOWDOWN_DELAY);
+    let hand_end_delay = delay_from_env("PKDEALER_HAND_END_DELAY_SECS", DEFAULT_HAND_END_DELAY);
     let ctx = SeatCtx {
         name: &config.name,
         seat: my_seat,
@@ -128,10 +128,6 @@ pub async fn run_agent<A: PokerAgent>(agent: A, config: AgentConfig) -> Result<(
     try_start_hand(&mut client).await;
 
     let mut action_history: Vec<String> = Vec::new();
-    // Number of seats still contesting the pot in the most recent in-progress
-    // status. At `HandEnded` this still holds the pre-reset value, so `>= 2`
-    // distinguishes a showdown from a fold-win (which narrows to one seat).
-    let mut live_seats: usize = 0;
 
     loop {
         // Reconcile fallback: the dealer is purely event-driven, so if this
@@ -149,21 +145,14 @@ pub async fn run_agent<A: PokerAgent>(agent: A, config: AgentConfig) -> Result<(
                 match EventType::try_from(event.event_type).unwrap_or(EventType::Unspecified) {
                     EventType::HandStarted => {
                         action_history.clear();
-                        live_seats = 0;
                         eprintln!("[{}] hand started", config.name);
                     }
                     EventType::HandEnded => {
                         eprintln!("[{}] hand ended — {}", config.name, event.description);
-                        // A showdown means two or more seats were still live at
-                        // the end; pause so revealed cards and the result are
-                        // visible before the next hand. Fold-wins skip the pause.
-                        if live_seats >= 2 && !showdown_delay.is_zero() {
-                            eprintln!(
-                                "[{}] showdown — pausing {:.1}s",
-                                config.name,
-                                showdown_delay.as_secs_f64()
-                            );
-                            tokio::time::sleep(showdown_delay).await;
+                        // Pause after every hand — showdown or fold-win alike —
+                        // so viewers can see how it ended before the next deal.
+                        if !hand_end_delay.is_zero() {
+                            tokio::time::sleep(hand_end_delay).await;
                         }
                         try_start_hand(&mut client).await;
                     }
@@ -175,11 +164,6 @@ pub async fn run_agent<A: PokerAgent>(agent: A, config: AgentConfig) -> Result<(
                 let Some(status) = event.current_status else {
                     continue;
                 };
-                // Track contesting seats only while a hand is live; the
-                // `HandEnded` snapshot is already reset and must not clobber it.
-                if status.hand_in_progress {
-                    live_seats = count_live_seats(&status);
-                }
                 act_if_my_turn(&mut client, &agent, &ctx, &status, &action_history).await?;
             }
             Err(_elapsed) => {
@@ -188,9 +172,6 @@ pub async fn run_agent<A: PokerAgent>(agent: A, config: AgentConfig) -> Result<(
                 let Some(status) = fetch_status(&mut client).await? else {
                     continue;
                 };
-                if status.hand_in_progress {
-                    live_seats = count_live_seats(&status);
-                }
                 act_if_my_turn(&mut client, &agent, &ctx, &status, &action_history).await?;
             }
         }
@@ -207,8 +188,8 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 /// Default pause before each action, overridable with `PKDEALER_ACTION_DELAY_SECS`.
 const DEFAULT_ACTION_DELAY: Duration = Duration::from_secs(1);
 
-/// Default pause after a showdown, overridable with `PKDEALER_SHOWDOWN_DELAY_SECS`.
-const DEFAULT_SHOWDOWN_DELAY: Duration = Duration::from_secs(5);
+/// Default pause after a hand ends, overridable with `PKDEALER_HAND_END_DELAY_SECS`.
+const DEFAULT_HAND_END_DELAY: Duration = Duration::from_secs(5);
 
 /// Parses a delay given in (possibly fractional) seconds.
 ///
@@ -225,20 +206,6 @@ fn parse_delay(raw: Option<&str>, default: Duration) -> Duration {
 /// when the variable is unset or invalid.
 fn delay_from_env(key: &str, default: Duration) -> Duration {
     parse_delay(std::env::var(key).ok().as_deref(), default)
-}
-
-/// Counts seats still contesting the pot: occupied (named) and neither folded
-/// nor eliminated. Two or more at hand-end indicates a showdown.
-fn count_live_seats(status: &TableStatus) -> usize {
-    status
-        .seats
-        .iter()
-        .filter(|s| {
-            !s.player_name.is_empty()
-                && s.state != PlayerState::Folded as i32
-                && s.state != PlayerState::Out as i32
-        })
-        .count()
 }
 
 /// Acts when the table is in progress and the authoritative next-to-act is this
@@ -636,52 +603,5 @@ mod tests {
         assert_eq!(parse_delay(Some("abc"), default), default);
         assert_eq!(parse_delay(Some(""), default), default);
         assert_eq!(parse_delay(Some("inf"), default), default);
-    }
-
-    fn seat_in_state(name: &str, state: PlayerState) -> pkdealer_proto::dealer::SeatInfo {
-        pkdealer_proto::dealer::SeatInfo {
-            seat_number: 0,
-            player_name: name.to_string(),
-            chips: 1_000,
-            cards: "??".to_string(),
-            state: state as i32,
-            withdrawn: 0,
-            chips_in_play: 0,
-            profit_loss: 0,
-        }
-    }
-
-    fn status_with(seats: Vec<pkdealer_proto::dealer::SeatInfo>) -> TableStatus {
-        TableStatus {
-            seats,
-            board: String::new(),
-            pot: 0,
-            next_to_act: 0,
-            hand_in_progress: true,
-            game_over: false,
-            current_street: 0,
-        }
-    }
-
-    #[test]
-    fn count_live_seats_counts_only_contesting_seats() {
-        let status = status_with(vec![
-            seat_in_state("a", PlayerState::Called),
-            seat_in_state("b", PlayerState::AllIn),
-            seat_in_state("c", PlayerState::Raised),
-        ]);
-        assert_eq!(count_live_seats(&status), 3);
-    }
-
-    #[test]
-    fn count_live_seats_excludes_folded_out_and_empty() {
-        let status = status_with(vec![
-            seat_in_state("a", PlayerState::Called),
-            seat_in_state("b", PlayerState::Folded),
-            seat_in_state("c", PlayerState::Out),
-            seat_in_state("", PlayerState::YetToAct), // empty seat
-        ]);
-        // Only "a" still contests the pot → fold-win shape, no showdown.
-        assert_eq!(count_live_seats(&status), 1);
     }
 }

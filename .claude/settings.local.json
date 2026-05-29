@@ -24,7 +24,8 @@
       "Bash(cargo update *)",
       "Bash(git log *)",
       "Bash(curl -fsS http://localhost:11434/api/tags)",
-      "Bash(cargo run *)"
+      "Bash(cargo run *)",
+      "Bash(cargo fmt *)"
     ]
   }
 }

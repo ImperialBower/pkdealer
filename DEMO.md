@@ -85,8 +85,8 @@ docker compose down -v
   are resolved without a mount.
 - **Table pacing.** Agents pause so the action is watchable:
   `PKDEALER_ACTION_DELAY_SECS` (default `1`) before each action and
-  `PKDEALER_SHOWDOWN_DELAY_SECS` (default `5`) after a showdown. Override per
-  run, e.g. `PKDEALER_ACTION_DELAY_SECS=2 ./bin/aiarena`, or set
+  `PKDEALER_HAND_END_DELAY_SECS` (default `5`) after every hand ends. Override
+  per run, e.g. `PKDEALER_ACTION_DELAY_SECS=2 ./bin/aiarena`, or set
   `PKDEALER_ACTION_DELAY_SECS=0` for a full-speed table.
 - **Different ollama models.** Each LLM seat reads its own override env var:
   `LLAMA_MODEL` (default `llama3.1`), `MISTRAL_MODEL` (default `mistral`),

@@ -1,11 +1,11 @@
 # Reusable agent pacing knobs, merged into every agent's environment below.
 # Both default to the values baked into pkdealer_agent_core and are overridable
 # from the host shell, e.g.:
-#   PKDEALER_ACTION_DELAY_SECS=2 PKDEALER_SHOWDOWN_DELAY_SECS=8 ./bin/aiarena
+#   PKDEALER_ACTION_DELAY_SECS=2 PKDEALER_HAND_END_DELAY_SECS=8 ./bin/aiarena
 # Set an action delay of 0 to remove the per-action pause entirely.
 x-agent-pacing: &agent-pacing
   PKDEALER_ACTION_DELAY_SECS: ${PKDEALER_ACTION_DELAY_SECS:-1}
-  PKDEALER_SHOWDOWN_DELAY_SECS: ${PKDEALER_SHOWDOWN_DELAY_SECS:-5}
+  PKDEALER_HAND_END_DELAY_SECS: ${PKDEALER_HAND_END_DELAY_SECS:-5}
 
 services:
   pkdealer_service:
