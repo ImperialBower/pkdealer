@@ -230,6 +230,9 @@ message SeatInfo {
   uint32      chips_in_play = 7;
   // chips + chips_in_play - withdrawn. Signed; negative means net loss.
   sint32      profit_loss   = 8;
+  // Chips wagered on the current betting round only; reset to 0 when the street
+  // advances. Use this (not chips_in_play) for a per-street "bet" display.
+  uint32      bet           = 9;
 }
 
 message GetNextToActRequest {}

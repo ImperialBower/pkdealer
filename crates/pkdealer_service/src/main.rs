@@ -357,6 +357,7 @@ impl DealerService {
                     withdrawn: seat.player.withdrawn as u32,
                     chips_in_play: seat.player.chips_in_play as u32,
                     profit_loss: compute_profit_loss(&seat.player),
+                    bet: seat.player.bet as u32,
                 });
             }
         }
