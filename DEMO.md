@@ -83,6 +83,11 @@ docker compose down -v
   container and pass `--profile /data/bots/<file>.yaml`. Built-in
   profile names (`gto`, `loose_aggressive`, `tight_aggressive`, etc.)
   are resolved without a mount.
+- **Table pacing.** Agents pause so the action is watchable:
+  `PKDEALER_ACTION_DELAY_SECS` (default `1`) before each action and
+  `PKDEALER_SHOWDOWN_DELAY_SECS` (default `5`) after a showdown. Override per
+  run, e.g. `PKDEALER_ACTION_DELAY_SECS=2 ./bin/aiarena`, or set
+  `PKDEALER_ACTION_DELAY_SECS=0` for a full-speed table.
 - **Different ollama models.** Each LLM seat reads its own override env var:
   `LLAMA_MODEL` (default `llama3.1`), `MISTRAL_MODEL` (default `mistral`),
   and `GEMMA_MODEL` (default `gemma2`). Set any of them in `.env` (e.g.

@@ -6,7 +6,7 @@
 # Example: make demo-audit COUNT=5
 COUNT ?= 1
 
-.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve demo demo-audit
+.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve ddown demo demo-audit
 
 # Default target
 default: ayce
@@ -37,6 +37,7 @@ help:
 	@echo ""
 	@echo "Service:"
 	@echo "  make serve          - Build and start the dealer service"
+	@echo "  make ddown          - Tear down the demo stack (docker compose down -v)"
 	@echo "  make demo           - Run the 9-player client demo (service must be running)"
 	@echo "  make demo-audit [COUNT=N] - Run demo+audit N times (default 1)"
 	@echo ""
@@ -69,6 +70,11 @@ demo-audit:
 serve:
 	@echo "Starting pkdealer_service on 127.0.0.1:50051..."
 	cargo run --bin pkdealer_service -p pkdealer_service
+
+# Tear down the demo stack and drop its named volumes.
+ddown:
+	@echo "Stopping demo stack and removing volumes..."
+	docker compose down -v
 
 # Build all crates
 build:
