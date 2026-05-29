@@ -2,13 +2,13 @@
 # Run the pkdealer service and demo client side-by-side in tmux.
 #
 # Usage:
-#   ./demo.sh          — start a fresh tmux session called "pkdealer-demo"
-#   ./demo.sh attach   — reattach to an existing session
+#   ./bin/simpletmux          — start a fresh tmux session called "pkdealer-demo"
+#   ./bin/simpletmux attach   — reattach to an existing session
 #
 # Exiting:
 #   Ctrl+B  then  D       — detach from tmux (leaves session running in background)
 #   Ctrl+B  then  :kill-session  Enter  — kill everything and exit completely
-#   ./demo.sh             — re-running the script also kills any existing session first
+#   ./bin/simpletmux      — re-running the script also kills any existing session first
 
 set -euo pipefail
 

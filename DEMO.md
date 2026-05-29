@@ -13,14 +13,14 @@ Grafana. The spectator UI runs separately from the
   ollama serve            # in a dedicated terminal
   ollama pull llama3.1    # one-time, ~4.7 GB
   ```
-  If ollama isn't running, `./demo.sh` prints a warning and continues; the
+  If ollama isn't running, `./bin/aiarena` prints a warning and continues; the
   ollama agent container will fail, the other four agents still play.
 - **pkspectator** checked out alongside this repo, e.g. `../pkspectator`.
 
 ## Launch
 
 ```bash
-./demo.sh
+./bin/aiarena
 ```
 
 The script builds images (first run takes a few minutes), starts the
