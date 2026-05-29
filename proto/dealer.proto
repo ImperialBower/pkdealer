@@ -203,6 +203,9 @@ message WinnerInfo {
   string player_name      = 2;
   uint32 amount_won       = 3;
   string hand_description = 4;  // e.g. "Pair", "Flush" — empty on fold win
+  // The winning 5-card hand at showdown, e.g. "A♠ K♠ Q♠ J♠ T♠". Empty on a
+  // fold win (no showdown).
+  string winning_cards    = 5;
 }
 
 message GetStatusRequest {}

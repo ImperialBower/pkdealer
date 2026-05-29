@@ -513,9 +513,9 @@ impl DealerService {
         for pot_win in winnings.vec() {
             let seatbit = pot_win.equity.seats;
             let total_chips = pot_win.equity.chips;
-            let hand_description = match pot_win.eval.hand_rank.name {
-                HandRankName::Invalid => String::new(), // fold win — no showdown
-                ref name => format!("{name:?}"),
+            let (hand_description, winning_cards) = match pot_win.eval.hand_rank.name {
+                HandRankName::Invalid => (String::new(), String::new()), // fold win
+                ref name => (format!("{name:?}"), pot_win.eval.hand.to_string()),
             };
 
             let winning_seats: Vec<u8> = (0u8..Seatbit::CAPACITY)
@@ -539,6 +539,7 @@ impl DealerService {
                     player_name,
                     amount_won: per_seat,
                     hand_description: hand_description.clone(),
+                    winning_cards: winning_cards.clone(),
                 });
             }
         }
@@ -551,8 +552,9 @@ impl DealerService {
 
     /// Formats the human-readable `HandEnded` description from a [`HandResult`],
     /// naming each winner, the amount won, and (at showdown) the winning hand —
-    /// e.g. `"Hand ended. gto wins 1500 with FullHouse"`, or on a split pot
-    /// `"Hand ended. gto wins 750, lag wins 750"`. Fold wins omit the hand.
+    /// e.g. `"Hand ended. gto wins 1500 with FullHouse (A♠ A♥ A♦ K♠ K♥)"`, or
+    /// on a split pot `"Hand ended. gto wins 750, lag wins 750"`. Fold wins omit
+    /// the hand; showdown wins append the winning five cards in parentheses.
     fn format_hand_end(result: &HandResult) -> String {
         if result.winners.is_empty() {
             return "Hand ended.".to_owned();
@@ -568,8 +570,13 @@ impl DealerService {
                 };
                 if w.hand_description.is_empty() {
                     format!("{who} wins {}", w.amount_won)
-                } else {
+                } else if w.winning_cards.is_empty() {
                     format!("{who} wins {} with {}", w.amount_won, w.hand_description)
+                } else {
+                    format!(
+                        "{who} wins {} with {} ({})",
+                        w.amount_won, w.hand_description, w.winning_cards
+                    )
                 }
             })
             .collect();
@@ -1833,30 +1840,32 @@ mod tests {
     }
 
     #[test]
-    fn format_hand_end_names_single_showdown_winner() {
+    fn format_hand_end_names_single_showdown_winner_with_cards() {
         let result = HandResult {
             winners: vec![WinnerInfo {
                 seat: 2,
                 player_name: "gto".to_owned(),
                 amount_won: 1_500,
                 hand_description: "FullHouse".to_owned(),
+                winning_cards: "A♠ A♥ A♦ K♠ K♥".to_owned(),
             }],
             final_chips: Vec::new(),
         };
         assert_eq!(
             DealerService::format_hand_end(&result),
-            "Hand ended. gto wins 1500 with FullHouse"
+            "Hand ended. gto wins 1500 with FullHouse (A♠ A♥ A♦ K♠ K♥)"
         );
     }
 
     #[test]
-    fn format_hand_end_fold_win_omits_hand() {
+    fn format_hand_end_fold_win_omits_hand_and_cards() {
         let result = HandResult {
             winners: vec![WinnerInfo {
                 seat: 0,
                 player_name: "lag".to_owned(),
                 amount_won: 300,
                 hand_description: String::new(),
+                winning_cards: String::new(),
             }],
             final_chips: Vec::new(),
         };
@@ -1867,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn format_hand_end_split_pot_lists_each_winner() {
+    fn format_hand_end_split_pot_lists_each_winner_with_cards() {
         let result = HandResult {
             winners: vec![
                 WinnerInfo {
@@ -1875,19 +1884,22 @@ mod tests {
                     player_name: "gto".to_owned(),
                     amount_won: 750,
                     hand_description: "Flush".to_owned(),
+                    winning_cards: "A♠ K♠ Q♠ J♠ T♠".to_owned(),
                 },
                 WinnerInfo {
                     seat: 4,
                     player_name: "tag".to_owned(),
                     amount_won: 750,
                     hand_description: "Flush".to_owned(),
+                    winning_cards: "A♠ K♠ Q♠ J♠ T♠".to_owned(),
                 },
             ],
             final_chips: Vec::new(),
         };
         assert_eq!(
             DealerService::format_hand_end(&result),
-            "Hand ended. gto wins 750 with Flush, tag wins 750 with Flush"
+            "Hand ended. gto wins 750 with Flush (A♠ K♠ Q♠ J♠ T♠), \
+             tag wins 750 with Flush (A♠ K♠ Q♠ J♠ T♠)"
         );
     }
 
@@ -1899,12 +1911,33 @@ mod tests {
                 player_name: String::new(),
                 amount_won: 200,
                 hand_description: String::new(),
+                winning_cards: String::new(),
             }],
             final_chips: Vec::new(),
         };
         assert_eq!(
             DealerService::format_hand_end(&result),
             "Hand ended. Seat 5 wins 200"
+        );
+    }
+
+    #[test]
+    fn format_hand_end_with_rank_but_no_cards_omits_parens() {
+        // Defensive: a hand_description without winning_cards should not render
+        // empty parentheses.
+        let result = HandResult {
+            winners: vec![WinnerInfo {
+                seat: 1,
+                player_name: "gto".to_owned(),
+                amount_won: 400,
+                hand_description: "Pair".to_owned(),
+                winning_cards: String::new(),
+            }],
+            final_chips: Vec::new(),
+        };
+        assert_eq!(
+            DealerService::format_hand_end(&result),
+            "Hand ended. gto wins 400 with Pair"
         );
     }
 
