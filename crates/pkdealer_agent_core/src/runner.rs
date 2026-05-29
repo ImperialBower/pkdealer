@@ -1,9 +1,11 @@
 //! Agent run loop: connect, seat, stream events, and act.
 
+use std::time::Duration;
+
 use pkdealer_proto::dealer::{
-    ActRequest, ActionType, EventType, GetNextToActRequest, GetTableConfigRequest, NextToActInfo,
-    PlayerAction as ProtoAction, SeatPlayerAtRequest, SeatPlayerRequest, StartHandRequest,
-    StreamEventsRequest, Street, TableStatus, act_response,
+    ActRequest, ActionType, EventType, GetNextToActRequest, GetStatusRequest, GetTableConfigRequest,
+    NextToActInfo, PlayerAction as ProtoAction, SeatPlayerAtRequest, SeatPlayerRequest,
+    StartHandRequest, StreamEventsRequest, Street, TableStatus, act_response,
     dealer_service_client::DealerServiceClient, get_next_to_act_response, seat_player_at_response,
     seat_player_response,
 };
@@ -122,44 +124,80 @@ pub async fn run_agent<A: PokerAgent>(agent: A, config: AgentConfig) -> Result<(
     let mut action_history: Vec<String> = Vec::new();
 
     loop {
-        let Some(event) = event_stream.message().await? else {
-            break;
-        };
+        // Reconcile fallback: the dealer is purely event-driven, so if this
+        // agent ever misses its turn-prompt (a dropped/late StreetAdvanced after
+        // a reconnect, or a HandStarted that arrived before we subscribed) it
+        // would block here forever and wedge the whole table. Time-box the wait
+        // so that, even with no event, we periodically re-check whether the
+        // table is silently waiting on us and act if so.
+        match tokio::time::timeout(RECONCILE_INTERVAL, event_stream.message()).await {
+            Ok(message) => {
+                let Some(event) = message? else {
+                    break;
+                };
 
-        match EventType::try_from(event.event_type).unwrap_or(EventType::Unspecified) {
-            EventType::HandStarted => {
-                action_history.clear();
-                eprintln!("[{}] hand started", config.name);
+                match EventType::try_from(event.event_type).unwrap_or(EventType::Unspecified) {
+                    EventType::HandStarted => {
+                        action_history.clear();
+                        eprintln!("[{}] hand started", config.name);
+                    }
+                    EventType::HandEnded => {
+                        eprintln!("[{}] hand ended — {}", config.name, event.description);
+                        try_start_hand(&mut client).await;
+                    }
+                    EventType::StreetAdvanced => action_history.clear(),
+                    EventType::PlayerAction => action_history.push(event.description.clone()),
+                    _ => {}
+                }
+
+                let Some(status) = event.current_status else {
+                    continue;
+                };
+                act_if_my_turn(&mut client, &agent, &ctx, &status, &action_history).await?;
             }
-            EventType::HandEnded => {
-                eprintln!("[{}] hand ended — {}", config.name, event.description);
-                try_start_hand(&mut client).await;
+            Err(_elapsed) => {
+                // No event for RECONCILE_INTERVAL. Pull the authoritative status
+                // and act if the table is stuck waiting on this seat.
+                let Some(status) = fetch_status(&mut client).await? else {
+                    continue;
+                };
+                act_if_my_turn(&mut client, &agent, &ctx, &status, &action_history).await?;
             }
-            EventType::StreetAdvanced => action_history.clear(),
-            EventType::PlayerAction => action_history.push(event.description.clone()),
-            _ => {}
         }
-
-        let Some(status) = event.current_status else {
-            continue;
-        };
-        if !status.hand_in_progress {
-            continue;
-        }
-
-        // status.next_to_act is captured before auto-advance runs and can be
-        // stale. Ask the service for the authoritative current actor instead.
-        let Some(info) = fetch_next_to_act_info(&mut client).await? else {
-            continue;
-        };
-        if info.seat != u32::from(ctx.seat) {
-            continue;
-        }
-
-        decide_and_act(&mut client, &agent, &ctx, &status, &info, &action_history).await?;
     }
 
     Ok(())
+}
+
+/// How long the play loop waits for a stream event before falling back to a
+/// status reconcile. Short enough that a missed turn-prompt recovers quickly,
+/// long enough that idle agents don't poll the service hard.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Acts when the table is in progress and the authoritative next-to-act is this
+/// agent's seat; otherwise does nothing. Shared by the event-driven path and
+/// the reconcile-timeout path so both recover a stuck seat identically.
+async fn act_if_my_turn<A: PokerAgent>(
+    client: &mut DealerServiceClient<tonic::transport::Channel>,
+    agent: &A,
+    ctx: &SeatCtx<'_>,
+    status: &TableStatus,
+    action_history: &[String],
+) -> Result<(), AgentError> {
+    if !status.hand_in_progress {
+        return Ok(());
+    }
+
+    // status.next_to_act is captured before auto-advance runs and can be stale.
+    // Ask the service for the authoritative current actor instead.
+    let Some(info) = fetch_next_to_act_info(client).await? else {
+        return Ok(());
+    };
+    if info.seat != u32::from(ctx.seat) {
+        return Ok(());
+    }
+
+    decide_and_act(client, agent, ctx, status, &info, action_history).await
 }
 
 async fn decide_and_act<A: PokerAgent>(
@@ -345,6 +383,18 @@ async fn fetch_big_blind(
         .await?
         .into_inner();
     Ok(resp.config.map_or(100, |c| c.big_blind))
+}
+
+/// Fetches the current full table status for the reconcile path. Returns
+/// `Ok(None)` if the service reports no status (e.g. between hands).
+async fn fetch_status(
+    client: &mut DealerServiceClient<tonic::transport::Channel>,
+) -> Result<Option<TableStatus>, AgentError> {
+    let resp = client
+        .get_status(tonic::Request::new(GetStatusRequest {}))
+        .await?
+        .into_inner();
+    Ok(resp.status)
 }
 
 async fn fetch_next_to_act_info(
