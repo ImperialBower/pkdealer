@@ -154,7 +154,11 @@ Run against a live service:
 cargo run --example demo -p pkdealer_client
 ```
 
-#### `demo.sh`
+#### `demo.sh` (now `bin/simpletmux`)
+
+> **Renamed 2026-05-29:** this tmux launcher moved to `bin/simpletmux`. A
+> separate full-stack docker launcher added in EPIC-24 took the `demo.sh`
+> name and later moved to `bin/aiarena`.
 
 A tmux script that opens a single window split into two side-by-side panes:
 
@@ -169,7 +173,7 @@ Behaviour:
 
 Run:
 ```
-./demo.sh
+./bin/simpletmux
 ```
 
 ---
@@ -248,11 +252,12 @@ Run:
 
 ## Upcoming Phases
 
-| Phase | Goal |
-|-------|------|
-| Phase 2 | Web spectator app |
-| Phase 4 | AI agent clients |
-| Future | Multi-table support via `pkcore::TableManager` |
+| Phase | Goal | Status |
+|-------|------|--------|
+| Phase 2 / EPIC-21 | Web spectator app | Shipped (separate `pkspectator` repo) |
+| Phase 4 / EPIC-23 | AI agent clients | ✅ Shipped — see EPIC-23 below |
+| EPIC-40 | Local LLM backend | ✅ Shipped — see EPIC-40 below |
+| Future | Multi-table support via `pkcore::TableManager` | Not started |
 
 ---
 
@@ -305,3 +310,123 @@ EPIC-23 (`pkdealer_agent_core`) can now ship a `load_or_create_secret`
 helper that persists a per-agent UUID to `~/.pkdealer/agents/<name>.secret`
 and threads it into every `SeatPlayer` call. See
 `docs/EPIC-23_Bot_Agents.md`.
+
+---
+
+## License migration — GPL-3.0 → MIT OR Apache-2.0 (2026-05-24)
+
+**Status: ✅ Complete** (`d7ad344`)
+
+Relicensed the whole repo to dual MIT OR Apache-2.0 to match `pkcore`.
+`LICENSE-GPL3.0` removed; `LICENSE-MIT` and `LICENSE-APACHE` copied
+verbatim from pkcore. Root `Cargo.toml` `license` field switched; READMEs
+and `docs/notes/*` updated. `deny.toml` allow-list rewritten — copyleft is
+now disallowed; `docs/notes/GPL_LICENSE_COMPATIBILITY.md` deleted and
+`CARGO_DENY_QUICKSTART.md` rewritten to drop the GPL framing.
+
+---
+
+## EPIC-23 — Bot Agents (2026-05-24)
+
+**Status: ✅ Complete** (PRs #10, #11)
+
+Autonomous bot agents that connect to the dealer as gRPC clients, resume
+their seat via the EPIC-20 `client_secret`, and play hands unattended.
+
+### What was built
+
+- `pkdealer_agent_core` — shared infrastructure for every agent binary:
+  `HandState` (the table state visible to one seat), `Decision` (the
+  action an agent may take), the `run_agent` loop, and the
+  `load_or_create_secret` helper that persists a per-agent UUID to
+  `~/.pkdealer/agents/<name>.secret`.
+- `pkdealer_agent_rules` — rule-based bot driven by a pkcore `BotProfile`
+  (aggression, bluff frequency, bet sizing) via `RuleBasedDecider`.
+  Ships the `gto` / `loose_aggressive` (lag) / `tight_aggressive` (tag)
+  profiles.
+- `pkdealer_agent_random` — uniform-random legal-action baseline that
+  establishes a performance floor for the other agents.
+- `pkdealer_agent_claude` — `ClaudeBackend` targeting the Anthropic
+  Messages API (see also the crate README, `8d7df9b`).
+
+### Why it matters
+
+Delivers the "AI agent clients" milestone (old Phase 4). The dealer was
+already the sole authority for seat state after EPIC-20; agents simply
+drive it from the outside, so no server changes were needed beyond seat
+resume.
+
+---
+
+## EPIC-24 — Demo packaging (2026-05-25)
+
+**Status: ✅ Complete** (`55ada60`, `9c28e55`, `059ce16`; PR #13)
+
+One-command "conference demo" of the full platform.
+
+- Five-agent demo stack added to `docker-compose.yml` (gto / lag / tag
+  rule bots, random, ollama) wired to the dealer + OTel collector.
+- `Dockerfile.agent` — shared `cargo-chef` multi-stage build
+  parametrized by `BIN_NAME` so every agent binary builds from one
+  Dockerfile.
+- A `demo.sh` one-command launcher (Ollama preflight check + dealer
+  `:50051` readiness wait). **Renamed 2026-05-29 to `bin/aiarena`.**
+- `deny.toml` allow-list extended with `ISC` and `CDLA-Permissive-2.0`
+  for new transitive deps.
+- Presenter guide and runbook (`DEMO.md`).
+
+This also closed out the EPIC-22 TODO to pin Jaeger as part of the
+production-packaging pass.
+
+---
+
+## EPIC-40 — Local LLM backend / multi-model shootout (2026-05-25)
+
+**Status: ✅ Complete** (`4ea4c66`, `9a8cf89`; PRs #12, #14)
+
+Renumbered from EPIC-25 → EPIC-40 to avoid a number collision with
+pkcore's Range Frequencies epic.
+
+- `pkdealer_agent_llm` — shared building blocks for LLM-backed agents:
+  the `LlmBackend` trait (HTTP transport, auth, request/response shape
+  per provider) and `LlmPokerAgent`, which adapts a backend into the
+  `pkdealer_agent_core::run_agent` loop. `pkdealer_agent_claude` was
+  refactored onto this trait.
+- `pkdealer_agent_ollama` — `OllamaBackend` targeting a locally-running
+  Ollama server (`/api/chat`), enabling a fully offline LLM agent.
+- Presentation: `docs/presentations/epic-40-multi-model-shootout.md`.
+
+---
+
+## Rebuy (2026-05-27)
+
+**Status: ✅ Complete** (PR #15, `11b2862`)
+
+Added a `Rebuy` RPC so a busted seat can reload chips. Guards:
+
+- `chips == 0` (busted) requires `rebuy_on_bust_enabled`.
+- Rebuy is **rejected mid-hand** — an all-in player can have `chips == 0`
+  while `chips_in_play > 0`, and reloading then would corrupt pot
+  accounting.
+- `default_rebuy_amount` configures the reload size.
+
+Covered by `crates/pkdealer_service/tests/e2e_rebuy.rs`.
+
+---
+
+## Agent loop self-heal (2026-05-29)
+
+**Status: ✅ Complete** (`9bd042a`)
+
+Hardened the shared agent loop (`pkdealer_agent_core/src/runner.rs`)
+against a silently-stuck seat:
+
+- The blocking `event_stream.message()` is now wrapped in a 3-second
+  `tokio::time::timeout`. On timeout the agent pulls authoritative state
+  via `GetStatus` and acts if the table is waiting on its seat.
+- Extracted `act_if_my_turn` so the event-driven path and the reconcile
+  path recover an idle seat identically; added a `fetch_status` helper.
+- Declared tokio's `time` feature explicitly in `Cargo.toml`.
+
+This complements EPIC-20 seat resume: resume recovers a *crashed* agent
+on restart; the self-heal recovers a *live* agent that missed an event.
