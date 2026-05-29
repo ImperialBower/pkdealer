@@ -54,10 +54,13 @@ services:
     ports: ["3001:3000"]
 
   # ── agent containers ──────────────────────────────────────────────────
+  # Six players fill the table: three rule-based bots and three LLMs.
+  #   Rule bots (pkdealer_agent_rules): gto, lag, tag — pkcore built-in
+  #     profile names (gto, loose_aggressive, tight_aggressive).
+  #   LLMs (pkdealer_agent_ollama): llama, mistral, gemma — each talks to a
+  #     host-side `ollama serve` via host.docker.internal, differing only in
+  #     OLLAMA_MODEL. Override any model with the matching *_MODEL env var.
   # All agents share Dockerfile.agent; BIN_NAME selects the binary.
-  # Rule-based bots use pkcore built-in profile names (gto, loose_aggressive,
-  # tight_aggressive). The ollama agent talks to a host-side `ollama serve`
-  # via host.docker.internal.
 
   agent_gto:
     image: pkdealer/agent_rules:latest
@@ -110,24 +113,7 @@ services:
       - pkdealer_service
       - otel-collector
 
-  agent_random:
-    image: pkdealer/agent_random:latest
-    build:
-      context: .
-      dockerfile: Dockerfile.agent
-      args:
-        BIN_NAME: pkdealer_agent_random
-    command: ["--name", "random"]
-    environment:
-      PKDEALER_ENDPOINT: http://pkdealer_service:50051
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-      OTEL_SERVICE_NAME: agent_random
-      RUST_LOG: info
-    depends_on:
-      - pkdealer_service
-      - otel-collector
-
-  agent_ollama:
+  agent_llama:
     image: pkdealer/agent_ollama:latest
     build:
       context: .
@@ -138,13 +124,55 @@ services:
     environment:
       PKDEALER_ENDPOINT: http://pkdealer_service:50051
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
+      OLLAMA_MODEL: ${LLAMA_MODEL:-llama3.1}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-      OTEL_SERVICE_NAME: agent_ollama
+      OTEL_SERVICE_NAME: agent_llama
       RUST_LOG: info
     extra_hosts:
       # Lets the container resolve host.docker.internal on Linux.
       # No-op (already mapped) on Docker Desktop for macOS/Windows.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_mistral:
+    image: pkdealer/agent_ollama:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_ollama
+    command: ["--name", "mistral"]
+    environment:
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${MISTRAL_MODEL:-mistral}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_mistral
+      RUST_LOG: info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_gemma:
+    image: pkdealer/agent_ollama:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_ollama
+    command: ["--name", "gemma"]
+    environment:
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${GEMMA_MODEL:-gemma2}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_gemma
+      RUST_LOG: info
+    extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
       - pkdealer_service

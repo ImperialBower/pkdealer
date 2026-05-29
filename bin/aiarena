@@ -2,21 +2,24 @@
 # Launch the full pkdealer demo stack.
 #
 # Brings up the dealer service, OpenTelemetry collector, Jaeger, Prometheus,
-# Grafana, and five agent containers (gto, lag, tag, random, ollama).
+# Grafana, and six agent containers: three rule bots (gto, lag, tag) and
+# three LLMs (llama, mistral, gemma).
 # The pkspectator UI runs separately from its own repo — see DEMO.md.
 
 set -euo pipefail
 
-# Soft check: warn if ollama isn't reachable. The rules and random agents
-# still play even when ollama is down, so don't abort.
+# Soft check: warn if ollama isn't reachable. The three rule bots still play
+# even when ollama is down, so don't abort.
 if ! curl -fsS http://localhost:11434/api/tags >/dev/null 2>&1; then
   cat <<'EOF'
 ⚠  Ollama not reachable at http://localhost:11434
-   The ollama agent container will exit until ollama is running.
-   The rules and random agents will still play.
-   To enable the ollama agent:
+   The three LLM agent containers (llama, mistral, gemma) will exit until
+   ollama is running. The three rule bots (gto, lag, tag) will still play.
+   To enable the LLM agents:
      ollama serve
      ollama pull llama3.1
+     ollama pull mistral
+     ollama pull gemma2
 
 EOF
 fi
