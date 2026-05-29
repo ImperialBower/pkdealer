@@ -233,16 +233,8 @@ async fn decide_and_act<A: PokerAgent>(
         ctx.name, hand_state.street, info.pot, info.amount_to_call
     );
 
-    let proto_action = decision_to_proto(my_seat, &decision);
-    let mut act_req = tonic::Request::new(ActRequest {
-        action: Some(proto_action),
-    });
-    act_req
-        .metadata_mut()
-        .insert(PLAYER_TOKEN_METADATA_KEY, ctx.token.parse()?);
-    let resp = client.act(act_req).await?.into_inner();
-    if let Some(act_response::Result::Error(e)) = resp.result {
-        // Service rejected the action; fall back to a safe action so the game
+    if let Some(e) = send_action(client, my_seat, &decision, ctx.token).await? {
+        // Service rejected the action; fall back to a safe action so the table
         // isn't left stuck waiting for this seat.
         let safe = if hand_state.to_call > 0 {
             Decision::Fold
@@ -253,16 +245,45 @@ async fn decide_and_act<A: PokerAgent>(
             "[{}] act rejected ({e}) — falling back to {safe:?}",
             ctx.name
         );
-        let proto_safe = decision_to_proto(my_seat, &safe);
-        let mut safe_req = tonic::Request::new(ActRequest {
-            action: Some(proto_safe),
-        });
-        safe_req
-            .metadata_mut()
-            .insert(PLAYER_TOKEN_METADATA_KEY, ctx.token.parse()?);
-        client.act(safe_req).await?;
+        if let Some(e2) = send_action(client, my_seat, &safe, ctx.token).await? {
+            // The fallback was rejected too. Without escalating, the table hangs
+            // forever on this seat (the dealer is purely reactive and only
+            // advances when the acting seat submits a valid action). Fold is
+            // legal on any turn, so it always frees the seat. Skip if `safe` was
+            // already Fold — nothing further would help.
+            eprintln!(
+                "[{}] fallback {safe:?} rejected ({e2}) — folding to unblock table",
+                ctx.name
+            );
+            if !matches!(safe, Decision::Fold)
+                && let Some(e3) = send_action(client, my_seat, &Decision::Fold, ctx.token).await?
+            {
+                eprintln!("[{}] fold also rejected ({e3})", ctx.name);
+            }
+        }
     }
     Ok(())
+}
+
+/// Sends a single `Act` RPC for `seat` carrying the player `token`. Returns
+/// `Ok(None)` when the service accepted the action, `Ok(Some(error))` when it
+/// returned a structured rejection, and `Err` for transport/metadata failures.
+async fn send_action(
+    client: &mut DealerServiceClient<tonic::transport::Channel>,
+    seat: u8,
+    decision: &Decision,
+    token: &str,
+) -> Result<Option<String>, AgentError> {
+    let mut req = tonic::Request::new(ActRequest {
+        action: Some(decision_to_proto(seat, decision)),
+    });
+    req.metadata_mut()
+        .insert(PLAYER_TOKEN_METADATA_KEY, token.parse()?);
+    let resp = client.act(req).await?.into_inner();
+    Ok(match resp.result {
+        Some(act_response::Result::Error(e)) => Some(e),
+        _ => None,
+    })
 }
 
 // Both agents race to call StartHand after seating and after each HandEnded.

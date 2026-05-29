@@ -85,7 +85,11 @@ const DEFAULT_CHIPS: usize = 10_000;
 const DEFAULT_SMALL_BLIND: usize = 50;
 const DEFAULT_BIG_BLIND: usize = 100;
 const DEFAULT_SEAT_COUNT: u8 = 9;
-const EVENT_CHANNEL_CAPACITY: usize = 64;
+// Capacity of both the broadcast channel and each subscriber's forwarding mpsc.
+// Sized generously so a briefly-slow spectator does not lag past the buffer
+// during a busy multi-agent demo; on overflow `stream_events` skips the gap and
+// resyncs from the next event's full snapshot rather than dropping the stream.
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// gRPC metadata key carrying the player's UUID auth token.
 const PLAYER_TOKEN_METADATA_KEY: &str = "x-player-token";
 /// Default spectator token used when `PKDEALER_SPECTATOR_TOKEN` is not set.
@@ -953,6 +957,14 @@ impl DealerServiceTrait for DealerService {
         let (response_result, maybe_event) = {
             let mut guard = self.lock()?;
             if guard.session.count_funded() < 2 {
+                // Genuine table-empty condition: fewer than two seats can post.
+                // Logged at warn so a stalled demo is diagnosable from service
+                // logs rather than appearing as a silent freeze (agents swallow
+                // this error in `try_start_hand`).
+                tracing::warn!(
+                    funded = guard.session.count_funded(),
+                    "start_hand refused: fewer than 2 funded players"
+                );
                 return Ok(Response::new(StartHandResponse {
                     result: Some(start_hand_response::Result::Error(
                         "at least 2 players with chips are required to start a hand".to_owned(),
@@ -993,7 +1005,24 @@ impl DealerServiceTrait for DealerService {
                         Some(event),
                     )
                 }
-                Err(e) => (start_hand_response::Result::Error(e.to_string()), None),
+                Err(e) => {
+                    // Distinguish the benign multi-agent race (a hand is already
+                    // running — every agent calls start_hand after HandEnded, only
+                    // one wins) from a real refusal that wedges the table, e.g.
+                    // pkcore's "Insufficient chips Error" when an occupied seat sits
+                    // at 0 chips and rebuy-on-bust is disabled. The latter is a
+                    // demo-killer and must be visible in logs.
+                    if guard.session.is_hand_in_progress() {
+                        tracing::debug!(error = %e, "start_hand ignored: hand already in progress");
+                    } else {
+                        tracing::warn!(
+                            error = %e,
+                            "start_hand refused while table idle — table may be wedged \
+                             (enable PKDEALER_REBUY_ON_BUST_ENABLED to top up busted seats)"
+                        );
+                    }
+                    (start_hand_response::Result::Error(e.to_string()), None)
+                }
             }
         };
 
@@ -1672,11 +1701,17 @@ impl DealerServiceTrait for DealerService {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        // Warn but continue; the client will see a gap in events
-                        let msg = format!("event stream lagged; {skipped} events skipped");
-                        if mpsc_tx.send(Err(Status::data_loss(msg))).await.is_err() {
-                            break;
-                        }
+                        // A slow subscriber (e.g. the spectator UI) fell behind the
+                        // broadcast buffer. Do NOT propagate an Err here: yielding
+                        // Err(Status) terminates the gRPC stream, which froze the
+                        // spectator mid-hand once it lagged past the channel
+                        // capacity. Every TableEvent carries a full `current_status`
+                        // snapshot, so simply skipping the gap is self-healing — the
+                        // next delivered event resyncs the client.
+                        tracing::warn!(
+                            skipped,
+                            "event stream lagged; skipping gap and resyncing on next event"
+                        );
                     }
                 }
             }

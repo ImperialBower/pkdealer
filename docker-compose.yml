@@ -7,6 +7,12 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       OTEL_SERVICE_NAME: pkdealer_service
       RUST_LOG: pkdealer_service=info,info
+      # Keep the demo running indefinitely: top up any seat that busts to $0
+      # at end-of-hand, so the table can always start the next hand. Without
+      # this, busted seats stay occupied at 0 chips and pkcore refuses to deal
+      # ("Insufficient chips Error"), wedging the whole table.
+      PKDEALER_REBUY_ON_BUST_ENABLED: "true"
+      PKDEALER_REBUY_AMOUNT: "10000"
     ports: ["50051:50051"]
     depends_on:
       - otel-collector
