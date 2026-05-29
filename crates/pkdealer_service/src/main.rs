@@ -21,6 +21,8 @@
 //! | `PKDEALER_REBUY_AMOUNT`           | 10000             | Default chips granted when `Rebuy.chips == 0`                           |
 //! | `PKDEALER_REBUY_ON_BUST_ENABLED`  | false             | Auto-reload busted seats at hand-end; allow `Rebuy` when `chips == 0`   |
 //! | `PKDEALER_TOPUP_ENABLED`          | false             | Allow `Rebuy` for healthy stacks (between hands only)                   |
+//! | `PKDEALER_BLIND_SCHEDULE_ENABLED` | false             | Escalate blinds every N hands and recycle stacks at the top (demo)      |
+//! | `PKDEALER_HANDS_PER_LEVEL`        | 20                | Hands per blind level when the schedule is enabled                      |
 //!
 //! For the browser spectator UI, run [`pkspectator`](https://github.com/ImperialBower/pkspectator)
 //! as a separate process. It subscribes to this service via gRPC `StreamEvents`.
@@ -37,6 +39,7 @@
 //!   with the spectator token returns all hole cards; with no token returns no hole
 //!   cards.
 
+use pkdealer_service::blind_schedule::blind_update_for;
 use pkdealer_service::otel;
 
 use std::{
@@ -96,6 +99,10 @@ const PLAYER_TOKEN_METADATA_KEY: &str = "x-player-token";
 const DEFAULT_SPECTATOR_TOKEN: &str = "spectator";
 /// Default chip amount granted on a `Rebuy` call when `chips == 0`.
 const DEFAULT_REBUY_AMOUNT: usize = 10_000;
+/// Default number of hands played at each blind level before the schedule
+/// advances. Used when the blind schedule is enabled but
+/// `PKDEALER_HANDS_PER_LEVEL` is unset, unparseable, or zero.
+const DEFAULT_HANDS_PER_LEVEL: usize = 20;
 
 // ── DealerConfig ──────────────────────────────────────────────────────────────
 
@@ -125,6 +132,14 @@ struct DealerConfig {
     /// When true, `Rebuy` is allowed for seats that still have chips
     /// (between hands only; mid-hand top-ups are always rejected).
     topup_enabled: bool,
+    /// When true, the service escalates blinds on a fixed schedule
+    /// (see [`pkdealer_service::blind_schedule`]) and recycles the table at
+    /// the top of the schedule. Off by default; the demos enable it via
+    /// `docker-compose.yml`.
+    blind_schedule_enabled: bool,
+    /// Number of hands played at each blind level before advancing. Only
+    /// consulted when `blind_schedule_enabled` is true.
+    hands_per_level: usize,
 }
 
 impl DealerConfig {
@@ -138,6 +153,8 @@ impl DealerConfig {
                 .unwrap_or(DEFAULT_REBUY_AMOUNT),
             rebuy_on_bust_enabled: parse_env_bool("PKDEALER_REBUY_ON_BUST_ENABLED"),
             topup_enabled: parse_env_bool("PKDEALER_TOPUP_ENABLED"),
+            blind_schedule_enabled: parse_env_bool("PKDEALER_BLIND_SCHEDULE_ENABLED"),
+            hands_per_level: parse_hands_per_level(env::var("PKDEALER_HANDS_PER_LEVEL").ok()),
         }
     }
 }
@@ -148,6 +165,8 @@ impl Default for DealerConfig {
             default_rebuy_amount: DEFAULT_REBUY_AMOUNT,
             rebuy_on_bust_enabled: false,
             topup_enabled: false,
+            blind_schedule_enabled: false,
+            hands_per_level: DEFAULT_HANDS_PER_LEVEL,
         }
     }
 }
@@ -162,6 +181,17 @@ fn parse_env_bool(key: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Parses `PKDEALER_HANDS_PER_LEVEL`-style input into a positive
+/// hands-per-level value. Unset, unparseable, or zero all fall back to
+/// [`DEFAULT_HANDS_PER_LEVEL`] so a typo can't divide the schedule by zero.
+///
+/// Split out from env reading so it can be unit-tested without env races.
+fn parse_hands_per_level(raw: Option<String>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_HANDS_PER_LEVEL)
 }
 
 // ── CardVisibility ────────────────────────────────────────────────────────────
@@ -204,6 +234,10 @@ struct TableState {
     /// Set whenever the auto-advance loop decides the next actor.
     /// Difference against `now` at the top of `act` is `action_duration_ms`.
     last_prompt_at: Option<std::time::Instant>,
+    /// Count of hands that have fully completed (`end_hand` succeeded). Drives
+    /// the blind schedule when `blind_schedule_enabled` is set. Monotonic for
+    /// the life of the process.
+    hands_completed: u64,
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -306,6 +340,7 @@ impl DealerService {
             current_street_span: None,
             hand_started_at: None,
             last_prompt_at: None,
+            hands_completed: 0,
         }));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let meter = opentelemetry::global::meter("pkdealer_service");
@@ -685,6 +720,37 @@ impl DealerService {
     }
 }
 
+/// Caps every occupied seat's stack to `cap`, leaving stacks already at or
+/// below `cap` untouched. Returns `(seat_index, handle, old_chips)` for each
+/// seat that was reduced, so the caller can log/emit the change.
+///
+/// Touches only `chips` (not `withdrawn`), so per-seat profit/loss tracking
+/// stays cumulative across cycles — matching the demo's documented behaviour.
+///
+/// # Examples
+///
+/// ```
+/// # // illustrative — `cap_stacks_to` is private to the service binary.
+/// // A seat with 300_000 chips and a cap of 10_000 ends at 10_000;
+/// // a seat with 1_000 chips is left at 1_000.
+/// ```
+fn cap_stacks_to(session: &mut PokerSession, cap: usize) -> Vec<(u8, String, usize)> {
+    let mut capped = Vec::new();
+    let table = &mut session.table;
+    let size = table.seats.size();
+    for i in 0..size {
+        if let Some(seat) = table.seats.get_seat_mut(i)
+            && !seat.is_empty()
+            && seat.player.chips > cap
+        {
+            let old = seat.player.chips;
+            seat.player.chips = cap;
+            capped.push((i, seat.player.handle.clone(), old));
+        }
+    }
+    capped
+}
+
 /// Computes a player's cumulative profit/loss as a signed `i32`.
 ///
 /// Uses the invariant `profit = chips + chips_in_play - withdrawn` maintained
@@ -1006,6 +1072,34 @@ impl DealerServiceTrait for DealerService {
                     )),
                 }));
             }
+            // Tournament blind schedule (demo-only; off by default). Apply
+            // only when no hand is in progress so a losing multi-agent
+            // start_hand race — which is about to return the benign "already
+            // in progress" error below — cannot cap stacks or change blinds.
+            // set_blinds MUST run before start_hand(): start_hand posts the
+            // forced bets, and once a hand is live set_blinds would defer to
+            // the next hand instead.
+            let mut reset_note: Option<String> = None;
+            if self.config.blind_schedule_enabled && !guard.session.is_hand_in_progress() {
+                let upd = blind_update_for(guard.hands_completed, self.config.hands_per_level);
+                if upd.reset_stacks {
+                    let cap = self.config.default_rebuy_amount;
+                    let capped = cap_stacks_to(&mut guard.session, cap);
+                    reset_note = Some(if capped.is_empty() {
+                        format!("cycle reset, stacks capped to {cap} (none exceeded)")
+                    } else {
+                        let names = capped
+                            .iter()
+                            .map(|(_, h, _)| h.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("cycle reset, stacks capped to {cap}: {names}")
+                    });
+                }
+                guard
+                    .session
+                    .set_blinds(ForcedBets::new(upd.small_blind, upd.big_blind));
+            }
             match guard.session.start_hand() {
                 Ok(()) => {
                     // Open the hand span for the full hand lifecycle.
@@ -1030,11 +1124,22 @@ impl DealerServiceTrait for DealerService {
                         Self::build_table_status(&guard.session, CardVisibility::Spectator);
                     let response_status =
                         Self::filter_cards(event_status.clone(), CardVisibility::Hidden);
-                    let event = (
-                        EventType::HandStarted,
-                        "Hand started".to_owned(),
-                        event_status,
-                    );
+                    let hand_desc = if self.config.blind_schedule_enabled {
+                        let fb = guard.session.table.forced;
+                        match reset_note {
+                            Some(note) => format!(
+                                "Hand started — blinds {}/{} ({note})",
+                                fb.small_blind, fb.big_blind
+                            ),
+                            None => format!(
+                                "Hand started — blinds {}/{}",
+                                fb.small_blind, fb.big_blind
+                            ),
+                        }
+                    } else {
+                        "Hand started".to_owned()
+                    };
+                    let event = (EventType::HandStarted, hand_desc, event_status);
                     (
                         start_hand_response::Result::Status(response_status),
                         Some(event),
@@ -1312,6 +1417,7 @@ impl DealerServiceTrait for DealerService {
                                     );
                                     self.emit_event(EventType::HandEnded, desc, status);
                                     self.metrics.hands_played.add(1, &[]);
+                                    guard.hands_completed += 1;
                                     self.metrics.pot_size.record(final_pot as u64, &[]);
 
                                     // Auto-rebuy any busted seats when the flag is on. Trigger
@@ -1835,6 +1941,33 @@ mod tests {
     use super::*;
     use pkdealer_proto::dealer::PlayerAction;
 
+    #[test]
+    fn parse_hands_per_level_defaults_when_absent() {
+        assert_eq!(parse_hands_per_level(None), DEFAULT_HANDS_PER_LEVEL);
+    }
+
+    #[test]
+    fn parse_hands_per_level_defaults_on_garbage() {
+        assert_eq!(parse_hands_per_level(Some("nope".to_owned())), DEFAULT_HANDS_PER_LEVEL);
+    }
+
+    #[test]
+    fn parse_hands_per_level_defaults_on_zero() {
+        assert_eq!(parse_hands_per_level(Some("0".to_owned())), DEFAULT_HANDS_PER_LEVEL);
+    }
+
+    #[test]
+    fn parse_hands_per_level_accepts_positive() {
+        assert_eq!(parse_hands_per_level(Some("30".to_owned())), 30);
+    }
+
+    #[test]
+    fn dealer_config_default_disables_blind_schedule() {
+        let cfg = DealerConfig::default();
+        assert!(!cfg.blind_schedule_enabled);
+        assert_eq!(cfg.hands_per_level, DEFAULT_HANDS_PER_LEVEL);
+    }
+
     fn make_service() -> DealerService {
         DealerService::new()
     }
@@ -1939,6 +2072,34 @@ mod tests {
             DealerService::format_hand_end(&result),
             "Hand ended. gto wins 400 with Pair"
         );
+    }
+
+    #[test]
+    fn cap_stacks_to_reduces_only_oversized_stacks() {
+        use pkcore::casino::game::ForcedBets;
+        use pkcore::casino::session::PokerSession;
+        use pkcore::casino::table_no_cell::{
+            PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell,
+        };
+
+        let seats = SeatsNoCell::new(vec![
+            SeatNoCell::new(PlayerNoCell::new_with_chips("rich".to_string(), 300_000)),
+            SeatNoCell::new(PlayerNoCell::new_with_chips("poor".to_string(), 1_000)),
+            SeatNoCell::new(PlayerNoCell::new_with_chips("exact".to_string(), 10_000)),
+        ]);
+        let mut session =
+            PokerSession::new(TableNoCell::nlh_from_seats(seats, ForcedBets::new(50, 100)));
+
+        let capped = cap_stacks_to(&mut session, 10_000);
+
+        // Only the 300k stack is reduced.
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].0, 0);
+        assert_eq!(capped[0].1, "rich");
+        assert_eq!(capped[0].2, 300_000);
+        assert_eq!(session.table.seats.get_seat(0).unwrap().player.chips, 10_000);
+        assert_eq!(session.table.seats.get_seat(1).unwrap().player.chips, 1_000);
+        assert_eq!(session.table.seats.get_seat(2).unwrap().player.chips, 10_000);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -3306,6 +3467,7 @@ mod tests {
             default_rebuy_amount: 5_000,
             rebuy_on_bust_enabled: true,
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (&seat, token) = tokens.iter().next().expect("token");
@@ -3340,6 +3502,7 @@ mod tests {
             default_rebuy_amount: 5_000,
             rebuy_on_bust_enabled: true,
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (&seat, token) = tokens.iter().next().expect("token");
@@ -3364,6 +3527,7 @@ mod tests {
             default_rebuy_amount: 5_000,
             rebuy_on_bust_enabled: true, // bust flag on, topup flag off
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (_, token) = tokens.iter().next().expect("token");
@@ -3385,6 +3549,7 @@ mod tests {
             default_rebuy_amount: 500,
             rebuy_on_bust_enabled: false,
             topup_enabled: true,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (&seat, token) = tokens.iter().next().expect("token");
@@ -3412,6 +3577,7 @@ mod tests {
             default_rebuy_amount: 500,
             rebuy_on_bust_enabled: false,
             topup_enabled: true,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (_, token) = tokens.iter().next().expect("token");
@@ -3440,6 +3606,7 @@ mod tests {
             default_rebuy_amount: 500,
             rebuy_on_bust_enabled: true,
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (&seat, token) = tokens.iter().next().expect("token");
@@ -3469,6 +3636,7 @@ mod tests {
             default_rebuy_amount: 500,
             rebuy_on_bust_enabled: true,
             topup_enabled: true,
+            ..DealerConfig::default()
         });
         let _ = seat_two_players(&service).await?;
         let result = service.rebuy(Request::new(RebuyRequest { chips: 0 })).await;
@@ -3491,6 +3659,7 @@ mod tests {
             default_rebuy_amount: 999,
             rebuy_on_bust_enabled: false,
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens_off = seat_two_players(&service_off).await?;
         let busted_off = *tokens_off.keys().next().expect("seat");
@@ -3509,6 +3678,7 @@ mod tests {
             default_rebuy_amount: 999,
             rebuy_on_bust_enabled: true,
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens_on = seat_two_players(&service_on).await?;
         let busted_on = *tokens_on.keys().next().expect("seat");
@@ -3585,6 +3755,7 @@ mod tests {
             default_rebuy_amount: 777,
             rebuy_on_bust_enabled: true,
             topup_enabled: true,
+            ..DealerConfig::default()
         });
         let resp = service
             .get_table_config(Request::new(GetTableConfigRequest {}))
@@ -3594,6 +3765,36 @@ mod tests {
         assert_eq!(777, cfg.default_rebuy_amount);
         assert!(cfg.rebuy_on_bust_enabled);
         assert!(cfg.topup_enabled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_hand_escalates_blinds_when_schedule_enabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Build the service with the blind schedule enabled, 20 hands/level.
+        let config = DealerConfig {
+            blind_schedule_enabled: true,
+            hands_per_level: 20,
+            ..DealerConfig::default()
+        };
+        let service = DealerService::new_with_config(config);
+
+        // Seat two funded players (mirrors the existing start_hand tests).
+        seat_two_players(&service).await?;
+
+        // Pretend 20 hands already completed → upcoming hand is level 1 (100/200).
+        {
+            let mut guard = service.lock().expect("lock");
+            guard.hands_completed = 20;
+        }
+
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let guard = service.lock().expect("lock");
+        assert_eq!(guard.session.table.forced.small_blind, 100);
+        assert_eq!(guard.session.table.forced.big_blind, 200);
         Ok(())
     }
 }
