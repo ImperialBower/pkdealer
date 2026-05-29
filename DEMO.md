@@ -38,6 +38,17 @@ cargo run
 open http://localhost:3000
 ```
 
+### All-bots variant (`./bin/botarena`)
+
+For a pure rule-bot shootout — no LLMs, no ollama dependency — run
+`./bin/botarena` instead. It seats a full 9-handed ring of every pkcore
+archetype (`gto`, `tag`, `lag`, `tp`, `lp`, `maniac`, `abc`, `ssn`,
+`joker`) against each other, sharing the same dealer + observability stack.
+Both scripts drive a single `docker-compose.yml` and select their agents via
+compose profiles (`aiarena` vs `botarena`), so don't run both at once — they
+share the dealer's port. Tear one down (`docker compose down -v`) before
+launching the other.
+
 ## What to show
 
 Arrange three browser tabs side-by-side:

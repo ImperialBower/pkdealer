@@ -25,7 +25,10 @@ EOF
 fi
 
 echo "Starting pkdealer demo stack..."
-docker compose up -d --build
+# The "aiarena" compose profile selects the 6 mixed players (3 bots + 3 LLMs).
+# Infra services carry no profile and start regardless. See ./bin/botarena for
+# the all-bots variant.
+docker compose --profile aiarena up -d --build
 
 echo ""
 echo "Waiting for dealer service to accept connections on :50051..."
