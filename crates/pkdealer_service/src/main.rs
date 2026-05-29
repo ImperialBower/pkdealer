@@ -1192,11 +1192,20 @@ impl DealerServiceTrait for DealerService {
                     i64::try_from(guard.session.table.pot).unwrap_or(i64::MAX),
                 );
 
-                // Emit PlayerAction event for the triggering action.
+                // Emit PlayerAction event for the triggering action. Include the
+                // acting player's name (looked up from the snapshot we just
+                // built) so log lines read "Seat 2 gto: Call" rather than bare
+                // "Seat 2: Call". Falls back to no name if the seat is unnamed.
                 let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                let actor = status
+                    .seats
+                    .iter()
+                    .find(|s| s.seat_number == u32::from(seat))
+                    .filter(|s| !s.player_name.is_empty())
+                    .map_or_else(String::new, |s| format!(" {}", s.player_name));
                 self.emit_event(
                     EventType::PlayerAction,
-                    format!("Seat {seat}: {action_type:?}"),
+                    format!("Seat {seat}{actor}: {action_type:?}"),
                     status,
                 );
 
