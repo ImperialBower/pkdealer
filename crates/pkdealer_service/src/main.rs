@@ -548,6 +548,33 @@ impl DealerService {
         }
     }
 
+    /// Formats the human-readable `HandEnded` description from a [`HandResult`],
+    /// naming each winner, the amount won, and (at showdown) the winning hand —
+    /// e.g. `"Hand ended. gto wins 1500 with FullHouse"`, or on a split pot
+    /// `"Hand ended. gto wins 750, lag wins 750"`. Fold wins omit the hand.
+    fn format_hand_end(result: &HandResult) -> String {
+        if result.winners.is_empty() {
+            return "Hand ended.".to_owned();
+        }
+        let parts: Vec<String> = result
+            .winners
+            .iter()
+            .map(|w| {
+                let who = if w.player_name.is_empty() {
+                    format!("Seat {}", w.seat)
+                } else {
+                    w.player_name.clone()
+                };
+                if w.hand_description.is_empty() {
+                    format!("{who} wins {}", w.amount_won)
+                } else {
+                    format!("{who} wins {} with {}", w.amount_won, w.hand_description)
+                }
+            })
+            .collect();
+        format!("Hand ended. {}", parts.join(", "))
+    }
+
     /// Returns the current UTC timestamp in milliseconds since the Unix epoch.
     fn now_unix_ms() -> u64 {
         SystemTime::now()
@@ -1265,18 +1292,17 @@ impl DealerServiceTrait for DealerService {
                             match guard.session.end_hand() {
                                 Ok(winnings) => {
                                     hand_complete = true;
-                                    hand_result =
-                                        Some(Self::build_hand_result(&guard.session, &winnings));
-                                    let desc = winnings.to_string();
+                                    let result = Self::build_hand_result(&guard.session, &winnings);
+                                    // Describe the result by winner name(s) rather
+                                    // than the raw seat/chip `Winnings` dump, so the
+                                    // event log reads "Hand ended. gto wins 1500…".
+                                    let desc = Self::format_hand_end(&result);
+                                    hand_result = Some(result);
                                     let status = Self::build_table_status(
                                         &guard.session,
                                         CardVisibility::Spectator,
                                     );
-                                    self.emit_event(
-                                        EventType::HandEnded,
-                                        format!("Hand ended. {desc}"),
-                                        status,
-                                    );
+                                    self.emit_event(EventType::HandEnded, desc, status);
                                     self.metrics.hands_played.add(1, &[]);
                                     self.metrics.pot_size.record(final_pot as u64, &[]);
 
@@ -1803,6 +1829,82 @@ mod tests {
 
     fn make_service() -> DealerService {
         DealerService::new()
+    }
+
+    #[test]
+    fn format_hand_end_names_single_showdown_winner() {
+        let result = HandResult {
+            winners: vec![WinnerInfo {
+                seat: 2,
+                player_name: "gto".to_owned(),
+                amount_won: 1_500,
+                hand_description: "FullHouse".to_owned(),
+            }],
+            final_chips: Vec::new(),
+        };
+        assert_eq!(
+            DealerService::format_hand_end(&result),
+            "Hand ended. gto wins 1500 with FullHouse"
+        );
+    }
+
+    #[test]
+    fn format_hand_end_fold_win_omits_hand() {
+        let result = HandResult {
+            winners: vec![WinnerInfo {
+                seat: 0,
+                player_name: "lag".to_owned(),
+                amount_won: 300,
+                hand_description: String::new(),
+            }],
+            final_chips: Vec::new(),
+        };
+        assert_eq!(
+            DealerService::format_hand_end(&result),
+            "Hand ended. lag wins 300"
+        );
+    }
+
+    #[test]
+    fn format_hand_end_split_pot_lists_each_winner() {
+        let result = HandResult {
+            winners: vec![
+                WinnerInfo {
+                    seat: 1,
+                    player_name: "gto".to_owned(),
+                    amount_won: 750,
+                    hand_description: "Flush".to_owned(),
+                },
+                WinnerInfo {
+                    seat: 4,
+                    player_name: "tag".to_owned(),
+                    amount_won: 750,
+                    hand_description: "Flush".to_owned(),
+                },
+            ],
+            final_chips: Vec::new(),
+        };
+        assert_eq!(
+            DealerService::format_hand_end(&result),
+            "Hand ended. gto wins 750 with Flush, tag wins 750 with Flush"
+        );
+    }
+
+    #[test]
+    fn format_hand_end_unnamed_seat_falls_back_to_seat_number() {
+        let result = HandResult {
+            winners: vec![WinnerInfo {
+                seat: 5,
+                player_name: String::new(),
+                amount_won: 200,
+                hand_description: String::new(),
+            }],
+            final_chips: Vec::new(),
+        };
+        assert_eq!(
+            DealerService::format_hand_end(&result),
+            "Hand ended. Seat 5 wins 200"
+        );
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
