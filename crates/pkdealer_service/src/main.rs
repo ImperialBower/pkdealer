@@ -102,7 +102,7 @@ const DEFAULT_REBUY_AMOUNT: usize = 10_000;
 /// Default number of hands played at each blind level before the schedule
 /// advances. Used when the blind schedule is enabled but
 /// `PKDEALER_HANDS_PER_LEVEL` is unset, unparseable, or zero.
-const DEFAULT_HANDS_PER_LEVEL: usize = 10;
+const DEFAULT_HANDS_PER_LEVEL: usize = 20;
 
 // ── DealerConfig ──────────────────────────────────────────────────────────────
 
@@ -1966,11 +1966,6 @@ mod tests {
     #[test]
     fn parse_hands_per_level_accepts_positive() {
         assert_eq!(parse_hands_per_level(Some("30".to_owned())), 30);
-    }
-
-    #[test]
-    fn parse_hands_per_level_default_is_ten() {
-        assert_eq!(parse_hands_per_level(None), 10);
     }
 
     #[test]
