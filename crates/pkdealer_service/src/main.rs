@@ -3113,8 +3113,8 @@ mod tests {
     /// the blinds rotate around the table. Regression guard for the arenas,
     /// where a frozen button pinned the SB/BB to the same two seats forever.
     #[tokio::test]
-    async fn dealer_service_button_rotates_between_hands()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn dealer_service_button_rotates_between_hands() -> Result<(), Box<dyn std::error::Error>>
+    {
         let service = make_service();
         let tokens = seat_two_players(&service).await?;
 
