@@ -219,6 +219,10 @@ message TableStatus {
   bool              hand_in_progress = 5;
   bool              game_over        = 6;
   Street            current_street   = 7;
+  // Live forced-bet blinds for the current/next hand. Tracks blind-schedule
+  // escalation so spectators see the real stakes, not a once-fetched config.
+  uint32            small_blind      = 8;
+  uint32            big_blind        = 9;
 }
 
 message SeatInfo {
