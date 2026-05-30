@@ -87,6 +87,7 @@ enum EventType {
   EVENT_TYPE_STREET_ADVANCED = 5;
   EVENT_TYPE_HAND_ENDED = 6;
   EVENT_TYPE_PLAYER_REBOUGHT = 7;
+  EVENT_TYPE_ROUND_ENDED = 8;
 }
 
 // Represents the player's action state within the current betting round.
@@ -229,6 +230,7 @@ message TableStatus {
   uint32            button_seat      = 10;
   uint32            small_blind_seat = 11;
   uint32            big_blind_seat   = 12;
+  uint32            round_number     = 13;
 }
 
 message SeatInfo {

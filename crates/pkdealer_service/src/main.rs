@@ -140,6 +140,11 @@ struct DealerConfig {
     /// Number of hands played at each blind level before advancing. Only
     /// consulted when `blind_schedule_enabled` is true.
     hands_per_level: usize,
+    /// When true, no automatic rebuys occur. Instead, after each hand the
+    /// service checks whether only one seated player still has chips. If so,
+    /// all players are reset to `default_rebuy_amount` and the blind counter
+    /// is reset to level 0, starting a new round. Off by default.
+    round_reset_enabled: bool,
 }
 
 impl DealerConfig {
@@ -155,6 +160,7 @@ impl DealerConfig {
             topup_enabled: parse_env_bool("PKDEALER_TOPUP_ENABLED"),
             blind_schedule_enabled: parse_env_bool("PKDEALER_BLIND_SCHEDULE_ENABLED"),
             hands_per_level: parse_hands_per_level(env::var("PKDEALER_HANDS_PER_LEVEL").ok()),
+            round_reset_enabled: parse_env_bool("PKDEALER_ROUND_RESET_ENABLED"),
         }
     }
 }
@@ -167,6 +173,7 @@ impl Default for DealerConfig {
             topup_enabled: false,
             blind_schedule_enabled: false,
             hands_per_level: DEFAULT_HANDS_PER_LEVEL,
+            round_reset_enabled: false,
         }
     }
 }
@@ -244,6 +251,10 @@ struct TableState {
     /// cumulative profit/loss zero-sum across cycles. A seat's entry is cleared
     /// when the seat is vacated so a later occupant starts clean.
     banked_profit: std::collections::HashMap<u8, i64>,
+    /// Monotonically increasing count of completed rounds. Starts at 1 (the
+    /// first round begins at 1 and increments to 2 after the first reset).
+    /// Only advances when `round_reset_enabled` triggers a round reset.
+    round_number: u64,
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -348,6 +359,7 @@ impl DealerService {
             last_prompt_at: None,
             hands_completed: 0,
             banked_profit: std::collections::HashMap::new(),
+            round_number: 1,
         }));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let meter = opentelemetry::global::meter("pkdealer_service");
@@ -381,6 +393,7 @@ impl DealerService {
         session: &PokerSession,
         banked: &std::collections::HashMap<u8, i64>,
         visibility: CardVisibility,
+        round_number: u64,
     ) -> TableStatus {
         let table = &session.table;
         let mut seats = Vec::new();
@@ -424,6 +437,7 @@ impl DealerService {
             button_seat: u32::from(table.button),
             small_blind_seat: u32::from(table.determine_small_blind()),
             big_blind_seat: u32::from(table.determine_big_blind()),
+            round_number: round_number as u32,
         }
     }
 
@@ -515,6 +529,7 @@ impl DealerService {
             &state.session,
             &state.banked_profit,
             CardVisibility::Spectator,
+            state.round_number,
         );
         let event = (
             EventType::PlayerSeated,
@@ -689,6 +704,7 @@ impl DealerService {
             &state.session,
             &state.banked_profit,
             CardVisibility::Spectator,
+            state.round_number,
         );
         for (seat_idx, handle, new_total) in reloaded {
             events.push((
@@ -699,6 +715,86 @@ impl DealerService {
             labels.push(seat_idx);
         }
         (events, labels)
+    }
+
+    /// Checks whether only one seated player still holds chips (round over). If
+    /// so, resets every player to the configured starting amount, zeroes the
+    /// blind counter so level 0 (50/100) takes effect on the next
+    /// `start_hand`, and increments the round number.
+    ///
+    /// Returns a `(EventType, description, TableStatus)` tuple for the caller
+    /// to emit as a `RoundEnded` event, or `None` when two or more players
+    /// still have chips and the round is live.
+    ///
+    /// # P&L invariant
+    ///
+    /// The winner's excess over `round_size` is passed through [`bank_caps`] so
+    /// [`compute_profit_loss`] credits it back — keeping cumulative P&L
+    /// zero-sum across rounds. Bust players get [`PlayerNoCell::reload`] which
+    /// increments `withdrawn`, preserving their running loss.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Illustrative — `run_round_reset` is private to the service binary.
+    /// // After 3 of 4 players bust, the sole remaining player with chips
+    /// // triggers a round reset: everyone returns to 10 000 and
+    /// // `hands_completed` resets to 0.
+    /// ```
+    fn run_round_reset(
+        &self,
+        state: &mut TableState,
+    ) -> Option<(EventType, String, TableStatus)> {
+        let round_size = self.config.default_rebuy_amount;
+        let table = &state.session.table;
+        let funded: Vec<(u8, String)> = (0..table.seats.size())
+            .filter_map(|i| {
+                table.seats.get_seat(i).filter(|s| !s.is_empty() && s.player.chips > 0)
+                    .map(|s| (i, s.player.handle.clone()))
+            })
+            .collect();
+
+        if funded.len() >= 2 {
+            return None;
+        }
+
+        let winner_desc = funded
+            .first()
+            .map(|(seat, name)| format!("Seat {seat} ({name})"))
+            .unwrap_or_else(|| "nobody".to_owned());
+
+        // Cap the winner's stack to round_size, banking the excess for P&L.
+        let capped = cap_stacks_to(&mut state.session, round_size);
+        bank_caps(&mut state.banked_profit, &capped, round_size);
+
+        // Reload all bust players (chips == 0) so they re-enter next round.
+        {
+            let table = &mut state.session.table;
+            for i in 0..table.seats.size() {
+                if let Some(seat) = table.seats.get_seat_mut(i)
+                    && !seat.is_empty()
+                    && seat.player.chips == 0
+                {
+                    seat.player.reload(round_size);
+                }
+            }
+        }
+
+        // Reset the blind counter so level 0 (50/100) resumes next hand.
+        state.hands_completed = 0;
+        state.round_number += 1;
+
+        let completed = state.round_number - 1;
+        let desc = format!(
+            "Round {completed} ended. {winner_desc} wins. All players reset to {round_size}."
+        );
+        let status = Self::build_table_status(
+            &state.session,
+            &state.banked_profit,
+            CardVisibility::Spectator,
+            state.round_number,
+        );
+        Some((EventType::RoundEnded, desc, status))
     }
 
     /// Constructs and enqueues a [`TableEvent`] on the broadcast channel.
@@ -924,6 +1020,7 @@ impl DealerServiceTrait for DealerService {
                             &guard.session,
                             &guard.banked_profit,
                             CardVisibility::Spectator,
+                            guard.round_number,
                         );
                         let event = (
                             EventType::PlayerSeated,
@@ -1088,6 +1185,7 @@ impl DealerServiceTrait for DealerService {
                 &guard.session,
                 &guard.banked_profit,
                 CardVisibility::Spectator,
+                guard.round_number,
             );
             let event = (
                 EventType::PlayerRemoved,
@@ -1185,6 +1283,7 @@ impl DealerServiceTrait for DealerService {
                         &guard.session,
                         &guard.banked_profit,
                         CardVisibility::Spectator,
+                        guard.round_number,
                     );
                     let response_status =
                         Self::filter_cards(event_status.clone(), CardVisibility::Hidden);
@@ -1403,6 +1502,7 @@ impl DealerServiceTrait for DealerService {
                     &guard.session,
                     &guard.banked_profit,
                     CardVisibility::Spectator,
+                    guard.round_number,
                 );
                 let actor = status
                     .seats
@@ -1455,6 +1555,7 @@ impl DealerServiceTrait for DealerService {
                                 &guard.session,
                                 &guard.banked_profit,
                                 CardVisibility::Spectator,
+                                guard.round_number,
                             );
                             self.emit_event(
                                 EventType::StreetAdvanced,
@@ -1495,22 +1596,34 @@ impl DealerServiceTrait for DealerService {
                                         &guard.session,
                                         &guard.banked_profit,
                                         CardVisibility::Spectator,
+                                        guard.round_number,
                                     );
                                     self.emit_event(EventType::HandEnded, desc, status);
                                     self.metrics.hands_played.add(1, &[]);
                                     guard.hands_completed += 1;
                                     self.metrics.pot_size.record(final_pot as u64, &[]);
 
-                                    // Auto-rebuy any busted seats when the flag is on. Trigger
-                                    // condition is `chips == 0` on an occupied seat (NOT
-                                    // PlayerState::Out, which pkcore only sets on empty seats —
-                                    // end_hand has already reset state to YetToAct here).
+                                    // In round-reset mode, check whether one player now
+                                    // holds all the chips (round over). Otherwise, fall
+                                    // through to the normal auto-rebuy path.
+                                    // NOTE: `chips == 0` check is against post-end_hand
+                                    // state where pkcore has already set all states to
+                                    // YetToAct, so chips is the only reliable signal.
+                                    let round_reset_event = if self.config.round_reset_enabled {
+                                        self.run_round_reset(&mut guard)
+                                    } else {
+                                        None
+                                    };
                                     let (rebuy_events, rebuy_labels) =
-                                        self.run_auto_rebuy(&mut guard);
+                                        if !self.config.round_reset_enabled {
+                                            self.run_auto_rebuy(&mut guard)
+                                        } else {
+                                            (Vec::new(), Vec::new())
+                                        };
 
                                     // Record per-seat cumulative profit/loss gauge for every
-                                    // occupied seat (uses post-rebuy state, which is invariant
-                                    // under reload anyway).
+                                    // occupied seat (uses post-reset/rebuy state, which is
+                                    // invariant under reload anyway).
                                     {
                                         let table = &guard.session.table;
                                         for i in 0..table.seats.size() {
@@ -1539,8 +1652,11 @@ impl DealerServiceTrait for DealerService {
                                         }
                                     }
 
-                                    // Emit any auto-rebuy events + counters now (still under the
-                                    // lock — `emit_event` and metric recording are non-blocking).
+                                    // Emit round-end event (round-reset mode) or auto-rebuy
+                                    // events (standard mode), then their respective metrics.
+                                    if let Some((et, desc, status)) = round_reset_event {
+                                        self.emit_event(et, desc, status);
+                                    }
                                     for (et, desc, status) in rebuy_events {
                                         self.emit_event(et, desc, status);
                                     }
@@ -1608,7 +1724,7 @@ impl DealerServiceTrait for DealerService {
     ) -> Result<Response<GetStatusResponse>, Status> {
         let guard = self.lock()?;
         let visibility = Self::card_visibility_from_metadata(request.metadata(), &guard);
-        let status = Self::build_table_status(&guard.session, &guard.banked_profit, visibility);
+        let status = Self::build_table_status(&guard.session, &guard.banked_profit, visibility, guard.round_number);
         Ok(Response::new(GetStatusResponse {
             status: Some(status),
         }))
@@ -1832,6 +1948,7 @@ impl DealerServiceTrait for DealerService {
                 &guard.session,
                 &guard.banked_profit,
                 CardVisibility::Spectator,
+                guard.round_number,
             );
             let info = RebuyInfo {
                 seat: u32::from(seat_idx),
@@ -3879,6 +3996,131 @@ mod tests {
         assert_eq!(999, chips_on, "flag-on busted seat reloaded to default");
         // Initial withdrawn = 1_000 (buy-in); after auto-reload of 999, == 1_999.
         assert_eq!(1_999, withdrawn_on);
+        Ok(())
+    }
+
+    /// `run_round_reset` returns `None` when two or more players still hold chips
+    /// (round is still live).
+    #[tokio::test]
+    async fn round_reset_returns_none_when_multiple_players_funded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig {
+            round_reset_enabled: true,
+            ..DealerConfig::default()
+        });
+        let _ = seat_two_players(&service).await?;
+        // Both players retain their default 1 000 chips — nobody busted.
+        let result = {
+            let mut guard = service.lock().expect("lock");
+            service.run_round_reset(&mut guard)
+        };
+        assert!(result.is_none(), "round should still be live");
+        Ok(())
+    }
+
+    /// When only one player has chips, `run_round_reset` resets every seat to
+    /// `default_rebuy_amount`, zeroes the blind counter, and increments
+    /// `round_number`.
+    #[tokio::test]
+    async fn round_reset_fires_when_one_player_has_all_chips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ROUND_SIZE: usize = 1_000;
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: ROUND_SIZE,
+            round_reset_enabled: true,
+            ..DealerConfig::default()
+        });
+        let tokens = seat_two_players(&service).await?;
+        let seats: Vec<u8> = tokens.keys().copied().collect();
+        let (winner_seat, loser_seat) = (seats[0], seats[1]);
+
+        // Simulate winner holding all chips; loser is busted.
+        {
+            let mut guard = service.lock().expect("lock");
+            if let Some(s) = guard.session.table.seats.get_seat_mut(winner_seat) {
+                s.player.chips = 2_000; // both players' chips combined
+            }
+            if let Some(s) = guard.session.table.seats.get_seat_mut(loser_seat) {
+                s.player.chips = 0;
+            }
+            guard.hands_completed = 42;
+        }
+
+        let result = {
+            let mut guard = service.lock().expect("lock");
+            service.run_round_reset(&mut guard)
+        };
+        assert!(result.is_some(), "expected RoundEnded event");
+        let (et, desc, _status) = result.unwrap();
+        assert_eq!(et, EventType::RoundEnded);
+        assert!(desc.contains("Round 1 ended"), "description should name completed round: {desc}");
+        assert!(desc.contains(&ROUND_SIZE.to_string()), "description should name reset amount: {desc}");
+
+        // All seats reset to ROUND_SIZE.
+        let (winner_chips, _) = read_chip_state(&service, winner_seat);
+        let (loser_chips, _) = read_chip_state(&service, loser_seat);
+        assert_eq!(ROUND_SIZE, winner_chips, "winner capped to round_size");
+        assert_eq!(ROUND_SIZE, loser_chips, "loser reloaded to round_size");
+
+        // Blind counter reset; round number advanced.
+        {
+            let guard = service.lock().expect("lock");
+            assert_eq!(0, guard.hands_completed, "blind counter must reset to 0");
+            assert_eq!(2, guard.round_number, "round_number must advance to 2");
+        }
+        Ok(())
+    }
+
+    /// P&L is zero-sum across a round reset: the winner's excess is banked and
+    /// the loser's running loss is preserved.
+    ///
+    /// `seat_two_players` buys in at 1 000 chips each. With `default_rebuy_amount`
+    /// also set to 1 000, the winner ends up with 2 000 (both stacks) and the
+    /// loser with 0, so a round reset rebalances everyone back to 1 000.
+    #[tokio::test]
+    async fn round_reset_pl_invariant_zero_sum()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ROUND_SIZE: usize = 1_000; // matches seat_two_players buy-in
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: ROUND_SIZE,
+            round_reset_enabled: true,
+            ..DealerConfig::default()
+        });
+        let tokens = seat_two_players(&service).await?;
+        let seats: Vec<u8> = tokens.keys().copied().collect();
+        let (winner_seat, loser_seat) = (seats[0], seats[1]);
+
+        // Winner holds both stacks (2 000); loser busted.
+        {
+            let mut guard = service.lock().expect("lock");
+            if let Some(s) = guard.session.table.seats.get_seat_mut(winner_seat) {
+                s.player.chips = 2 * ROUND_SIZE;
+            }
+            if let Some(s) = guard.session.table.seats.get_seat_mut(loser_seat) {
+                s.player.chips = 0;
+            }
+        }
+
+        {
+            let mut guard = service.lock().expect("lock");
+            let _ = service.run_round_reset(&mut guard);
+        }
+
+        // Compute post-reset P&L for both seats.
+        let total_pl: i64 = {
+            let guard = service.lock().expect("lock");
+            let mut sum = 0i64;
+            for i in 0..guard.session.table.seats.size() {
+                if let Some(s) = guard.session.table.seats.get_seat(i)
+                    && !s.is_empty()
+                {
+                    let banked = guard.banked_profit.get(&i).copied().unwrap_or(0);
+                    sum += i64::from(compute_profit_loss(&s.player, banked));
+                }
+            }
+            sum
+        };
+        assert_eq!(0, total_pl, "P&L must be zero-sum after round reset");
         Ok(())
     }
 
