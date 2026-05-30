@@ -27,7 +27,8 @@
       "Bash(cargo run *)",
       "Bash(cargo fmt *)",
       "Bash(echo \"exit=$?\")",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(cd *)"
     ]
   }
 }
