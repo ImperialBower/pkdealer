@@ -123,6 +123,7 @@ const DEFAULT_HANDS_PER_LEVEL: usize = 20;
 /// assert_eq!(500, cfg.default_rebuy_amount);
 /// ```
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct DealerConfig {
     /// Fallback chip amount used when a `Rebuy` request specifies `chips == 0`.
     default_rebuy_amount: usize,
@@ -741,15 +742,15 @@ impl DealerService {
     /// // triggers a round reset: everyone returns to 10 000 and
     /// // `hands_completed` resets to 0.
     /// ```
-    fn run_round_reset(
-        &self,
-        state: &mut TableState,
-    ) -> Option<(EventType, String, TableStatus)> {
+    fn run_round_reset(&self, state: &mut TableState) -> Option<(EventType, String, TableStatus)> {
         let round_size = self.config.default_rebuy_amount;
         let table = &state.session.table;
         let funded: Vec<(u8, String)> = (0..table.seats.size())
             .filter_map(|i| {
-                table.seats.get_seat(i).filter(|s| !s.is_empty() && s.player.chips > 0)
+                table
+                    .seats
+                    .get_seat(i)
+                    .filter(|s| !s.is_empty() && s.player.chips > 0)
                     .map(|s| (i, s.player.handle.clone()))
             })
             .collect();
@@ -758,10 +759,10 @@ impl DealerService {
             return None;
         }
 
-        let winner_desc = funded
-            .first()
-            .map(|(seat, name)| format!("Seat {seat} ({name})"))
-            .unwrap_or_else(|| "nobody".to_owned());
+        let winner_desc = funded.first().map_or_else(
+            || "nobody".to_owned(),
+            |(seat, name)| format!("Seat {seat} ({name})"),
+        );
 
         // Cap the winner's stack to round_size, banking the excess for P&L.
         let capped = cap_stacks_to(&mut state.session, round_size);
@@ -1615,10 +1616,10 @@ impl DealerServiceTrait for DealerService {
                                         None
                                     };
                                     let (rebuy_events, rebuy_labels) =
-                                        if !self.config.round_reset_enabled {
-                                            self.run_auto_rebuy(&mut guard)
-                                        } else {
+                                        if self.config.round_reset_enabled {
                                             (Vec::new(), Vec::new())
+                                        } else {
+                                            self.run_auto_rebuy(&mut guard)
                                         };
 
                                     // Record per-seat cumulative profit/loss gauge for every
@@ -1724,7 +1725,12 @@ impl DealerServiceTrait for DealerService {
     ) -> Result<Response<GetStatusResponse>, Status> {
         let guard = self.lock()?;
         let visibility = Self::card_visibility_from_metadata(request.metadata(), &guard);
-        let status = Self::build_table_status(&guard.session, &guard.banked_profit, visibility, guard.round_number);
+        let status = Self::build_table_status(
+            &guard.session,
+            &guard.banked_profit,
+            visibility,
+            guard.round_number,
+        );
         Ok(Response::new(GetStatusResponse {
             status: Some(status),
         }))
@@ -4053,8 +4059,14 @@ mod tests {
         assert!(result.is_some(), "expected RoundEnded event");
         let (et, desc, _status) = result.unwrap();
         assert_eq!(et, EventType::RoundEnded);
-        assert!(desc.contains("Round 1 ended"), "description should name completed round: {desc}");
-        assert!(desc.contains(&ROUND_SIZE.to_string()), "description should name reset amount: {desc}");
+        assert!(
+            desc.contains("Round 1 ended"),
+            "description should name completed round: {desc}"
+        );
+        assert!(
+            desc.contains(&ROUND_SIZE.to_string()),
+            "description should name reset amount: {desc}"
+        );
 
         // All seats reset to ROUND_SIZE.
         let (winner_chips, _) = read_chip_state(&service, winner_seat);
@@ -4078,8 +4090,7 @@ mod tests {
     /// also set to 1 000, the winner ends up with 2 000 (both stacks) and the
     /// loser with 0, so a round reset rebalances everyone back to 1 000.
     #[tokio::test]
-    async fn round_reset_pl_invariant_zero_sum()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn round_reset_pl_invariant_zero_sum() -> Result<(), Box<dyn std::error::Error>> {
         const ROUND_SIZE: usize = 1_000; // matches seat_two_players buy-in
         let service = make_service_with_config(DealerConfig {
             default_rebuy_amount: ROUND_SIZE,
