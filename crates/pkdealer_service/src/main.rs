@@ -421,6 +421,9 @@ impl DealerService {
             current_street: Self::map_game_phase_to_street(table) as i32,
             small_blind: table.forced.small_blind as u32,
             big_blind: table.forced.big_blind as u32,
+            button_seat: u32::from(table.button),
+            small_blind_seat: u32::from(table.determine_small_blind()),
+            big_blind_seat: u32::from(table.determine_big_blind()),
         }
     }
 

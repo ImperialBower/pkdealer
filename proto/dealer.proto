@@ -223,6 +223,12 @@ message TableStatus {
   // escalation so spectators see the real stakes, not a once-fetched config.
   uint32            small_blind      = 8;
   uint32            big_blind        = 9;
+  // Button and blind seat numbers for position-tag display (BTN/SB/BB).
+  // Populated so remote spectators can render position labels without
+  // re-implementing the heads-up vs. full-ring blind-assignment rules.
+  uint32            button_seat      = 10;
+  uint32            small_blind_seat = 11;
+  uint32            big_blind_seat   = 12;
 }
 
 message SeatInfo {
