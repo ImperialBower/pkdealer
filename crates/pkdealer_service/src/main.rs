@@ -1472,6 +1472,16 @@ impl DealerServiceTrait for DealerService {
                             match guard.session.end_hand() {
                                 Ok(winnings) => {
                                     hand_complete = true;
+                                    // Rotate the dealer button so the blinds move
+                                    // around the table next hand. `end_hand` runs
+                                    // exactly once per hand under this lock, so this
+                                    // is the race-safe place to advance it (unlike
+                                    // `start_hand`, which many agents call but only
+                                    // one wins). `determine_small_blind`/`big_blind`
+                                    // derive the SB/BB seats from `table.button`;
+                                    // without this the button — and therefore the
+                                    // blinds — stay pinned to the same seats forever.
+                                    guard.session.table.button_up();
                                     let result = Self::build_hand_result(&guard.session, &winnings);
                                     // Describe the result by winner name(s) rather
                                     // than the raw seat/chip `Winnings` dump, so the
@@ -3093,6 +3103,42 @@ mod tests {
             .map(|p| p.chips)
             .sum();
         assert_eq!(total, 2_000, "chips must be conserved after auto-payout");
+        Ok(())
+    }
+
+    /// The dealer button must advance one seat after every completed hand so
+    /// the blinds rotate around the table. Regression guard for the arenas,
+    /// where a frozen button pinned the SB/BB to the same two seats forever.
+    #[tokio::test]
+    async fn dealer_service_button_rotates_between_hands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+
+        let button_before = {
+            let guard = service.lock().expect("lock");
+            guard.session.table.button
+        };
+
+        // Hand 1: start, fold to end it (act auto-calls end_hand).
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        fold_next_to_act(&service, &tokens).await?;
+
+        // Hand 2: start the next hand.
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        let button_after = {
+            let guard = service.lock().expect("lock");
+            guard.session.table.button
+        };
+
+        assert_ne!(
+            button_before, button_after,
+            "button must advance after a completed hand (was {button_before}, still {button_after})"
+        );
         Ok(())
     }
 
