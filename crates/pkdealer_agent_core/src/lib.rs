@@ -10,6 +10,19 @@
 //! - [`AgentConfig`] — connection and seat parameters
 //! - [`run_agent`] — connects, seats, and drives the event loop for any agent
 //!
+//! # Pacing
+//!
+//! [`run_agent`] paces the table so a spectator can follow play. Two pauses,
+//! both read once at startup and applied by every agent built on this crate:
+//!
+//! | Variable | Default | Effect |
+//! |----------|---------|--------|
+//! | `PKDEALER_ACTION_DELAY_SECS`   | `1` | Pause before this seat submits each action. Only the acting agent waits, so it spaces consecutive actions across the table. Set `0` to disable. |
+//! | `PKDEALER_HAND_END_DELAY_SECS` | `5` | Pause after every hand ends — showdown or fold-win alike — before the next hand starts, so viewers can see how it resolved. Set `0` to disable. |
+//!
+//! Values are (possibly fractional) seconds; an unparseable, negative, or
+//! non-finite value falls back to the default.
+//!
 //! # Quick start
 //!
 //! ```rust,no_run

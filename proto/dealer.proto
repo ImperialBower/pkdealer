@@ -87,6 +87,7 @@ enum EventType {
   EVENT_TYPE_STREET_ADVANCED = 5;
   EVENT_TYPE_HAND_ENDED = 6;
   EVENT_TYPE_PLAYER_REBOUGHT = 7;
+  EVENT_TYPE_ROUND_ENDED = 8;
 }
 
 // Represents the player's action state within the current betting round.
@@ -203,6 +204,9 @@ message WinnerInfo {
   string player_name      = 2;
   uint32 amount_won       = 3;
   string hand_description = 4;  // e.g. "Pair", "Flush" — empty on fold win
+  // The winning 5-card hand at showdown, e.g. "A♠ K♠ Q♠ J♠ T♠". Empty on a
+  // fold win (no showdown).
+  string winning_cards    = 5;
 }
 
 message GetStatusRequest {}
@@ -216,6 +220,17 @@ message TableStatus {
   bool              hand_in_progress = 5;
   bool              game_over        = 6;
   Street            current_street   = 7;
+  // Live forced-bet blinds for the current/next hand. Tracks blind-schedule
+  // escalation so spectators see the real stakes, not a once-fetched config.
+  uint32            small_blind      = 8;
+  uint32            big_blind        = 9;
+  // Button and blind seat numbers for position-tag display (BTN/SB/BB).
+  // Populated so remote spectators can render position labels without
+  // re-implementing the heads-up vs. full-ring blind-assignment rules.
+  uint32            button_seat      = 10;
+  uint32            small_blind_seat = 11;
+  uint32            big_blind_seat   = 12;
+  uint32            round_number     = 13;
 }
 
 message SeatInfo {
@@ -230,6 +245,9 @@ message SeatInfo {
   uint32      chips_in_play = 7;
   // chips + chips_in_play - withdrawn. Signed; negative means net loss.
   sint32      profit_loss   = 8;
+  // Chips wagered on the current betting round only; reset to 0 when the street
+  // advances. Use this (not chips_in_play) for a per-street "bet" display.
+  uint32      bet           = 9;
 }
 
 message GetNextToActRequest {}

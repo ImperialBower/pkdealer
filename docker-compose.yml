@@ -1,3 +1,12 @@
+# Reusable agent pacing knobs, merged into every agent's environment below.
+# Both default to the values baked into pkdealer_agent_core and are overridable
+# from the host shell, e.g.:
+#   PKDEALER_ACTION_DELAY_SECS=2 PKDEALER_HAND_END_DELAY_SECS=8 ./bin/aiarena
+# Set an action delay of 0 to remove the per-action pause entirely.
+x-agent-pacing: &agent-pacing
+  PKDEALER_ACTION_DELAY_SECS: ${PKDEALER_ACTION_DELAY_SECS:-1}
+  PKDEALER_HAND_END_DELAY_SECS: ${PKDEALER_HAND_END_DELAY_SECS:-5}
+
 services:
   pkdealer_service:
     build:
@@ -13,6 +22,12 @@ services:
       # ("Insufficient chips Error"), wedging the whole table.
       PKDEALER_REBUY_ON_BUST_ENABLED: "true"
       PKDEALER_REBUY_AMOUNT: "10000"
+      # Demo tournament blinds: escalate one level every 20 hands through the
+      # 12-level schedule, then cap stacks back to PKDEALER_REBUY_AMOUNT and
+      # restart. Shared service runs only under the aiarena/botarena profiles,
+      # so this scopes the feature to those demos.
+      PKDEALER_BLIND_SCHEDULE_ENABLED: "true"
+      PKDEALER_HANDS_PER_LEVEL: "20"
     ports: ["50051:50051"]
     depends_on:
       - otel-collector
@@ -54,10 +69,22 @@ services:
     ports: ["3001:3000"]
 
   # ── agent containers ──────────────────────────────────────────────────
-  # All agents share Dockerfile.agent; BIN_NAME selects the binary.
-  # Rule-based bots use pkcore built-in profile names (gto, loose_aggressive,
-  # tight_aggressive). The ollama agent talks to a host-side `ollama serve`
-  # via host.docker.internal.
+  # Agents are grouped by compose `profiles`, so one file drives two demos:
+  #
+  #   profile "aiarena" (./bin/aiarena) — 6 players:
+  #     three rule bots (gto, lag, tag) + three LLMs (llama, mistral, gemma).
+  #   profile "botarena" (./bin/botarena) — all 9 pkcore rule archetypes:
+  #     gto, tag, lag, tp, lp, maniac, abc, ssn, joker (a full 9-seat ring).
+  #
+  # gto/lag/tag carry BOTH profiles, so they appear in either demo; the LLMs
+  # are aiarena-only and the six extra archetypes are botarena-only. Infra
+  # services above carry no profile, so they always start.
+  #
+  # Rule bots (pkdealer_agent_rules) take a pkcore built-in `--profile`. LLMs
+  # (pkdealer_agent_ollama) talk to a host-side `ollama serve` via
+  # host.docker.internal, differing only in OLLAMA_MODEL (override with the
+  # matching *_MODEL env var). All agents share Dockerfile.agent; BIN_NAME
+  # selects the binary.
 
   agent_gto:
     image: pkdealer/agent_rules:latest
@@ -67,7 +94,9 @@ services:
       args:
         BIN_NAME: pkdealer_agent_rules
     command: ["--name", "gto", "--profile", "gto"]
+    profiles: ["aiarena", "botarena"]
     environment:
+      <<: *agent-pacing
       PKDEALER_ENDPOINT: http://pkdealer_service:50051
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       OTEL_SERVICE_NAME: agent_gto
@@ -84,7 +113,9 @@ services:
       args:
         BIN_NAME: pkdealer_agent_rules
     command: ["--name", "lag", "--profile", "loose_aggressive"]
+    profiles: ["aiarena", "botarena"]
     environment:
+      <<: *agent-pacing
       PKDEALER_ENDPOINT: http://pkdealer_service:50051
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       OTEL_SERVICE_NAME: agent_lag
@@ -101,7 +132,9 @@ services:
       args:
         BIN_NAME: pkdealer_agent_rules
     command: ["--name", "tag", "--profile", "tight_aggressive"]
+    profiles: ["aiarena", "botarena"]
     environment:
+      <<: *agent-pacing
       PKDEALER_ENDPOINT: http://pkdealer_service:50051
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       OTEL_SERVICE_NAME: agent_tag
@@ -110,24 +143,7 @@ services:
       - pkdealer_service
       - otel-collector
 
-  agent_random:
-    image: pkdealer/agent_random:latest
-    build:
-      context: .
-      dockerfile: Dockerfile.agent
-      args:
-        BIN_NAME: pkdealer_agent_random
-    command: ["--name", "random"]
-    environment:
-      PKDEALER_ENDPOINT: http://pkdealer_service:50051
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-      OTEL_SERVICE_NAME: agent_random
-      RUST_LOG: info
-    depends_on:
-      - pkdealer_service
-      - otel-collector
-
-  agent_ollama:
+  agent_llama:
     image: pkdealer/agent_ollama:latest
     build:
       context: .
@@ -135,17 +151,184 @@ services:
       args:
         BIN_NAME: pkdealer_agent_ollama
     command: ["--name", "llama"]
+    profiles: ["aiarena"]
     environment:
+      <<: *agent-pacing
       PKDEALER_ENDPOINT: http://pkdealer_service:50051
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
+      OLLAMA_MODEL: ${LLAMA_MODEL:-llama3.1}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-      OTEL_SERVICE_NAME: agent_ollama
+      OTEL_SERVICE_NAME: agent_llama
       RUST_LOG: info
     extra_hosts:
       # Lets the container resolve host.docker.internal on Linux.
       # No-op (already mapped) on Docker Desktop for macOS/Windows.
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_mistral:
+    image: pkdealer/agent_ollama:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_ollama
+    command: ["--name", "mistral"]
+    profiles: ["aiarena"]
+    environment:
+      <<: *agent-pacing
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${MISTRAL_MODEL:-mistral}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_mistral
+      RUST_LOG: info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_gemma:
+    image: pkdealer/agent_ollama:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_ollama
+    command: ["--name", "gemma"]
+    profiles: ["aiarena"]
+    environment:
+      <<: *agent-pacing
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${GEMMA_MODEL:-gemma2}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_gemma
+      RUST_LOG: info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  # ── botarena-only archetypes ──────────────────────────────────────────
+  # The six remaining pkcore rule profiles, joining gto/lag/tag (above) to
+  # seat a full 9-handed ring of distinct strategies. Active only under the
+  # "botarena" profile (./bin/botarena).
+
+  agent_tp:
+    image: pkdealer/agent_rules:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_rules
+    command: ["--name", "tp", "--profile", "tight_passive"]
+    profiles: ["botarena"]
+    environment:
+      <<: *agent-pacing
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_tp
+      RUST_LOG: info
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_lp:
+    image: pkdealer/agent_rules:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_rules
+    command: ["--name", "lp", "--profile", "loose_passive"]
+    profiles: ["botarena"]
+    environment:
+      <<: *agent-pacing
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_lp
+      RUST_LOG: info
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_maniac:
+    image: pkdealer/agent_rules:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_rules
+    command: ["--name", "maniac", "--profile", "maniac"]
+    profiles: ["botarena"]
+    environment:
+      <<: *agent-pacing
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_maniac
+      RUST_LOG: info
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_abc:
+    image: pkdealer/agent_rules:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_rules
+    command: ["--name", "abc", "--profile", "abc"]
+    profiles: ["botarena"]
+    environment:
+      <<: *agent-pacing
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_abc
+      RUST_LOG: info
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_ssn:
+    image: pkdealer/agent_rules:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_rules
+    command: ["--name", "ssn", "--profile", "short_stack_ninja"]
+    profiles: ["botarena"]
+    environment:
+      <<: *agent-pacing
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_ssn
+      RUST_LOG: info
+    depends_on:
+      - pkdealer_service
+      - otel-collector
+
+  agent_joker:
+    image: pkdealer/agent_rules:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        BIN_NAME: pkdealer_agent_rules
+    command: ["--name", "joker", "--profile", "joker"]
+    profiles: ["botarena"]
+    environment:
+      <<: *agent-pacing
+      PKDEALER_ENDPOINT: http://pkdealer_service:50051
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent_joker
+      RUST_LOG: info
     depends_on:
       - pkdealer_service
       - otel-collector

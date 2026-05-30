@@ -59,6 +59,25 @@ Configuration options will be loaded from:
 - `PKDEALER_REBUY_AMOUNT` - Default chips granted when a `Rebuy` request specifies `chips == 0` (default: 10000)
 - `PKDEALER_REBUY_ON_BUST_ENABLED` - When `true`, auto-reloads any seat that finished a hand with `chips == 0`, and allows the `Rebuy` RPC for seats with `chips == 0` (default: false)
 - `PKDEALER_TOPUP_ENABLED` - When `true`, allows the `Rebuy` RPC for seats that still have chips; mid-hand top-ups are always rejected (default: false)
+- `PKDEALER_BLIND_SCHEDULE_ENABLED` - When `true`, escalates blinds on the fixed 12-level schedule every `PKDEALER_HANDS_PER_LEVEL` hands and recycles stacks at the top (default: false)
+- `PKDEALER_HANDS_PER_LEVEL` - Hands per blind level when the schedule is enabled (default: 20)
+
+### Tournament blind schedule
+
+When `PKDEALER_BLIND_SCHEDULE_ENABLED=true`, the service escalates blinds on a
+fixed 12-level schedule (50/100 up to 3,000/6,000 — the same values as
+pkarena0-web), advancing one level every `PKDEALER_HANDS_PER_LEVEL` hands
+(default 20). The top level is not terminal: after it plays out its hands the
+table recycles — every stack above `PKDEALER_REBUY_AMOUNT` is capped back down
+to it (smaller stacks are left alone), blinds drop to 50/100, and escalation
+starts over. A full cycle is `12 × PKDEALER_HANDS_PER_LEVEL` hands (240 by
+default).
+
+The flag is off by default, so plain `cargo run` and the test suite keep the
+fixed 50/100 blinds. The `aiarena` and `botarena` demos enable it via
+`docker-compose.yml`. Stack caps touch only the chip stack, so the per-seat
+profit/loss metric stays cumulative across cycles (it steps down at each
+reset).
 
 ## API
 

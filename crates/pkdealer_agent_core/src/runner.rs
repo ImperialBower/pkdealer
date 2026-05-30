@@ -3,9 +3,9 @@
 use std::time::Duration;
 
 use pkdealer_proto::dealer::{
-    ActRequest, ActionType, EventType, GetNextToActRequest, GetStatusRequest, GetTableConfigRequest,
-    NextToActInfo, PlayerAction as ProtoAction, SeatPlayerAtRequest, SeatPlayerRequest,
-    StartHandRequest, StreamEventsRequest, Street, TableStatus, act_response,
+    ActRequest, ActionType, EventType, GetNextToActRequest, GetStatusRequest,
+    GetTableConfigRequest, NextToActInfo, PlayerAction as ProtoAction, SeatPlayerAtRequest,
+    SeatPlayerRequest, StartHandRequest, StreamEventsRequest, Street, TableStatus, act_response,
     dealer_service_client::DealerServiceClient, get_next_to_act_response, seat_player_at_response,
     seat_player_response,
 };
@@ -51,6 +51,9 @@ struct SeatCtx<'a> {
     seat: u8,
     token: &'a str,
     big_blind: u32,
+    /// Pause applied before this agent submits each action, so a spectator can
+    /// follow the table. Read once at startup from `PKDEALER_ACTION_DELAY_SECS`.
+    action_delay: Duration,
 }
 
 /// Connect to the service, seat the agent, and run the event-driven play loop.
@@ -102,11 +105,14 @@ pub async fn run_agent<A: PokerAgent>(agent: A, config: AgentConfig) -> Result<(
     eprintln!("[{}] seated at seat {my_seat}", config.name);
 
     let big_blind = fetch_big_blind(&mut client).await?;
+    let action_delay = delay_from_env("PKDEALER_ACTION_DELAY_SECS", DEFAULT_ACTION_DELAY);
+    let hand_end_delay = delay_from_env("PKDEALER_HAND_END_DELAY_SECS", DEFAULT_HAND_END_DELAY);
     let ctx = SeatCtx {
         name: &config.name,
         seat: my_seat,
         token: &my_token,
         big_blind,
+        action_delay,
     };
 
     let stream_req = StreamEventsRequest {
@@ -143,6 +149,11 @@ pub async fn run_agent<A: PokerAgent>(agent: A, config: AgentConfig) -> Result<(
                     }
                     EventType::HandEnded => {
                         eprintln!("[{}] hand ended — {}", config.name, event.description);
+                        // Pause after every hand — showdown or fold-win alike —
+                        // so viewers can see how it ended before the next deal.
+                        if !hand_end_delay.is_zero() {
+                            tokio::time::sleep(hand_end_delay).await;
+                        }
                         try_start_hand(&mut client).await;
                     }
                     EventType::StreetAdvanced => action_history.clear(),
@@ -173,6 +184,29 @@ pub async fn run_agent<A: PokerAgent>(agent: A, config: AgentConfig) -> Result<(
 /// status reconcile. Short enough that a missed turn-prompt recovers quickly,
 /// long enough that idle agents don't poll the service hard.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Default pause before each action, overridable with `PKDEALER_ACTION_DELAY_SECS`.
+const DEFAULT_ACTION_DELAY: Duration = Duration::from_secs(1);
+
+/// Default pause after a hand ends, overridable with `PKDEALER_HAND_END_DELAY_SECS`.
+const DEFAULT_HAND_END_DELAY: Duration = Duration::from_secs(5);
+
+/// Parses a delay given in (possibly fractional) seconds.
+///
+/// Falls back to `default` when the value is absent, unparseable, negative, or
+/// non-finite. A value of `"0"` is honoured and disables the pause.
+fn parse_delay(raw: Option<&str>, default: Duration) -> Duration {
+    match raw.map(str::trim).map(str::parse::<f64>) {
+        Some(Ok(secs)) if secs.is_finite() && secs >= 0.0 => Duration::from_secs_f64(secs),
+        _ => default,
+    }
+}
+
+/// Reads a delay in seconds from environment variable `key`, using `default`
+/// when the variable is unset or invalid.
+fn delay_from_env(key: &str, default: Duration) -> Duration {
+    parse_delay(std::env::var(key).ok().as_deref(), default)
+}
 
 /// Acts when the table is in progress and the authoritative next-to-act is this
 /// agent's seat; otherwise does nothing. Shared by the event-driven path and
@@ -208,6 +242,13 @@ async fn decide_and_act<A: PokerAgent>(
     info: &NextToActInfo,
     action_history: &[String],
 ) -> Result<(), AgentError> {
+    // Pace the table: hold this seat's turn briefly so a spectator can read
+    // each action as it happens. Only the acting agent sleeps, so the delay
+    // applies once per action across the table.
+    if !ctx.action_delay.is_zero() {
+        tokio::time::sleep(ctx.action_delay).await;
+    }
+
     let my_seat = ctx.seat;
     let my_cards = status
         .seats
@@ -521,5 +562,46 @@ mod tests {
     fn test_decision_to_proto_seat_encoded() {
         let action = decision_to_proto(8, &Decision::Fold);
         assert_eq!(action.seat, 8);
+    }
+
+    #[test]
+    fn parse_delay_defaults_when_absent() {
+        assert_eq!(
+            parse_delay(None, Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn parse_delay_reads_whole_seconds() {
+        assert_eq!(
+            parse_delay(Some("3"), Duration::from_secs(1)),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn parse_delay_reads_fractional_seconds() {
+        assert_eq!(
+            parse_delay(Some(" 0.5 "), Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn parse_delay_zero_disables_the_pause() {
+        assert_eq!(
+            parse_delay(Some("0"), Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn parse_delay_rejects_negative_and_garbage() {
+        let default = Duration::from_secs(5);
+        assert_eq!(parse_delay(Some("-2"), default), default);
+        assert_eq!(parse_delay(Some("abc"), default), default);
+        assert_eq!(parse_delay(Some(""), default), default);
+        assert_eq!(parse_delay(Some("inf"), default), default);
     }
 }

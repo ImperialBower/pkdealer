@@ -21,6 +21,8 @@
 //! | `PKDEALER_REBUY_AMOUNT`           | 10000             | Default chips granted when `Rebuy.chips == 0`                           |
 //! | `PKDEALER_REBUY_ON_BUST_ENABLED`  | false             | Auto-reload busted seats at hand-end; allow `Rebuy` when `chips == 0`   |
 //! | `PKDEALER_TOPUP_ENABLED`          | false             | Allow `Rebuy` for healthy stacks (between hands only)                   |
+//! | `PKDEALER_BLIND_SCHEDULE_ENABLED` | false             | Escalate blinds every N hands and recycle stacks at the top (demo)      |
+//! | `PKDEALER_HANDS_PER_LEVEL`        | 20                | Hands per blind level when the schedule is enabled                      |
 //!
 //! For the browser spectator UI, run [`pkspectator`](https://github.com/ImperialBower/pkspectator)
 //! as a separate process. It subscribes to this service via gRPC `StreamEvents`.
@@ -37,6 +39,7 @@
 //!   with the spectator token returns all hole cards; with no token returns no hole
 //!   cards.
 
+use pkdealer_service::blind_schedule::blind_update_for;
 use pkdealer_service::otel;
 
 use std::{
@@ -96,6 +99,10 @@ const PLAYER_TOKEN_METADATA_KEY: &str = "x-player-token";
 const DEFAULT_SPECTATOR_TOKEN: &str = "spectator";
 /// Default chip amount granted on a `Rebuy` call when `chips == 0`.
 const DEFAULT_REBUY_AMOUNT: usize = 10_000;
+/// Default number of hands played at each blind level before the schedule
+/// advances. Used when the blind schedule is enabled but
+/// `PKDEALER_HANDS_PER_LEVEL` is unset, unparseable, or zero.
+const DEFAULT_HANDS_PER_LEVEL: usize = 20;
 
 // ── DealerConfig ──────────────────────────────────────────────────────────────
 
@@ -116,6 +123,7 @@ const DEFAULT_REBUY_AMOUNT: usize = 10_000;
 /// assert_eq!(500, cfg.default_rebuy_amount);
 /// ```
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct DealerConfig {
     /// Fallback chip amount used when a `Rebuy` request specifies `chips == 0`.
     default_rebuy_amount: usize,
@@ -125,6 +133,19 @@ struct DealerConfig {
     /// When true, `Rebuy` is allowed for seats that still have chips
     /// (between hands only; mid-hand top-ups are always rejected).
     topup_enabled: bool,
+    /// When true, the service escalates blinds on a fixed schedule
+    /// (see [`pkdealer_service::blind_schedule`]) and recycles the table at
+    /// the top of the schedule. Off by default; the demos enable it via
+    /// `docker-compose.yml`.
+    blind_schedule_enabled: bool,
+    /// Number of hands played at each blind level before advancing. Only
+    /// consulted when `blind_schedule_enabled` is true.
+    hands_per_level: usize,
+    /// When true, no automatic rebuys occur. Instead, after each hand the
+    /// service checks whether only one seated player still has chips. If so,
+    /// all players are reset to `default_rebuy_amount` and the blind counter
+    /// is reset to level 0, starting a new round. Off by default.
+    round_reset_enabled: bool,
 }
 
 impl DealerConfig {
@@ -138,6 +159,9 @@ impl DealerConfig {
                 .unwrap_or(DEFAULT_REBUY_AMOUNT),
             rebuy_on_bust_enabled: parse_env_bool("PKDEALER_REBUY_ON_BUST_ENABLED"),
             topup_enabled: parse_env_bool("PKDEALER_TOPUP_ENABLED"),
+            blind_schedule_enabled: parse_env_bool("PKDEALER_BLIND_SCHEDULE_ENABLED"),
+            hands_per_level: parse_hands_per_level(env::var("PKDEALER_HANDS_PER_LEVEL").ok()),
+            round_reset_enabled: parse_env_bool("PKDEALER_ROUND_RESET_ENABLED"),
         }
     }
 }
@@ -148,6 +172,9 @@ impl Default for DealerConfig {
             default_rebuy_amount: DEFAULT_REBUY_AMOUNT,
             rebuy_on_bust_enabled: false,
             topup_enabled: false,
+            blind_schedule_enabled: false,
+            hands_per_level: DEFAULT_HANDS_PER_LEVEL,
+            round_reset_enabled: false,
         }
     }
 }
@@ -162,6 +189,17 @@ fn parse_env_bool(key: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Parses `PKDEALER_HANDS_PER_LEVEL`-style input into a positive
+/// hands-per-level value. Unset, unparseable, or zero all fall back to
+/// [`DEFAULT_HANDS_PER_LEVEL`] so a typo can't divide the schedule by zero.
+///
+/// Split out from env reading so it can be unit-tested without env races.
+fn parse_hands_per_level(raw: Option<String>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_HANDS_PER_LEVEL)
 }
 
 // ── CardVisibility ────────────────────────────────────────────────────────────
@@ -204,6 +242,20 @@ struct TableState {
     /// Set whenever the auto-advance loop decides the next actor.
     /// Difference against `now` at the top of `act` is `action_duration_ms`.
     last_prompt_at: Option<std::time::Instant>,
+    /// Count of hands that have fully completed (`end_hand` succeeded). Drives
+    /// the blind schedule when `blind_schedule_enabled` is set. Monotonic for
+    /// the life of the process.
+    hands_completed: u64,
+    /// Per-seat banked profit (signed chips) accumulated by the blind-cycle
+    /// stack cap. Credited by [`compute_profit_loss`] so confiscating a
+    /// winner's excess at a cycle reset does not show up as a loss — keeps
+    /// cumulative profit/loss zero-sum across cycles. A seat's entry is cleared
+    /// when the seat is vacated so a later occupant starts clean.
+    banked_profit: std::collections::HashMap<u8, i64>,
+    /// Monotonically increasing count of completed rounds. Starts at 1 (the
+    /// first round begins at 1 and increments to 2 after the first reset).
+    /// Only advances when `round_reset_enabled` triggers a round reset.
+    round_number: u64,
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -306,6 +358,9 @@ impl DealerService {
             current_street_span: None,
             hand_started_at: None,
             last_prompt_at: None,
+            hands_completed: 0,
+            banked_profit: std::collections::HashMap::new(),
+            round_number: 1,
         }));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let meter = opentelemetry::global::meter("pkdealer_service");
@@ -335,7 +390,12 @@ impl DealerService {
     /// - [`CardVisibility::Hidden`] — `cards` is empty for every seat.
     /// - [`CardVisibility::Player`]`(seat)` — `cards` is populated only for `seat`.
     /// - [`CardVisibility::Spectator`] — `cards` is populated for every seat.
-    fn build_table_status(session: &PokerSession, visibility: CardVisibility) -> TableStatus {
+    fn build_table_status(
+        session: &PokerSession,
+        banked: &std::collections::HashMap<u8, i64>,
+        visibility: CardVisibility,
+        round_number: u64,
+    ) -> TableStatus {
         let table = &session.table;
         let mut seats = Vec::new();
 
@@ -356,7 +416,11 @@ impl DealerService {
                     state: Self::map_player_state(seat.player.state) as i32,
                     withdrawn: seat.player.withdrawn as u32,
                     chips_in_play: seat.player.chips_in_play as u32,
-                    profit_loss: compute_profit_loss(&seat.player),
+                    profit_loss: compute_profit_loss(
+                        &seat.player,
+                        banked.get(&i).copied().unwrap_or(0),
+                    ),
+                    bet: seat.player.bet as u32,
                 });
             }
         }
@@ -369,6 +433,12 @@ impl DealerService {
             hand_in_progress: session.is_hand_in_progress(),
             game_over: table.is_game_over(),
             current_street: Self::map_game_phase_to_street(table) as i32,
+            small_blind: table.forced.small_blind as u32,
+            big_blind: table.forced.big_blind as u32,
+            button_seat: u32::from(table.button),
+            small_blind_seat: u32::from(table.determine_small_blind()),
+            big_blind_seat: u32::from(table.determine_big_blind()),
+            round_number: round_number as u32,
         }
     }
 
@@ -456,7 +526,12 @@ impl DealerService {
                 .secret_to_token
                 .insert(client_secret.to_owned(), token);
         }
-        let status = Self::build_table_status(&state.session, CardVisibility::Spectator);
+        let status = Self::build_table_status(
+            &state.session,
+            &state.banked_profit,
+            CardVisibility::Spectator,
+            state.round_number,
+        );
         let event = (
             EventType::PlayerSeated,
             format!("Player seated at seat {requested_seat}"),
@@ -512,9 +587,9 @@ impl DealerService {
         for pot_win in winnings.vec() {
             let seatbit = pot_win.equity.seats;
             let total_chips = pot_win.equity.chips;
-            let hand_description = match pot_win.eval.hand_rank.name {
-                HandRankName::Invalid => String::new(), // fold win — no showdown
-                ref name => format!("{name:?}"),
+            let (hand_description, winning_cards) = match pot_win.eval.hand_rank.name {
+                HandRankName::Invalid => (String::new(), String::new()), // fold win
+                ref name => (format!("{name:?}"), pot_win.eval.hand.to_string()),
             };
 
             let winning_seats: Vec<u8> = (0u8..Seatbit::CAPACITY)
@@ -538,6 +613,7 @@ impl DealerService {
                     player_name,
                     amount_won: per_seat,
                     hand_description: hand_description.clone(),
+                    winning_cards: winning_cards.clone(),
                 });
             }
         }
@@ -546,6 +622,39 @@ impl DealerService {
             winners,
             final_chips: Self::build_player_chips(session),
         }
+    }
+
+    /// Formats the human-readable `HandEnded` description from a [`HandResult`],
+    /// naming each winner, the amount won, and (at showdown) the winning hand —
+    /// e.g. `"Hand ended. gto wins 1500 with FullHouse (A♠ A♥ A♦ K♠ K♥)"`, or
+    /// on a split pot `"Hand ended. gto wins 750, lag wins 750"`. Fold wins omit
+    /// the hand; showdown wins append the winning five cards in parentheses.
+    fn format_hand_end(result: &HandResult) -> String {
+        if result.winners.is_empty() {
+            return "Hand ended.".to_owned();
+        }
+        let parts: Vec<String> = result
+            .winners
+            .iter()
+            .map(|w| {
+                let who = if w.player_name.is_empty() {
+                    format!("Seat {}", w.seat)
+                } else {
+                    w.player_name.clone()
+                };
+                if w.hand_description.is_empty() {
+                    format!("{who} wins {}", w.amount_won)
+                } else if w.winning_cards.is_empty() {
+                    format!("{who} wins {} with {}", w.amount_won, w.hand_description)
+                } else {
+                    format!(
+                        "{who} wins {} with {} ({})",
+                        w.amount_won, w.hand_description, w.winning_cards
+                    )
+                }
+            })
+            .collect();
+        format!("Hand ended. {}", parts.join(", "))
     }
 
     /// Returns the current UTC timestamp in milliseconds since the Unix epoch.
@@ -592,7 +701,12 @@ impl DealerService {
         if reloaded.is_empty() {
             return (events, labels);
         }
-        let status = Self::build_table_status(&state.session, CardVisibility::Spectator);
+        let status = Self::build_table_status(
+            &state.session,
+            &state.banked_profit,
+            CardVisibility::Spectator,
+            state.round_number,
+        );
         for (seat_idx, handle, new_total) in reloaded {
             events.push((
                 EventType::PlayerRebought,
@@ -602,6 +716,86 @@ impl DealerService {
             labels.push(seat_idx);
         }
         (events, labels)
+    }
+
+    /// Checks whether only one seated player still holds chips (round over). If
+    /// so, resets every player to the configured starting amount, zeroes the
+    /// blind counter so level 0 (50/100) takes effect on the next
+    /// `start_hand`, and increments the round number.
+    ///
+    /// Returns a `(EventType, description, TableStatus)` tuple for the caller
+    /// to emit as a `RoundEnded` event, or `None` when two or more players
+    /// still have chips and the round is live.
+    ///
+    /// # P&L invariant
+    ///
+    /// The winner's excess over `round_size` is passed through [`bank_caps`] so
+    /// [`compute_profit_loss`] credits it back — keeping cumulative P&L
+    /// zero-sum across rounds. Bust players get [`PlayerNoCell::reload`] which
+    /// increments `withdrawn`, preserving their running loss.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Illustrative — `run_round_reset` is private to the service binary.
+    /// // After 3 of 4 players bust, the sole remaining player with chips
+    /// // triggers a round reset: everyone returns to 10 000 and
+    /// // `hands_completed` resets to 0.
+    /// ```
+    fn run_round_reset(&self, state: &mut TableState) -> Option<(EventType, String, TableStatus)> {
+        let round_size = self.config.default_rebuy_amount;
+        let table = &state.session.table;
+        let funded: Vec<(u8, String)> = (0..table.seats.size())
+            .filter_map(|i| {
+                table
+                    .seats
+                    .get_seat(i)
+                    .filter(|s| !s.is_empty() && s.player.chips > 0)
+                    .map(|s| (i, s.player.handle.clone()))
+            })
+            .collect();
+
+        if funded.len() >= 2 {
+            return None;
+        }
+
+        let winner_desc = funded.first().map_or_else(
+            || "nobody".to_owned(),
+            |(seat, name)| format!("Seat {seat} ({name})"),
+        );
+
+        // Cap the winner's stack to round_size, banking the excess for P&L.
+        let capped = cap_stacks_to(&mut state.session, round_size);
+        bank_caps(&mut state.banked_profit, &capped, round_size);
+
+        // Reload all bust players (chips == 0) so they re-enter next round.
+        {
+            let table = &mut state.session.table;
+            for i in 0..table.seats.size() {
+                if let Some(seat) = table.seats.get_seat_mut(i)
+                    && !seat.is_empty()
+                    && seat.player.chips == 0
+                {
+                    seat.player.reload(round_size);
+                }
+            }
+        }
+
+        // Reset the blind counter so level 0 (50/100) resumes next hand.
+        state.hands_completed = 0;
+        state.round_number += 1;
+
+        let completed = state.round_number - 1;
+        let desc = format!(
+            "Round {completed} ended. {winner_desc} wins. All players reset to {round_size}."
+        );
+        let status = Self::build_table_status(
+            &state.session,
+            &state.banked_profit,
+            CardVisibility::Spectator,
+            state.round_number,
+        );
+        Some((EventType::RoundEnded, desc, status))
     }
 
     /// Constructs and enqueues a [`TableEvent`] on the broadcast channel.
@@ -650,17 +844,71 @@ impl DealerService {
     }
 }
 
+/// Caps every occupied seat's stack to `cap`, leaving stacks already at or
+/// below `cap` untouched. Returns `(seat_index, handle, old_chips)` for each
+/// seat that was reduced, so the caller can log/emit the change.
+///
+/// Touches only `chips` (not `withdrawn`), so per-seat profit/loss tracking
+/// stays cumulative across cycles — matching the demo's documented behaviour.
+///
+/// # Examples
+///
+/// ```
+/// # // illustrative — `cap_stacks_to` is private to the service binary.
+/// // A seat with 300_000 chips and a cap of 10_000 ends at 10_000;
+/// // a seat with 1_000 chips is left at 1_000.
+/// ```
+fn cap_stacks_to(session: &mut PokerSession, cap: usize) -> Vec<(u8, String, usize)> {
+    let mut capped = Vec::new();
+    let table = &mut session.table;
+    let size = table.seats.size();
+    for i in 0..size {
+        if let Some(seat) = table.seats.get_seat_mut(i)
+            && !seat.is_empty()
+            && seat.player.chips > cap
+        {
+            let old = seat.player.chips;
+            seat.player.chips = cap;
+            capped.push((i, seat.player.handle.clone(), old));
+        }
+    }
+    capped
+}
+
 /// Computes a player's cumulative profit/loss as a signed `i32`.
 ///
-/// Uses the invariant `profit = chips + chips_in_play - withdrawn` maintained
-/// by `pkcore`. Values outside the `i32` range saturate at `i32::MIN` /
-/// `i32::MAX` rather than panicking — `unwrap()` is forbidden by the project
-/// lint set.
-fn compute_profit_loss(player: &PlayerNoCell) -> i32 {
+/// Uses the invariant `profit = chips + chips_in_play - withdrawn + banked`.
+/// The first three terms are maintained by `pkcore`; `banked` is the per-seat
+/// ledger of chips removed by the blind-cycle stack cap (see [`bank_caps`]).
+/// Crediting `banked` back means confiscating a winner's excess at a cycle
+/// reset does not register as a loss, so the table's profit/loss stays
+/// zero-sum across cycles. Pass `0` when no cap has occurred for the seat.
+/// Values outside the `i32` range saturate at `i32::MIN` / `i32::MAX` rather
+/// than panicking — `unwrap()` is forbidden by the project lint set.
+fn compute_profit_loss(player: &PlayerNoCell, banked: i64) -> i32 {
     let pl = i64::try_from(player.chips).unwrap_or(i64::MAX)
         + i64::try_from(player.chips_in_play).unwrap_or(i64::MAX)
-        - i64::try_from(player.withdrawn).unwrap_or(i64::MAX);
+        - i64::try_from(player.withdrawn).unwrap_or(i64::MAX)
+        + banked;
     i32::try_from(pl).unwrap_or(if pl < 0 { i32::MIN } else { i32::MAX })
+}
+
+/// Records the chips removed by [`cap_stacks_to`] into the per-seat `banked`
+/// ledger so [`compute_profit_loss`] can credit them back, keeping cumulative
+/// profit/loss intact across blind-cycle resets.
+///
+/// `capped` is the return value of [`cap_stacks_to`]:
+/// `(seat, handle, old_chips)`. Each seat's confiscated excess
+/// (`old_chips - cap`) is added to its running banked total.
+fn bank_caps(
+    banked: &mut std::collections::HashMap<u8, i64>,
+    capped: &[(u8, String, usize)],
+    cap: usize,
+) {
+    for (seat, _handle, old) in capped {
+        let delta = i64::try_from(old.saturating_sub(cap)).unwrap_or(i64::MAX);
+        *banked.entry(*seat).or_insert(0) += delta;
+    }
 }
 
 /// Returns a stable string label for the current street, suitable as a span
@@ -769,8 +1017,12 @@ impl DealerServiceTrait for DealerService {
                                 .secret_to_token
                                 .insert(req.client_secret.clone(), token);
                         }
-                        let status =
-                            Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                        let status = Self::build_table_status(
+                            &guard.session,
+                            &guard.banked_profit,
+                            CardVisibility::Spectator,
+                            guard.round_number,
+                        );
                         let event = (
                             EventType::PlayerSeated,
                             format!("Player seated at seat {i}"),
@@ -922,12 +1174,20 @@ impl DealerServiceTrait for DealerService {
                 .unwrap_or_default();
 
             // Clean up the auth token AND any resume binding for the removed seat.
+            // Drop any banked profit for this seat so a later occupant starts
+            // with a clean cumulative profit/loss.
+            guard.banked_profit.remove(&seat);
             if let Some(uuid) = guard.seat_to_token.remove(&seat) {
                 guard.token_to_seat.remove(&uuid);
                 guard.secret_to_token.retain(|_, t| *t != uuid);
             }
 
-            let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
+            let status = Self::build_table_status(
+                &guard.session,
+                &guard.banked_profit,
+                CardVisibility::Spectator,
+                guard.round_number,
+            );
             let event = (
                 EventType::PlayerRemoved,
                 format!("Player '{name}' removed from seat {seat}"),
@@ -971,6 +1231,35 @@ impl DealerServiceTrait for DealerService {
                     )),
                 }));
             }
+            // Tournament blind schedule (demo-only; off by default). Apply
+            // only when no hand is in progress so a losing multi-agent
+            // start_hand race — which is about to return the benign "already
+            // in progress" error below — cannot cap stacks or change blinds.
+            // set_blinds MUST run before start_hand(): start_hand posts the
+            // forced bets, and once a hand is live set_blinds would defer to
+            // the next hand instead.
+            let mut reset_note: Option<String> = None;
+            if self.config.blind_schedule_enabled && !guard.session.is_hand_in_progress() {
+                let upd = blind_update_for(guard.hands_completed, self.config.hands_per_level);
+                if upd.reset_stacks {
+                    let cap = self.config.default_rebuy_amount;
+                    let capped = cap_stacks_to(&mut guard.session, cap);
+                    bank_caps(&mut guard.banked_profit, &capped, cap);
+                    reset_note = Some(if capped.is_empty() {
+                        format!("cycle reset, stacks capped to {cap} (none exceeded)")
+                    } else {
+                        let names = capped
+                            .iter()
+                            .map(|(_, h, _)| h.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("cycle reset, stacks capped to {cap}: {names}")
+                    });
+                }
+                guard
+                    .session
+                    .set_blinds(ForcedBets::new(upd.small_blind, upd.big_blind));
+            }
             match guard.session.start_hand() {
                 Ok(()) => {
                     // Open the hand span for the full hand lifecycle.
@@ -991,15 +1280,29 @@ impl DealerServiceTrait for DealerService {
                     // Broadcast events carry full-visibility snapshots; per-subscriber
                     // filtering happens in `stream_events`.  The unauthenticated
                     // `StartHandResponse` itself must hide hole cards.
-                    let event_status =
-                        Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                    let event_status = Self::build_table_status(
+                        &guard.session,
+                        &guard.banked_profit,
+                        CardVisibility::Spectator,
+                        guard.round_number,
+                    );
                     let response_status =
                         Self::filter_cards(event_status.clone(), CardVisibility::Hidden);
-                    let event = (
-                        EventType::HandStarted,
-                        "Hand started".to_owned(),
-                        event_status,
-                    );
+                    let hand_desc = if self.config.blind_schedule_enabled {
+                        let fb = guard.session.table.forced;
+                        match reset_note {
+                            Some(note) => format!(
+                                "Hand started — blinds {}/{} ({note})",
+                                fb.small_blind, fb.big_blind
+                            ),
+                            None => {
+                                format!("Hand started — blinds {}/{}", fb.small_blind, fb.big_blind)
+                            }
+                        }
+                    } else {
+                        "Hand started".to_owned()
+                    };
+                    let event = (EventType::HandStarted, hand_desc, event_status);
                     (
                         start_hand_response::Result::Status(response_status),
                         Some(event),
@@ -1192,11 +1495,25 @@ impl DealerServiceTrait for DealerService {
                     i64::try_from(guard.session.table.pot).unwrap_or(i64::MAX),
                 );
 
-                // Emit PlayerAction event for the triggering action.
-                let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                // Emit PlayerAction event for the triggering action. Include the
+                // acting player's name (looked up from the snapshot we just
+                // built) so log lines read "Seat 2 gto: Call" rather than bare
+                // "Seat 2: Call". Falls back to no name if the seat is unnamed.
+                let status = Self::build_table_status(
+                    &guard.session,
+                    &guard.banked_profit,
+                    CardVisibility::Spectator,
+                    guard.round_number,
+                );
+                let actor = status
+                    .seats
+                    .iter()
+                    .find(|s| s.seat_number == u32::from(seat))
+                    .filter(|s| !s.player_name.is_empty())
+                    .map_or_else(String::new, |s| format!(" {}", s.player_name));
                 self.emit_event(
                     EventType::PlayerAction,
-                    format!("Seat {seat}: {action_type:?}"),
+                    format!("Seat {seat}{actor}: {action_type:?}"),
                     status,
                 );
 
@@ -1235,8 +1552,12 @@ impl DealerServiceTrait for DealerService {
                             };
                             guard.current_street_span = Some(street_span);
 
-                            let status =
-                                Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                            let status = Self::build_table_status(
+                                &guard.session,
+                                &guard.banked_profit,
+                                CardVisibility::Spectator,
+                                guard.round_number,
+                            );
                             self.emit_event(
                                 EventType::StreetAdvanced,
                                 format!("Street advanced. Board: {board}"),
@@ -1256,39 +1577,68 @@ impl DealerServiceTrait for DealerService {
                             match guard.session.end_hand() {
                                 Ok(winnings) => {
                                     hand_complete = true;
-                                    hand_result =
-                                        Some(Self::build_hand_result(&guard.session, &winnings));
-                                    let desc = winnings.to_string();
+                                    // Rotate the dealer button so the blinds move
+                                    // around the table next hand. `end_hand` runs
+                                    // exactly once per hand under this lock, so this
+                                    // is the race-safe place to advance it (unlike
+                                    // `start_hand`, which many agents call but only
+                                    // one wins). `determine_small_blind`/`big_blind`
+                                    // derive the SB/BB seats from `table.button`;
+                                    // without this the button — and therefore the
+                                    // blinds — stay pinned to the same seats forever.
+                                    guard.session.table.button_up();
+                                    let result = Self::build_hand_result(&guard.session, &winnings);
+                                    // Describe the result by winner name(s) rather
+                                    // than the raw seat/chip `Winnings` dump, so the
+                                    // event log reads "Hand ended. gto wins 1500…".
+                                    let desc = Self::format_hand_end(&result);
+                                    hand_result = Some(result);
                                     let status = Self::build_table_status(
                                         &guard.session,
+                                        &guard.banked_profit,
                                         CardVisibility::Spectator,
+                                        guard.round_number,
                                     );
-                                    self.emit_event(
-                                        EventType::HandEnded,
-                                        format!("Hand ended. {desc}"),
-                                        status,
-                                    );
+                                    self.emit_event(EventType::HandEnded, desc, status);
                                     self.metrics.hands_played.add(1, &[]);
+                                    guard.hands_completed += 1;
                                     self.metrics.pot_size.record(final_pot as u64, &[]);
 
-                                    // Auto-rebuy any busted seats when the flag is on. Trigger
-                                    // condition is `chips == 0` on an occupied seat (NOT
-                                    // PlayerState::Out, which pkcore only sets on empty seats —
-                                    // end_hand has already reset state to YetToAct here).
+                                    // In round-reset mode, check whether one player now
+                                    // holds all the chips (round over). Otherwise, fall
+                                    // through to the normal auto-rebuy path.
+                                    // NOTE: `chips == 0` check is against post-end_hand
+                                    // state where pkcore has already set all states to
+                                    // YetToAct, so chips is the only reliable signal.
+                                    let round_reset_event = if self.config.round_reset_enabled {
+                                        self.run_round_reset(&mut guard)
+                                    } else {
+                                        None
+                                    };
                                     let (rebuy_events, rebuy_labels) =
-                                        self.run_auto_rebuy(&mut guard);
+                                        if self.config.round_reset_enabled {
+                                            (Vec::new(), Vec::new())
+                                        } else {
+                                            self.run_auto_rebuy(&mut guard)
+                                        };
 
                                     // Record per-seat cumulative profit/loss gauge for every
-                                    // occupied seat (uses post-rebuy state, which is invariant
-                                    // under reload anyway).
+                                    // occupied seat (uses post-reset/rebuy state, which is
+                                    // invariant under reload anyway).
                                     {
                                         let table = &guard.session.table;
                                         for i in 0..table.seats.size() {
                                             if let Some(seat) = table.seats.get_seat(i)
                                                 && !seat.is_empty()
                                             {
-                                                let pl =
-                                                    i64::from(compute_profit_loss(&seat.player));
+                                                let pl = i64::from(compute_profit_loss(
+                                                    &seat.player,
+                                                    guard
+                                                        .banked_profit
+                                                        .get(&i)
+                                                        .copied()
+                                                        .unwrap_or(0),
+                                                ));
                                                 self.metrics.player_profit_loss.record(
                                                     pl,
                                                     &[
@@ -1303,8 +1653,11 @@ impl DealerServiceTrait for DealerService {
                                         }
                                     }
 
-                                    // Emit any auto-rebuy events + counters now (still under the
-                                    // lock — `emit_event` and metric recording are non-blocking).
+                                    // Emit round-end event (round-reset mode) or auto-rebuy
+                                    // events (standard mode), then their respective metrics.
+                                    if let Some((et, desc, status)) = round_reset_event {
+                                        self.emit_event(et, desc, status);
+                                    }
                                     for (et, desc, status) in rebuy_events {
                                         self.emit_event(et, desc, status);
                                     }
@@ -1372,7 +1725,12 @@ impl DealerServiceTrait for DealerService {
     ) -> Result<Response<GetStatusResponse>, Status> {
         let guard = self.lock()?;
         let visibility = Self::card_visibility_from_metadata(request.metadata(), &guard);
-        let status = Self::build_table_status(&guard.session, visibility);
+        let status = Self::build_table_status(
+            &guard.session,
+            &guard.banked_profit,
+            visibility,
+            guard.round_number,
+        );
         Ok(Response::new(GetStatusResponse {
             status: Some(status),
         }))
@@ -1592,7 +1950,12 @@ impl DealerServiceTrait for DealerService {
             span.record("seat", i64::from(seat_idx));
             span.record("reason", reason);
 
-            let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
+            let status = Self::build_table_status(
+                &guard.session,
+                &guard.banked_profit,
+                CardVisibility::Spectator,
+                guard.round_number,
+            );
             let info = RebuyInfo {
                 seat: u32::from(seat_idx),
                 new_chips: new_chips as u32,
@@ -1652,7 +2015,10 @@ impl DealerServiceTrait for DealerService {
                     chips: seat.player.chips as u32,
                     chips_in_play: seat.player.chips_in_play as u32,
                     withdrawn: seat.player.withdrawn as u32,
-                    profit_loss: compute_profit_loss(&seat.player),
+                    profit_loss: compute_profit_loss(
+                        &seat.player,
+                        guard.banked_profit.get(&i).copied().unwrap_or(0),
+                    ),
                 });
             }
         }
@@ -1792,8 +2158,220 @@ mod tests {
     use super::*;
     use pkdealer_proto::dealer::PlayerAction;
 
+    #[test]
+    fn parse_hands_per_level_defaults_when_absent() {
+        assert_eq!(parse_hands_per_level(None), DEFAULT_HANDS_PER_LEVEL);
+    }
+
+    #[test]
+    fn parse_hands_per_level_defaults_on_garbage() {
+        assert_eq!(
+            parse_hands_per_level(Some("nope".to_owned())),
+            DEFAULT_HANDS_PER_LEVEL
+        );
+    }
+
+    #[test]
+    fn parse_hands_per_level_defaults_on_zero() {
+        assert_eq!(
+            parse_hands_per_level(Some("0".to_owned())),
+            DEFAULT_HANDS_PER_LEVEL
+        );
+    }
+
+    #[test]
+    fn parse_hands_per_level_accepts_positive() {
+        assert_eq!(parse_hands_per_level(Some("30".to_owned())), 30);
+    }
+
+    #[test]
+    fn dealer_config_default_disables_blind_schedule() {
+        let cfg = DealerConfig::default();
+        assert!(!cfg.blind_schedule_enabled);
+        assert_eq!(cfg.hands_per_level, DEFAULT_HANDS_PER_LEVEL);
+    }
+
     fn make_service() -> DealerService {
         DealerService::new()
+    }
+
+    #[test]
+    fn format_hand_end_names_single_showdown_winner_with_cards() {
+        let result = HandResult {
+            winners: vec![WinnerInfo {
+                seat: 2,
+                player_name: "gto".to_owned(),
+                amount_won: 1_500,
+                hand_description: "FullHouse".to_owned(),
+                winning_cards: "A♠ A♥ A♦ K♠ K♥".to_owned(),
+            }],
+            final_chips: Vec::new(),
+        };
+        assert_eq!(
+            DealerService::format_hand_end(&result),
+            "Hand ended. gto wins 1500 with FullHouse (A♠ A♥ A♦ K♠ K♥)"
+        );
+    }
+
+    #[test]
+    fn format_hand_end_fold_win_omits_hand_and_cards() {
+        let result = HandResult {
+            winners: vec![WinnerInfo {
+                seat: 0,
+                player_name: "lag".to_owned(),
+                amount_won: 300,
+                hand_description: String::new(),
+                winning_cards: String::new(),
+            }],
+            final_chips: Vec::new(),
+        };
+        assert_eq!(
+            DealerService::format_hand_end(&result),
+            "Hand ended. lag wins 300"
+        );
+    }
+
+    #[test]
+    fn format_hand_end_split_pot_lists_each_winner_with_cards() {
+        let result = HandResult {
+            winners: vec![
+                WinnerInfo {
+                    seat: 1,
+                    player_name: "gto".to_owned(),
+                    amount_won: 750,
+                    hand_description: "Flush".to_owned(),
+                    winning_cards: "A♠ K♠ Q♠ J♠ T♠".to_owned(),
+                },
+                WinnerInfo {
+                    seat: 4,
+                    player_name: "tag".to_owned(),
+                    amount_won: 750,
+                    hand_description: "Flush".to_owned(),
+                    winning_cards: "A♠ K♠ Q♠ J♠ T♠".to_owned(),
+                },
+            ],
+            final_chips: Vec::new(),
+        };
+        assert_eq!(
+            DealerService::format_hand_end(&result),
+            "Hand ended. gto wins 750 with Flush (A♠ K♠ Q♠ J♠ T♠), \
+             tag wins 750 with Flush (A♠ K♠ Q♠ J♠ T♠)"
+        );
+    }
+
+    #[test]
+    fn format_hand_end_unnamed_seat_falls_back_to_seat_number() {
+        let result = HandResult {
+            winners: vec![WinnerInfo {
+                seat: 5,
+                player_name: String::new(),
+                amount_won: 200,
+                hand_description: String::new(),
+                winning_cards: String::new(),
+            }],
+            final_chips: Vec::new(),
+        };
+        assert_eq!(
+            DealerService::format_hand_end(&result),
+            "Hand ended. Seat 5 wins 200"
+        );
+    }
+
+    #[test]
+    fn format_hand_end_with_rank_but_no_cards_omits_parens() {
+        // Defensive: a hand_description without winning_cards should not render
+        // empty parentheses.
+        let result = HandResult {
+            winners: vec![WinnerInfo {
+                seat: 1,
+                player_name: "gto".to_owned(),
+                amount_won: 400,
+                hand_description: "Pair".to_owned(),
+                winning_cards: String::new(),
+            }],
+            final_chips: Vec::new(),
+        };
+        assert_eq!(
+            DealerService::format_hand_end(&result),
+            "Hand ended. gto wins 400 with Pair"
+        );
+    }
+
+    #[test]
+    fn bank_caps_keeps_profit_loss_zero_sum() {
+        use pkcore::casino::table_no_cell::PlayerNoCell;
+        use std::collections::HashMap;
+
+        // Three players each bought in for 10k (withdrawn = 10k). Chips have
+        // since moved so seat 0 is up to 24k and seats 1,2 are down to 3k each
+        // — still zero-sum (+14k, -7k, -7k). `chips`/`withdrawn` are pub fields.
+        let mut win = PlayerNoCell::new_with_chips("win".to_string(), 10_000);
+        win.chips = 24_000;
+        let mut lose1 = PlayerNoCell::new_with_chips("lose1".to_string(), 10_000);
+        lose1.chips = 3_000;
+        let mut lose2 = PlayerNoCell::new_with_chips("lose2".to_string(), 10_000);
+        lose2.chips = 3_000;
+
+        // Cycle-wrap cap fires: only the winner exceeds the 10k cap. Mirror
+        // cap_stacks_to by recording the (seat, handle, old_chips) tuple and
+        // then clamping chips, and bank the confiscated excess.
+        let cap = 10_000usize;
+        let capped = vec![(0u8, "win".to_string(), win.chips)];
+        win.chips = cap;
+        let mut banked: HashMap<u8, i64> = HashMap::new();
+        bank_caps(&mut banked, &capped, cap);
+
+        // The winner's confiscated chips are banked, so displayed P/L stays +14k.
+        assert_eq!(
+            compute_profit_loss(&win, banked.get(&0).copied().unwrap_or(0)),
+            14_000
+        );
+
+        // The whole table's profit/loss still sums to zero after the cap —
+        // no chips leak out of the accounting.
+        let total = i64::from(compute_profit_loss(
+            &win,
+            banked.get(&0).copied().unwrap_or(0),
+        )) + i64::from(compute_profit_loss(
+            &lose1,
+            banked.get(&1).copied().unwrap_or(0),
+        )) + i64::from(compute_profit_loss(
+            &lose2,
+            banked.get(&2).copied().unwrap_or(0),
+        ));
+        assert_eq!(total, 0, "P/L must stay zero-sum after a stack cap");
+    }
+
+    #[test]
+    fn cap_stacks_to_reduces_only_oversized_stacks() {
+        use pkcore::casino::game::ForcedBets;
+        use pkcore::casino::session::PokerSession;
+        use pkcore::casino::table_no_cell::{PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell};
+
+        let seats = SeatsNoCell::new(vec![
+            SeatNoCell::new(PlayerNoCell::new_with_chips("rich".to_string(), 300_000)),
+            SeatNoCell::new(PlayerNoCell::new_with_chips("poor".to_string(), 1_000)),
+            SeatNoCell::new(PlayerNoCell::new_with_chips("exact".to_string(), 10_000)),
+        ]);
+        let mut session =
+            PokerSession::new(TableNoCell::nlh_from_seats(seats, ForcedBets::new(50, 100)));
+
+        let capped = cap_stacks_to(&mut session, 10_000);
+
+        // Only the 300k stack is reduced.
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].0, 0);
+        assert_eq!(capped[0].1, "rich");
+        assert_eq!(capped[0].2, 300_000);
+        assert_eq!(
+            session.table.seats.get_seat(0).unwrap().player.chips,
+            10_000
+        );
+        assert_eq!(session.table.seats.get_seat(1).unwrap().player.chips, 1_000);
+        assert_eq!(
+            session.table.seats.get_seat(2).unwrap().player.chips,
+            10_000
+        );
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -2654,6 +3232,42 @@ mod tests {
         Ok(())
     }
 
+    /// The dealer button must advance one seat after every completed hand so
+    /// the blinds rotate around the table. Regression guard for the arenas,
+    /// where a frozen button pinned the SB/BB to the same two seats forever.
+    #[tokio::test]
+    async fn dealer_service_button_rotates_between_hands() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+
+        let button_before = {
+            let guard = service.lock().expect("lock");
+            guard.session.table.button
+        };
+
+        // Hand 1: start, fold to end it (act auto-calls end_hand).
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        fold_next_to_act(&service, &tokens).await?;
+
+        // Hand 2: start the next hand.
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        let button_after = {
+            let guard = service.lock().expect("lock");
+            guard.session.table.button
+        };
+
+        assert_ne!(
+            button_before, button_after,
+            "button must advance after a completed hand (was {button_before}, still {button_after})"
+        );
+        Ok(())
+    }
+
     // ── full hand sequence ────────────────────────────────────────────────────
 
     /// Plays a complete two-player hand via `Act` only (no `advance_street` or
@@ -3161,6 +3775,7 @@ mod tests {
             default_rebuy_amount: 5_000,
             rebuy_on_bust_enabled: true,
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (&seat, token) = tokens.iter().next().expect("token");
@@ -3195,6 +3810,7 @@ mod tests {
             default_rebuy_amount: 5_000,
             rebuy_on_bust_enabled: true,
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (&seat, token) = tokens.iter().next().expect("token");
@@ -3219,6 +3835,7 @@ mod tests {
             default_rebuy_amount: 5_000,
             rebuy_on_bust_enabled: true, // bust flag on, topup flag off
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (_, token) = tokens.iter().next().expect("token");
@@ -3240,6 +3857,7 @@ mod tests {
             default_rebuy_amount: 500,
             rebuy_on_bust_enabled: false,
             topup_enabled: true,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (&seat, token) = tokens.iter().next().expect("token");
@@ -3267,6 +3885,7 @@ mod tests {
             default_rebuy_amount: 500,
             rebuy_on_bust_enabled: false,
             topup_enabled: true,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (_, token) = tokens.iter().next().expect("token");
@@ -3295,6 +3914,7 @@ mod tests {
             default_rebuy_amount: 500,
             rebuy_on_bust_enabled: true,
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens = seat_two_players(&service).await?;
         let (&seat, token) = tokens.iter().next().expect("token");
@@ -3324,6 +3944,7 @@ mod tests {
             default_rebuy_amount: 500,
             rebuy_on_bust_enabled: true,
             topup_enabled: true,
+            ..DealerConfig::default()
         });
         let _ = seat_two_players(&service).await?;
         let result = service.rebuy(Request::new(RebuyRequest { chips: 0 })).await;
@@ -3346,6 +3967,7 @@ mod tests {
             default_rebuy_amount: 999,
             rebuy_on_bust_enabled: false,
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens_off = seat_two_players(&service_off).await?;
         let busted_off = *tokens_off.keys().next().expect("seat");
@@ -3364,6 +3986,7 @@ mod tests {
             default_rebuy_amount: 999,
             rebuy_on_bust_enabled: true,
             topup_enabled: false,
+            ..DealerConfig::default()
         });
         let tokens_on = seat_two_players(&service_on).await?;
         let busted_on = *tokens_on.keys().next().expect("seat");
@@ -3379,6 +4002,136 @@ mod tests {
         assert_eq!(999, chips_on, "flag-on busted seat reloaded to default");
         // Initial withdrawn = 1_000 (buy-in); after auto-reload of 999, == 1_999.
         assert_eq!(1_999, withdrawn_on);
+        Ok(())
+    }
+
+    /// `run_round_reset` returns `None` when two or more players still hold chips
+    /// (round is still live).
+    #[tokio::test]
+    async fn round_reset_returns_none_when_multiple_players_funded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service_with_config(DealerConfig {
+            round_reset_enabled: true,
+            ..DealerConfig::default()
+        });
+        let _ = seat_two_players(&service).await?;
+        // Both players retain their default 1 000 chips — nobody busted.
+        let result = {
+            let mut guard = service.lock().expect("lock");
+            service.run_round_reset(&mut guard)
+        };
+        assert!(result.is_none(), "round should still be live");
+        Ok(())
+    }
+
+    /// When only one player has chips, `run_round_reset` resets every seat to
+    /// `default_rebuy_amount`, zeroes the blind counter, and increments
+    /// `round_number`.
+    #[tokio::test]
+    async fn round_reset_fires_when_one_player_has_all_chips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ROUND_SIZE: usize = 1_000;
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: ROUND_SIZE,
+            round_reset_enabled: true,
+            ..DealerConfig::default()
+        });
+        let tokens = seat_two_players(&service).await?;
+        let seats: Vec<u8> = tokens.keys().copied().collect();
+        let (winner_seat, loser_seat) = (seats[0], seats[1]);
+
+        // Simulate winner holding all chips; loser is busted.
+        {
+            let mut guard = service.lock().expect("lock");
+            if let Some(s) = guard.session.table.seats.get_seat_mut(winner_seat) {
+                s.player.chips = 2_000; // both players' chips combined
+            }
+            if let Some(s) = guard.session.table.seats.get_seat_mut(loser_seat) {
+                s.player.chips = 0;
+            }
+            guard.hands_completed = 42;
+        }
+
+        let result = {
+            let mut guard = service.lock().expect("lock");
+            service.run_round_reset(&mut guard)
+        };
+        assert!(result.is_some(), "expected RoundEnded event");
+        let (et, desc, _status) = result.unwrap();
+        assert_eq!(et, EventType::RoundEnded);
+        assert!(
+            desc.contains("Round 1 ended"),
+            "description should name completed round: {desc}"
+        );
+        assert!(
+            desc.contains(&ROUND_SIZE.to_string()),
+            "description should name reset amount: {desc}"
+        );
+
+        // All seats reset to ROUND_SIZE.
+        let (winner_chips, _) = read_chip_state(&service, winner_seat);
+        let (loser_chips, _) = read_chip_state(&service, loser_seat);
+        assert_eq!(ROUND_SIZE, winner_chips, "winner capped to round_size");
+        assert_eq!(ROUND_SIZE, loser_chips, "loser reloaded to round_size");
+
+        // Blind counter reset; round number advanced.
+        {
+            let guard = service.lock().expect("lock");
+            assert_eq!(0, guard.hands_completed, "blind counter must reset to 0");
+            assert_eq!(2, guard.round_number, "round_number must advance to 2");
+        }
+        Ok(())
+    }
+
+    /// P&L is zero-sum across a round reset: the winner's excess is banked and
+    /// the loser's running loss is preserved.
+    ///
+    /// `seat_two_players` buys in at 1 000 chips each. With `default_rebuy_amount`
+    /// also set to 1 000, the winner ends up with 2 000 (both stacks) and the
+    /// loser with 0, so a round reset rebalances everyone back to 1 000.
+    #[tokio::test]
+    async fn round_reset_pl_invariant_zero_sum() -> Result<(), Box<dyn std::error::Error>> {
+        const ROUND_SIZE: usize = 1_000; // matches seat_two_players buy-in
+        let service = make_service_with_config(DealerConfig {
+            default_rebuy_amount: ROUND_SIZE,
+            round_reset_enabled: true,
+            ..DealerConfig::default()
+        });
+        let tokens = seat_two_players(&service).await?;
+        let seats: Vec<u8> = tokens.keys().copied().collect();
+        let (winner_seat, loser_seat) = (seats[0], seats[1]);
+
+        // Winner holds both stacks (2 000); loser busted.
+        {
+            let mut guard = service.lock().expect("lock");
+            if let Some(s) = guard.session.table.seats.get_seat_mut(winner_seat) {
+                s.player.chips = 2 * ROUND_SIZE;
+            }
+            if let Some(s) = guard.session.table.seats.get_seat_mut(loser_seat) {
+                s.player.chips = 0;
+            }
+        }
+
+        {
+            let mut guard = service.lock().expect("lock");
+            let _ = service.run_round_reset(&mut guard);
+        }
+
+        // Compute post-reset P&L for both seats.
+        let total_pl: i64 = {
+            let guard = service.lock().expect("lock");
+            let mut sum = 0i64;
+            for i in 0..guard.session.table.seats.size() {
+                if let Some(s) = guard.session.table.seats.get_seat(i)
+                    && !s.is_empty()
+                {
+                    let banked = guard.banked_profit.get(&i).copied().unwrap_or(0);
+                    sum += i64::from(compute_profit_loss(&s.player, banked));
+                }
+            }
+            sum
+        };
+        assert_eq!(0, total_pl, "P&L must be zero-sum after round reset");
         Ok(())
     }
 
@@ -3440,6 +4193,7 @@ mod tests {
             default_rebuy_amount: 777,
             rebuy_on_bust_enabled: true,
             topup_enabled: true,
+            ..DealerConfig::default()
         });
         let resp = service
             .get_table_config(Request::new(GetTableConfigRequest {}))
@@ -3449,6 +4203,36 @@ mod tests {
         assert_eq!(777, cfg.default_rebuy_amount);
         assert!(cfg.rebuy_on_bust_enabled);
         assert!(cfg.topup_enabled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_hand_escalates_blinds_when_schedule_enabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Build the service with the blind schedule enabled, 20 hands/level.
+        let config = DealerConfig {
+            blind_schedule_enabled: true,
+            hands_per_level: 20,
+            ..DealerConfig::default()
+        };
+        let service = DealerService::new_with_config(config);
+
+        // Seat two funded players (mirrors the existing start_hand tests).
+        seat_two_players(&service).await?;
+
+        // Pretend 20 hands already completed → upcoming hand is level 1 (100/200).
+        {
+            let mut guard = service.lock().expect("lock");
+            guard.hands_completed = 20;
+        }
+
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let guard = service.lock().expect("lock");
+        assert_eq!(guard.session.table.forced.small_blind, 100);
+        assert_eq!(guard.session.table.forced.big_blind, 200);
         Ok(())
     }
 }
