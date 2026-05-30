@@ -238,6 +238,12 @@ struct TableState {
     /// the blind schedule when `blind_schedule_enabled` is set. Monotonic for
     /// the life of the process.
     hands_completed: u64,
+    /// Per-seat banked profit (signed chips) accumulated by the blind-cycle
+    /// stack cap. Credited by [`compute_profit_loss`] so confiscating a
+    /// winner's excess at a cycle reset does not show up as a loss — keeps
+    /// cumulative profit/loss zero-sum across cycles. A seat's entry is cleared
+    /// when the seat is vacated so a later occupant starts clean.
+    banked_profit: std::collections::HashMap<u8, i64>,
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -341,6 +347,7 @@ impl DealerService {
             hand_started_at: None,
             last_prompt_at: None,
             hands_completed: 0,
+            banked_profit: std::collections::HashMap::new(),
         }));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let meter = opentelemetry::global::meter("pkdealer_service");
@@ -370,7 +377,11 @@ impl DealerService {
     /// - [`CardVisibility::Hidden`] — `cards` is empty for every seat.
     /// - [`CardVisibility::Player`]`(seat)` — `cards` is populated only for `seat`.
     /// - [`CardVisibility::Spectator`] — `cards` is populated for every seat.
-    fn build_table_status(session: &PokerSession, visibility: CardVisibility) -> TableStatus {
+    fn build_table_status(
+        session: &PokerSession,
+        banked: &std::collections::HashMap<u8, i64>,
+        visibility: CardVisibility,
+    ) -> TableStatus {
         let table = &session.table;
         let mut seats = Vec::new();
 
@@ -391,7 +402,10 @@ impl DealerService {
                     state: Self::map_player_state(seat.player.state) as i32,
                     withdrawn: seat.player.withdrawn as u32,
                     chips_in_play: seat.player.chips_in_play as u32,
-                    profit_loss: compute_profit_loss(&seat.player),
+                    profit_loss: compute_profit_loss(
+                        &seat.player,
+                        banked.get(&i).copied().unwrap_or(0),
+                    ),
                     bet: seat.player.bet as u32,
                 });
             }
@@ -494,7 +508,11 @@ impl DealerService {
                 .secret_to_token
                 .insert(client_secret.to_owned(), token);
         }
-        let status = Self::build_table_status(&state.session, CardVisibility::Spectator);
+        let status = Self::build_table_status(
+            &state.session,
+            &state.banked_profit,
+            CardVisibility::Spectator,
+        );
         let event = (
             EventType::PlayerSeated,
             format!("Player seated at seat {requested_seat}"),
@@ -664,7 +682,11 @@ impl DealerService {
         if reloaded.is_empty() {
             return (events, labels);
         }
-        let status = Self::build_table_status(&state.session, CardVisibility::Spectator);
+        let status = Self::build_table_status(
+            &state.session,
+            &state.banked_profit,
+            CardVisibility::Spectator,
+        );
         for (seat_idx, handle, new_total) in reloaded {
             events.push((
                 EventType::PlayerRebought,
@@ -755,15 +777,38 @@ fn cap_stacks_to(session: &mut PokerSession, cap: usize) -> Vec<(u8, String, usi
 
 /// Computes a player's cumulative profit/loss as a signed `i32`.
 ///
-/// Uses the invariant `profit = chips + chips_in_play - withdrawn` maintained
-/// by `pkcore`. Values outside the `i32` range saturate at `i32::MIN` /
-/// `i32::MAX` rather than panicking — `unwrap()` is forbidden by the project
-/// lint set.
-fn compute_profit_loss(player: &PlayerNoCell) -> i32 {
+/// Uses the invariant `profit = chips + chips_in_play - withdrawn + banked`.
+/// The first three terms are maintained by `pkcore`; `banked` is the per-seat
+/// ledger of chips removed by the blind-cycle stack cap (see [`bank_caps`]).
+/// Crediting `banked` back means confiscating a winner's excess at a cycle
+/// reset does not register as a loss, so the table's profit/loss stays
+/// zero-sum across cycles. Pass `0` when no cap has occurred for the seat.
+/// Values outside the `i32` range saturate at `i32::MIN` / `i32::MAX` rather
+/// than panicking — `unwrap()` is forbidden by the project lint set.
+fn compute_profit_loss(player: &PlayerNoCell, banked: i64) -> i32 {
     let pl = i64::try_from(player.chips).unwrap_or(i64::MAX)
         + i64::try_from(player.chips_in_play).unwrap_or(i64::MAX)
-        - i64::try_from(player.withdrawn).unwrap_or(i64::MAX);
+        - i64::try_from(player.withdrawn).unwrap_or(i64::MAX)
+        + banked;
     i32::try_from(pl).unwrap_or(if pl < 0 { i32::MIN } else { i32::MAX })
+}
+
+/// Records the chips removed by [`cap_stacks_to`] into the per-seat `banked`
+/// ledger so [`compute_profit_loss`] can credit them back, keeping cumulative
+/// profit/loss intact across blind-cycle resets.
+///
+/// `capped` is the return value of [`cap_stacks_to`]:
+/// `(seat, handle, old_chips)`. Each seat's confiscated excess
+/// (`old_chips - cap`) is added to its running banked total.
+fn bank_caps(
+    banked: &mut std::collections::HashMap<u8, i64>,
+    capped: &[(u8, String, usize)],
+    cap: usize,
+) {
+    for (seat, _handle, old) in capped {
+        let delta = i64::try_from(old.saturating_sub(cap)).unwrap_or(i64::MAX);
+        *banked.entry(*seat).or_insert(0) += delta;
+    }
 }
 
 /// Returns a stable string label for the current street, suitable as a span
@@ -872,8 +917,11 @@ impl DealerServiceTrait for DealerService {
                                 .secret_to_token
                                 .insert(req.client_secret.clone(), token);
                         }
-                        let status =
-                            Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                        let status = Self::build_table_status(
+                            &guard.session,
+                            &guard.banked_profit,
+                            CardVisibility::Spectator,
+                        );
                         let event = (
                             EventType::PlayerSeated,
                             format!("Player seated at seat {i}"),
@@ -1025,12 +1073,19 @@ impl DealerServiceTrait for DealerService {
                 .unwrap_or_default();
 
             // Clean up the auth token AND any resume binding for the removed seat.
+            // Drop any banked profit for this seat so a later occupant starts
+            // with a clean cumulative profit/loss.
+            guard.banked_profit.remove(&seat);
             if let Some(uuid) = guard.seat_to_token.remove(&seat) {
                 guard.token_to_seat.remove(&uuid);
                 guard.secret_to_token.retain(|_, t| *t != uuid);
             }
 
-            let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
+            let status = Self::build_table_status(
+                &guard.session,
+                &guard.banked_profit,
+                CardVisibility::Spectator,
+            );
             let event = (
                 EventType::PlayerRemoved,
                 format!("Player '{name}' removed from seat {seat}"),
@@ -1087,6 +1142,7 @@ impl DealerServiceTrait for DealerService {
                 if upd.reset_stacks {
                     let cap = self.config.default_rebuy_amount;
                     let capped = cap_stacks_to(&mut guard.session, cap);
+                    bank_caps(&mut guard.banked_profit, &capped, cap);
                     reset_note = Some(if capped.is_empty() {
                         format!("cycle reset, stacks capped to {cap} (none exceeded)")
                     } else {
@@ -1122,8 +1178,11 @@ impl DealerServiceTrait for DealerService {
                     // Broadcast events carry full-visibility snapshots; per-subscriber
                     // filtering happens in `stream_events`.  The unauthenticated
                     // `StartHandResponse` itself must hide hole cards.
-                    let event_status =
-                        Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                    let event_status = Self::build_table_status(
+                        &guard.session,
+                        &guard.banked_profit,
+                        CardVisibility::Spectator,
+                    );
                     let response_status =
                         Self::filter_cards(event_status.clone(), CardVisibility::Hidden);
                     let hand_desc = if self.config.blind_schedule_enabled {
@@ -1337,7 +1396,11 @@ impl DealerServiceTrait for DealerService {
                 // acting player's name (looked up from the snapshot we just
                 // built) so log lines read "Seat 2 gto: Call" rather than bare
                 // "Seat 2: Call". Falls back to no name if the seat is unnamed.
-                let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                let status = Self::build_table_status(
+                    &guard.session,
+                    &guard.banked_profit,
+                    CardVisibility::Spectator,
+                );
                 let actor = status
                     .seats
                     .iter()
@@ -1385,8 +1448,11 @@ impl DealerServiceTrait for DealerService {
                             };
                             guard.current_street_span = Some(street_span);
 
-                            let status =
-                                Self::build_table_status(&guard.session, CardVisibility::Spectator);
+                            let status = Self::build_table_status(
+                                &guard.session,
+                                &guard.banked_profit,
+                                CardVisibility::Spectator,
+                            );
                             self.emit_event(
                                 EventType::StreetAdvanced,
                                 format!("Street advanced. Board: {board}"),
@@ -1414,6 +1480,7 @@ impl DealerServiceTrait for DealerService {
                                     hand_result = Some(result);
                                     let status = Self::build_table_status(
                                         &guard.session,
+                                        &guard.banked_profit,
                                         CardVisibility::Spectator,
                                     );
                                     self.emit_event(EventType::HandEnded, desc, status);
@@ -1437,8 +1504,14 @@ impl DealerServiceTrait for DealerService {
                                             if let Some(seat) = table.seats.get_seat(i)
                                                 && !seat.is_empty()
                                             {
-                                                let pl =
-                                                    i64::from(compute_profit_loss(&seat.player));
+                                                let pl = i64::from(compute_profit_loss(
+                                                    &seat.player,
+                                                    guard
+                                                        .banked_profit
+                                                        .get(&i)
+                                                        .copied()
+                                                        .unwrap_or(0),
+                                                ));
                                                 self.metrics.player_profit_loss.record(
                                                     pl,
                                                     &[
@@ -1522,7 +1595,7 @@ impl DealerServiceTrait for DealerService {
     ) -> Result<Response<GetStatusResponse>, Status> {
         let guard = self.lock()?;
         let visibility = Self::card_visibility_from_metadata(request.metadata(), &guard);
-        let status = Self::build_table_status(&guard.session, visibility);
+        let status = Self::build_table_status(&guard.session, &guard.banked_profit, visibility);
         Ok(Response::new(GetStatusResponse {
             status: Some(status),
         }))
@@ -1742,7 +1815,11 @@ impl DealerServiceTrait for DealerService {
             span.record("seat", i64::from(seat_idx));
             span.record("reason", reason);
 
-            let status = Self::build_table_status(&guard.session, CardVisibility::Spectator);
+            let status = Self::build_table_status(
+                &guard.session,
+                &guard.banked_profit,
+                CardVisibility::Spectator,
+            );
             let info = RebuyInfo {
                 seat: u32::from(seat_idx),
                 new_chips: new_chips as u32,
@@ -1802,7 +1879,10 @@ impl DealerServiceTrait for DealerService {
                     chips: seat.player.chips as u32,
                     chips_in_play: seat.player.chips_in_play as u32,
                     withdrawn: seat.player.withdrawn as u32,
-                    profit_loss: compute_profit_loss(&seat.player),
+                    profit_loss: compute_profit_loss(
+                        &seat.player,
+                        guard.banked_profit.get(&i).copied().unwrap_or(0),
+                    ),
                 });
             }
         }
@@ -2079,6 +2159,51 @@ mod tests {
             DealerService::format_hand_end(&result),
             "Hand ended. gto wins 400 with Pair"
         );
+    }
+
+    #[test]
+    fn bank_caps_keeps_profit_loss_zero_sum() {
+        use pkcore::casino::table_no_cell::PlayerNoCell;
+        use std::collections::HashMap;
+
+        // Three players each bought in for 10k (withdrawn = 10k). Chips have
+        // since moved so seat 0 is up to 24k and seats 1,2 are down to 3k each
+        // — still zero-sum (+14k, -7k, -7k). `chips`/`withdrawn` are pub fields.
+        let mut win = PlayerNoCell::new_with_chips("win".to_string(), 10_000);
+        win.chips = 24_000;
+        let mut lose1 = PlayerNoCell::new_with_chips("lose1".to_string(), 10_000);
+        lose1.chips = 3_000;
+        let mut lose2 = PlayerNoCell::new_with_chips("lose2".to_string(), 10_000);
+        lose2.chips = 3_000;
+
+        // Cycle-wrap cap fires: only the winner exceeds the 10k cap. Mirror
+        // cap_stacks_to by recording the (seat, handle, old_chips) tuple and
+        // then clamping chips, and bank the confiscated excess.
+        let cap = 10_000usize;
+        let capped = vec![(0u8, "win".to_string(), win.chips)];
+        win.chips = cap;
+        let mut banked: HashMap<u8, i64> = HashMap::new();
+        bank_caps(&mut banked, &capped, cap);
+
+        // The winner's confiscated chips are banked, so displayed P/L stays +14k.
+        assert_eq!(
+            compute_profit_loss(&win, banked.get(&0).copied().unwrap_or(0)),
+            14_000
+        );
+
+        // The whole table's profit/loss still sums to zero after the cap —
+        // no chips leak out of the accounting.
+        let total = i64::from(compute_profit_loss(
+            &win,
+            banked.get(&0).copied().unwrap_or(0),
+        )) + i64::from(compute_profit_loss(
+            &lose1,
+            banked.get(&1).copied().unwrap_or(0),
+        )) + i64::from(compute_profit_loss(
+            &lose2,
+            banked.get(&2).copied().unwrap_or(0),
+        ));
+        assert_eq!(total, 0, "P/L must stay zero-sum after a stack cap");
     }
 
     #[test]
