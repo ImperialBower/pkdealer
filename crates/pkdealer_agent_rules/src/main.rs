@@ -32,6 +32,7 @@ use std::process;
 
 use async_trait::async_trait;
 use clap::Parser;
+use pkcore::Forgiving;
 use pkcore::bot::decider::{BotDecider, RuleBasedDecider};
 use pkcore::bot::player_action::PlayerAction as PkcoreAction;
 use pkcore::bot::profile::BotProfile;
@@ -96,8 +97,13 @@ impl PokerAgent for RulesAgent {
 ///
 /// `current_bet` is approximated as `to_call` and `min_raise` as `big_blind`;
 /// the runner's floor-raise correction handles any undersized raise amounts.
-/// `board` and `hole_cards` are left empty because [`RuleBasedDecider`] does
-/// not use them for its probabilistic decisions.
+///
+/// `hole_cards` and `board` are parsed from their space-separated index
+/// notation (e.g. `"Ah Kd"`) so that [`RuleBasedDecider`] runs its
+/// hand-strength *equity* path. When a card field is empty (e.g. `board`
+/// before the flop) or contains an unparseable token, [`Cards::forgiving_from_str`]
+/// yields what it can — an empty [`Cards`] in the empty case — and the decider
+/// falls back to its aggression-factor path for that decision.
 fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot<'static> {
     let stacks: Vec<SeatInfo> = state
         .stacks
@@ -126,8 +132,8 @@ fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot<'static> {
     TableSnapshot {
         seat: state.seat,
         phase,
-        board: Cards::default(),
-        hole_cards: Cards::default(),
+        board: Cards::forgiving_from_str(&state.board),
+        hole_cards: Cards::forgiving_from_str(&state.hole_cards),
         pot: state.pot as usize,
         to_call: state.to_call as usize,
         current_bet: state.to_call as usize,
@@ -309,7 +315,37 @@ mod tests {
     fn test_hand_state_to_snapshot_empty_board_is_default_cards() {
         let snap = hand_state_to_snapshot(&sample_state());
         assert!(snap.board.is_empty());
-        assert!(snap.hole_cards.is_empty());
+    }
+
+    #[test]
+    fn test_hand_state_to_snapshot_parses_hole_cards() {
+        // sample_state() has hole_cards "Ah Kd"; the snapshot must carry both
+        // cards so RuleBasedDecider runs its equity path rather than the
+        // card-blind fallback path.
+        let snap = hand_state_to_snapshot(&sample_state());
+        assert_eq!(snap.hole_cards.len(), 2);
+    }
+
+    #[test]
+    fn test_hand_state_to_snapshot_parses_board() {
+        let state = HandState {
+            board: "Ts 9s 8c".to_string(),
+            street: "flop".to_string(),
+            ..sample_state()
+        };
+        let snap = hand_state_to_snapshot(&state);
+        assert_eq!(snap.board.len(), 3);
+    }
+
+    #[test]
+    fn test_hand_state_to_snapshot_empty_board_stays_empty() {
+        let state = HandState {
+            board: String::new(),
+            street: "preflop".to_string(),
+            ..sample_state()
+        };
+        let snap = hand_state_to_snapshot(&state);
+        assert!(snap.board.is_empty());
     }
 
     #[test]

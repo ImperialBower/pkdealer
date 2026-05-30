@@ -25,7 +25,9 @@
       "Bash(git log *)",
       "Bash(curl -fsS http://localhost:11434/api/tags)",
       "Bash(cargo run *)",
-      "Bash(cargo fmt *)"
+      "Bash(cargo fmt *)",
+      "Bash(echo \"exit=$?\")",
+      "Read(//tmp/**)"
     ]
   }
 }

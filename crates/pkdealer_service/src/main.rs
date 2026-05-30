@@ -102,7 +102,7 @@ const DEFAULT_REBUY_AMOUNT: usize = 10_000;
 /// Default number of hands played at each blind level before the schedule
 /// advances. Used when the blind schedule is enabled but
 /// `PKDEALER_HANDS_PER_LEVEL` is unset, unparseable, or zero.
-const DEFAULT_HANDS_PER_LEVEL: usize = 20;
+const DEFAULT_HANDS_PER_LEVEL: usize = 10;
 
 // ── DealerConfig ──────────────────────────────────────────────────────────────
 
@@ -1133,10 +1133,9 @@ impl DealerServiceTrait for DealerService {
                                 "Hand started — blinds {}/{} ({note})",
                                 fb.small_blind, fb.big_blind
                             ),
-                            None => format!(
-                                "Hand started — blinds {}/{}",
-                                fb.small_blind, fb.big_blind
-                            ),
+                            None => {
+                                format!("Hand started — blinds {}/{}", fb.small_blind, fb.big_blind)
+                            }
                         }
                     } else {
                         "Hand started".to_owned()
@@ -1950,17 +1949,28 @@ mod tests {
 
     #[test]
     fn parse_hands_per_level_defaults_on_garbage() {
-        assert_eq!(parse_hands_per_level(Some("nope".to_owned())), DEFAULT_HANDS_PER_LEVEL);
+        assert_eq!(
+            parse_hands_per_level(Some("nope".to_owned())),
+            DEFAULT_HANDS_PER_LEVEL
+        );
     }
 
     #[test]
     fn parse_hands_per_level_defaults_on_zero() {
-        assert_eq!(parse_hands_per_level(Some("0".to_owned())), DEFAULT_HANDS_PER_LEVEL);
+        assert_eq!(
+            parse_hands_per_level(Some("0".to_owned())),
+            DEFAULT_HANDS_PER_LEVEL
+        );
     }
 
     #[test]
     fn parse_hands_per_level_accepts_positive() {
         assert_eq!(parse_hands_per_level(Some("30".to_owned())), 30);
+    }
+
+    #[test]
+    fn parse_hands_per_level_default_is_ten() {
+        assert_eq!(parse_hands_per_level(None), 10);
     }
 
     #[test]
@@ -2080,9 +2090,7 @@ mod tests {
     fn cap_stacks_to_reduces_only_oversized_stacks() {
         use pkcore::casino::game::ForcedBets;
         use pkcore::casino::session::PokerSession;
-        use pkcore::casino::table_no_cell::{
-            PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell,
-        };
+        use pkcore::casino::table_no_cell::{PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell};
 
         let seats = SeatsNoCell::new(vec![
             SeatNoCell::new(PlayerNoCell::new_with_chips("rich".to_string(), 300_000)),
@@ -2099,9 +2107,15 @@ mod tests {
         assert_eq!(capped[0].0, 0);
         assert_eq!(capped[0].1, "rich");
         assert_eq!(capped[0].2, 300_000);
-        assert_eq!(session.table.seats.get_seat(0).unwrap().player.chips, 10_000);
+        assert_eq!(
+            session.table.seats.get_seat(0).unwrap().player.chips,
+            10_000
+        );
         assert_eq!(session.table.seats.get_seat(1).unwrap().player.chips, 1_000);
-        assert_eq!(session.table.seats.get_seat(2).unwrap().player.chips, 10_000);
+        assert_eq!(
+            session.table.seats.get_seat(2).unwrap().player.chips,
+            10_000
+        );
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
