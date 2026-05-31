@@ -2746,6 +2746,7 @@ mod tests {
                 seat: u32::from(seat),
                 action_type: action_type as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut().insert(
@@ -3166,6 +3167,7 @@ mod tests {
                     seat: u32::from(next_seat),
                     action_type: ActionType::Fold as i32,
                     amount: 0,
+                    agent: None,
                 }),
             }))
             .await;
@@ -3201,6 +3203,7 @@ mod tests {
                 seat: u32::from(next_seat),
                 action_type: ActionType::Fold as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut().insert(
@@ -3815,6 +3818,7 @@ mod tests {
                 seat: 4,
                 action_type: ActionType::Fold as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut()
@@ -4019,6 +4023,7 @@ mod tests {
                 // Heads-up preflop: SB must call to continue.
                 action_type: ActionType::Call as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut().insert(

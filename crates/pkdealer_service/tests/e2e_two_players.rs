@@ -114,6 +114,7 @@ impl PlayerClient {
                 seat: self.seat,
                 action_type: action as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut().insert(
@@ -134,6 +135,7 @@ impl PlayerClient {
                 seat: self.seat,
                 action_type: action as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut().insert(

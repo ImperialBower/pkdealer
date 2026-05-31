@@ -464,6 +464,9 @@ fn decision_to_proto(seat: u8, decision: &Decision) -> ProtoAction {
         seat: u32::from(seat),
         action_type: action_type as i32,
         amount,
+        // Agent-fidelity provenance is attached later (EPIC-25 Phase 4, step 5);
+        // the core runner emits a bare decision for now.
+        agent: None,
     }
 }
 
