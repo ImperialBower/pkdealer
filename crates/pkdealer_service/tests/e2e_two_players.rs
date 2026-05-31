@@ -13,9 +13,9 @@ use std::{
 };
 
 use pkdealer_proto::dealer::{
-    ActRequest, ActionType, GetChipsRequest, GetNextToActRequest, PlayerAction, SeatPlayerRequest,
-    StartHandRequest, act_response, dealer_service_client::DealerServiceClient,
-    get_next_to_act_response, seat_player_response,
+    ActRequest, ActionType, ExportSessionRequest, GetChipsRequest, GetNextToActRequest,
+    PlayerAction, SeatPlayerRequest, StartHandRequest, act_response,
+    dealer_service_client::DealerServiceClient, get_next_to_act_response, seat_player_response,
 };
 use tonic::{Request, metadata::MetadataValue};
 
@@ -270,6 +270,37 @@ async fn e2e_two_players_full_hand_with_token_enforcement() -> Result<(), Box<dy
         .chips;
     let total: u32 = chips.iter().map(|p| p.chips).sum();
     assert_eq!(total, 2_000, "chips must be conserved end-to-end");
+
+    // ── EPIC-25: export the session and replay it off the wire ───────────────
+    // The spectator token authorizes the export; the YAML must round-trip into a
+    // HandCollection whose single hand replays with chip conservation.
+    let mut export_req = Request::new(ExportSessionRequest {});
+    export_req.metadata_mut().insert(
+        PLAYER_TOKEN_KEY,
+        MetadataValue::try_from("spectator").expect("valid token"),
+    );
+    let export = orchestrator.export_session(export_req).await?.into_inner();
+    assert_eq!(export.hand_count, 1, "one hand recorded this session");
+    assert_eq!(export.source, "arena");
+
+    let collection = pkcore::hand_history::HandCollection::from_yaml(&export.payload)
+        .expect("exported YAML parses as a HandCollection");
+    assert_eq!(collection.len(), 1);
+    let replay = collection.hands[0].replay().expect("replay succeeds");
+    assert!(
+        replay.is_consistent,
+        "exported hand must replay with chip conservation"
+    );
+
+    // Export without the spectator token must be denied (payload has all cards).
+    let denied = orchestrator
+        .export_session(Request::new(ExportSessionRequest {}))
+        .await;
+    assert_eq!(
+        denied.unwrap_err().code(),
+        tonic::Code::PermissionDenied,
+        "export without spectator token must be PERMISSION_DENIED"
+    );
 
     Ok(())
 }

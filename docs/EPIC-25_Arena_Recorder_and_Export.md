@@ -8,9 +8,9 @@
 
 | Component | Status |
 |---|---|
-| In-memory `HandCollection` recorder on `TableState` | Planned |
-| Hand-end recording hook inside `act()` (snapshot-before / stacks-after) | Planned |
-| `ExportSession` RPC (YAML) | Planned |
+| In-memory `HandCollection` recorder on `TableState` | ✅ Done (Phase 1) |
+| Hand-end recording hook inside `act()` (snapshot-before / stacks-after) | ✅ Done (Phase 1) |
+| `ExportSession` RPC (YAML) | ✅ Done (Phase 1) |
 | `ExportSession` JSON format | Planned |
 | `GetSessionInfo` RPC | Planned |
 | Disk sink via `PKDEALER_RECORD_DIR` | Planned |
@@ -18,6 +18,32 @@
 | Deck capture for exact replay (`shuffled_deck`) | Planned (Phase 3, pending `pkcore` accessor) |
 | Agent-fidelity per-action annotations | Planned (Phase 4, needs `pkcore` schema work) |
 | `audit.rs` replay + chip-conservation verification | Existing — reused as the oracle |
+
+### Phase 1 implementation notes (deviations from the pseudo-code below)
+
+Two corrections were required against the live code; later phases should follow
+the implemented behavior, not the original snippets:
+
+1. **Starting stacks.** The `player_snapshot` must use each seat's stack
+   captured **before `start_hand()` posts blinds**, not `seat.player.chips` at
+   `HandComplete` (those are post-betting). Implemented via a new
+   `TableState.hand_starting_stacks`, snapshotted just before `start_hand()` and
+   committed on the winning `Ok(())` branch. `pkcore` computes
+   `net = ending − starting` from this field, so getting it wrong corrupts every
+   record.
+2. **`event_log` is cumulative and is kept that way.** `TableNoCell::reset()`
+   *appends* `ResetTable`+audit to `event_log` rather than clearing it, and we
+   deliberately do **not** clear it (so `GetEventLog` keeps the full session).
+   Each recorded hand instead takes a *slice* `event_log[hand_event_log_start..]`
+   captured before `end_hand()`; the marker advances to `event_log.len()` after
+   every hand (Ok and Err) so the next slice is clean.
+
+Phase 1 ships YAML-only with an empty `ExportSessionRequest` (no `RecordFormat`
+enum / `drain` yet — deferred to Phase 2 to keep the proto change additive).
+The export RPC requires the spectator token. Note the gRPC package is
+`pkdealer.dealer.v1`, so the service method is
+`pkdealer.dealer.v1.DealerService/ExportSession` (the grpcurl example in
+"Verification" below uses the wrong `dealer.DealerService` path).
 
 ---
 

@@ -48,14 +48,14 @@ mod tests {
     use super::*;
 
     use pkdealer_proto::dealer::{
-        ActRequest, ActResponse, GetBoardRequest, GetBoardResponse, GetChipsRequest,
-        GetChipsResponse, GetEventLogRequest, GetEventLogResponse, GetNextToActRequest,
-        GetNextToActResponse, GetPlayerStatsRequest, GetPlayerStatsResponse, GetPotRequest,
-        GetPotResponse, GetStatusRequest, GetStatusResponse, GetTableConfigRequest,
-        GetTableConfigResponse, PingReply, PingRequest, RebuyRequest, RebuyResponse,
-        RemovePlayerRequest, RemovePlayerResponse, SeatPlayerAtRequest, SeatPlayerAtResponse,
-        SeatPlayerRequest, SeatPlayerResponse, StartHandRequest, StartHandResponse,
-        StreamEventsRequest, TableEvent,
+        ActRequest, ActResponse, ExportSessionRequest, ExportSessionResponse, GetBoardRequest,
+        GetBoardResponse, GetChipsRequest, GetChipsResponse, GetEventLogRequest,
+        GetEventLogResponse, GetNextToActRequest, GetNextToActResponse, GetPlayerStatsRequest,
+        GetPlayerStatsResponse, GetPotRequest, GetPotResponse, GetStatusRequest, GetStatusResponse,
+        GetTableConfigRequest, GetTableConfigResponse, PingReply, PingRequest, RebuyRequest,
+        RebuyResponse, RemovePlayerRequest, RemovePlayerResponse, SeatPlayerAtRequest,
+        SeatPlayerAtResponse, SeatPlayerRequest, SeatPlayerResponse, StartHandRequest,
+        StartHandResponse, StreamEventsRequest, TableEvent,
         dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
     };
     use tokio::net::TcpListener;
@@ -155,6 +155,13 @@ mod tests {
             &self,
             _request: Request<GetTableConfigRequest>,
         ) -> Result<Response<GetTableConfigResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+
+        async fn export_session(
+            &self,
+            _request: Request<ExportSessionRequest>,
+        ) -> Result<Response<ExportSessionResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
         }
 

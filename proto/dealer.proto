@@ -64,6 +64,11 @@ service DealerService {
   // Stream all table events as they happen. Supply player_token to receive
   // your own hole cards in event status snapshots.
   rpc StreamEvents(StreamEventsRequest) returns (stream TableEvent);
+
+  // Export every hand recorded so far this session as a serialized pkcore
+  // HandCollection (YAML). Requires the spectator token via x-player-token,
+  // because the payload contains every player's hole cards.
+  rpc ExportSession(ExportSessionRequest) returns (ExportSessionResponse);
 }
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
@@ -285,6 +290,18 @@ message GetPotResponse { uint32 pot = 1; }
 
 message GetEventLogRequest  {}
 message GetEventLogResponse { string log = 1; }
+
+// Phase 1 export takes no parameters: the whole session is returned as YAML.
+// (A format selector and drain flag are reserved for a later phase.)
+message ExportSessionRequest {}
+message ExportSessionResponse {
+  // Number of hands in the exported collection.
+  uint32 hand_count = 1;
+  // The session's HandCollection serialized as YAML.
+  string payload = 2;
+  // Source tag embedded in each recorded hand (always "arena").
+  string source = 3;
+}
 
 message GetTableConfigRequest {}
 message GetTableConfigResponse { TableConfig config = 1; }
