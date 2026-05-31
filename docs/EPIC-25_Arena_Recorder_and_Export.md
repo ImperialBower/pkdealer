@@ -15,7 +15,7 @@
 | `GetSessionInfo` RPC | ✅ Done (Phase 2) |
 | Disk sink via `PKDEALER_RECORD_DIR` | ✅ Done (Phase 2) |
 | `drain` / `PKDEALER_RECORD_MAX_HANDS` buffer controls | ✅ Done (Phase 2) |
-| Deck capture for exact replay (`shuffled_deck`) | Planned (Phase 3, pending `pkcore` accessor) |
+| Deck capture for exact replay (`shuffled_deck`) | ✅ Done (Phase 3 — `PokerSession::shuffled_deck_str`) |
 | Agent-fidelity per-action annotations | Planned (Phase 4, needs `pkcore` schema work) |
 | `audit.rs` replay + chip-conservation verification | Existing — reused as the oracle |
 
@@ -68,6 +68,18 @@ The export RPC requires the spectator token. Note the gRPC package is
    returns `recording_enabled`, `hand_count`, first/last hand id, and the
    resolved session-file path (empty when disk persistence is off); it needs no
    token since it carries no hole cards.
+
+**Phase 3 — deck capture (no `pkcore` follow-up needed):** the anticipated
+accessor already exists. `PokerSession::start_hand` runs
+`self.shuffled_deck_str = Some(self.table.deck.to_string())` immediately after
+the shuffle (before any dealing) and exposes it as the public field
+`shuffled_deck_str: Option<String>`, which `end_hand` does not clear. The
+recorder snapshots `guard.session.shuffled_deck_str.clone()` before `end_hand()`
+and passes it as `shuffled_deck` to `from_table_state_with_ids`, so every record
+carries the full 52-card post-shuffle order. Note `pkcore`'s `replay()` does
+**not** consume this field — it reconstructs from recorded actions + hole cards
++ board — so the deck is forensic/exact-reproducibility metadata, not a replay
+input. No `TableNoCell` accessor work or follow-up is required.
 
 ---
 
@@ -371,18 +383,22 @@ async fn export_session(&self, req: Request<ExportSessionRequest>)
 - `uuid` is already a service dependency (token maps), so the 5-tuple snapshot
   is free.
 
-### Deck capture (optional, for exact replay)
+### Deck capture (✅ Phase 3 — shipped)
 
 `from_table_state*` accepts `shuffled_deck: Option<String>`; when present a hand
-"can be fully replayed from this deck alone." `demo.rs` passes `None`, and
-`replay()` still works by re-running the recorded actions against the recorded
-board — so this is a **nice-to-have**, not a blocker.
+"can be fully replayed from this deck alone." `replay()` does not require it (it
+re-runs the recorded actions against the recorded board), so it remains a
+forensic/exact-reproducibility nice-to-have, not a blocker.
 
-Action: confirm the accessor for the post-shuffle deck on `TableNoCell` (e.g. a
-`deck`/`to_deck_string()` method). If it exists and can be read at `start_hand`
-time, stash it in `TableState` for the duration of the hand and pass
-`Some(deck_str)` into the recorder. If not, ship with `None` and file a
-follow-up to expose it in `pkcore`.
+**Resolved:** no `pkcore` accessor follow-up is needed — the post-shuffle deck
+is already captured. `PokerSession::start_hand` runs
+`self.shuffled_deck_str = Some(self.table.deck.to_string())` right after the
+shuffle (before dealing) and stores it on the public field
+`shuffled_deck_str: Option<String>`; `end_hand` never clears it. The recorder
+clones `guard.session.shuffled_deck_str` in the pre-`end_hand` snapshot block and
+passes it straight into `from_table_state_with_ids`, so every recorded hand
+carries the full 52-card order. (No need to read `TableNoCell.deck` directly or
+stash anything extra in `TableState`.)
 
 ### Concurrency, memory, failure
 
@@ -419,9 +435,9 @@ follow-up to expose it in `pkcore`.
    `record_dir`, with `tracing::warn!` on failure.
 9. Implement `drain = true` buffer clearing and the optional
    `PKDEALER_RECORD_MAX_HANDS` cap.
-10. (Phase 3) Confirm/stash the post-shuffle deck string and pass
-    `Some(deck_str)` into the recorder; otherwise file the `pkcore` accessor
-    follow-up.
+10. ✅ (Phase 3) Pass the post-shuffle deck string into the recorder. No stash or
+    `pkcore` follow-up needed — `PokerSession::shuffled_deck_str` is captured at
+    `start_hand` and read in the pre-`end_hand` snapshot block.
 11. Write the unit, e2e, round-trip, and regression-harness tests (see
     Verification).
 12. Document `PKDEALER_RECORD_DIR` / `PKDEALER_RECORD_MAX_HANDS` in the service
@@ -478,13 +494,13 @@ cargo run --bin audit -- ./recordings   # expect zero inconsistencies/leaks
 
 ## Rollout phases
 
-1. **Phase 1 — in-memory recorder + `ExportSession` (YAML).** Smallest change
+1. ✅ **Phase 1 — in-memory recorder + `ExportSession` (YAML).** Smallest change
    that unblocks all downstream analysis. Hook in `act()`, buffer in
    `TableState`, one RPC.
-2. **Phase 2 — disk sink (`PKDEALER_RECORD_DIR`) + `GetSessionInfo` + JSON
+2. ✅ **Phase 2 — disk sink (`PKDEALER_RECORD_DIR`) + `GetSessionInfo` + JSON
    format.** Durability and web-friendly output; drain/cap controls.
-3. **Phase 3 — deck capture** for exact replay (pending the `pkcore` accessor in
-   "Deck capture").
+3. ✅ **Phase 3 — deck capture** for exact replay — shipped via
+   `PokerSession::shuffled_deck_str` (no `pkcore` accessor follow-up needed).
 4. **Phase 4 — agent-fidelity annotations** (Step 2 of the eval roadmap): thread
    each agent's raw response + `was_coerced` flag into the hand history as
    per-action metadata. This is a separate change in `agent_core`/`agent_llm`
@@ -499,6 +515,6 @@ cargo run --bin audit -- ./recordings   # expect zero inconsistencies/leaks
 | 1 | Default export format | YAML (reuses `audit.rs` as-is); add JSON in Phase 2 |
 | 2 | Recording on by default? | Yes, in-memory; disk opt-in via env |
 | 3 | Access control on `ExportSession` | Require spectator/admin token (payload has all hole cards) |
-| 4 | Capture deck for exact replay? | Phase 3, after confirming the `pkcore` accessor |
+| 4 | Capture deck for exact replay? | ✅ Done — `PokerSession::shuffled_deck_str` already exists; threaded into every record |
 | 5 | Use `from_table_state_with_ids` (Uuid)? | Yes — needed for `StatsRegistry` correlation in Step 3 |
 | 6 | Does anything reach the `pkcore 0.1.2` pin? | No bump needed for the recorder; revisit only for Phase 4 schema work |

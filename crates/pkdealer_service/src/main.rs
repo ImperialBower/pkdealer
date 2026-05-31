@@ -1717,6 +1717,11 @@ impl DealerServiceTrait for DealerService {
                             let rec_ts_secs = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map_or(0, |d| d.as_secs());
+                            // EPIC-25 Phase 3: the full post-shuffle deck string
+                            // pkcore captured at `start_hand` (before dealing),
+                            // for exact-replay / forensic reproducibility. Not
+                            // consumed by `replay()` — stored as record metadata.
+                            let rec_shuffled_deck = guard.session.shuffled_deck_str.clone();
                             // Per-hand slice of the cumulative event log: only the
                             // actions since the last hand ended, so the record
                             // replays cleanly while `event_log` stays full-session.
@@ -1793,7 +1798,7 @@ impl DealerServiceTrait for DealerService {
                                             &rec_event_log,
                                             &ending_stacks,
                                             "arena",
-                                            None,
+                                            rec_shuffled_deck,
                                         );
                                         guard.recorder.push(hh);
 
@@ -4821,6 +4826,30 @@ mod tests {
             .await?
             .into_inner();
         assert_eq!(second.hand_count, 0, "buffer should be empty after drain");
+        Ok(())
+    }
+
+    /// EPIC-25 Phase 3: each recorded hand carries the full 52-card post-shuffle
+    /// deck string pkcore captured at `start_hand`.
+    #[tokio::test]
+    async fn recorded_hand_captures_shuffled_deck() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        play_hand_to_completion(&service, &tokens).await?;
+
+        let guard = service.lock().expect("lock");
+        let deck = guard.recorder.hands[0]
+            .shuffled_deck
+            .as_ref()
+            .expect("recorded hand should carry the shuffled deck");
+        assert_eq!(
+            deck.split_whitespace().count(),
+            52,
+            "shuffled deck should be 52 space-separated card tokens, got {deck:?}"
+        );
         Ok(())
     }
 
