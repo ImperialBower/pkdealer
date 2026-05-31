@@ -299,6 +299,13 @@ struct TableState {
     /// begin. Lets each recorded hand take a clean per-hand slice of the log
     /// without clearing it, so `GetEventLog` keeps the full-session history.
     hand_event_log_start: usize,
+    /// Per-`Act` agent-fidelity metadata for the hand currently in progress, in
+    /// **arrival order** — one entry per successfully-applied voluntary action
+    /// (EPIC-25 Phase 4). Cleared on `start_hand`; zipped onto the recorded
+    /// `HandHistory` via `attach_agent_fidelity` in the hand-end hook. Entries
+    /// carry `AgentFidelity::default()` for acts submitted without agent data,
+    /// preserving 1:1 alignment with the replayed voluntary-action list.
+    hand_agent_fidelity: Vec<(u8, pkcore::hand_history::AgentFidelity)>,
     /// Resolved path of the session YAML file when disk persistence is enabled
     /// (EPIC-25 Phase 2), or `None` for in-memory only. Computed once at
     /// construction from `DealerConfig::record_dir`. The full collection is
@@ -421,6 +428,7 @@ impl DealerService {
             recorder: pkcore::hand_history::HandCollection::new(),
             hand_starting_stacks: Vec::new(),
             hand_event_log_start: 0,
+            hand_agent_fidelity: Vec::new(),
             record_file,
         }));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -936,6 +944,40 @@ fn hole_cards_string(seat: &SeatNoCell) -> Option<String> {
     }
 }
 
+/// Converts a proto [`pkdealer_proto::dealer::AgentFidelity`] into the pkcore
+/// recorder type [`pkcore::hand_history::AgentFidelity`] (EPIC-25 Phase 4).
+///
+/// Widens the wire representation to pkcore's: the intended-action enum (proto
+/// `ActionType` `i32`) maps to [`pkcore::hand_history::ActionType`], and
+/// `intended_amount` widens from `u32` chips to `f64`. An `UNSPECIFIED` or
+/// unknown intended action maps to `None`. Every other field carries over
+/// `Option`-for-`Option`, preserving the absent-vs-present distinction.
+fn proto_agent_to_pkcore(
+    p: pkdealer_proto::dealer::AgentFidelity,
+) -> pkcore::hand_history::AgentFidelity {
+    use pkcore::hand_history::ActionType as PkActionType;
+    let intended_action = p
+        .intended_action_type
+        .and_then(|v| match ActionType::try_from(v) {
+            Ok(ActionType::Bet) => Some(PkActionType::Bet),
+            Ok(ActionType::Call) => Some(PkActionType::Call),
+            Ok(ActionType::Check) => Some(PkActionType::Check),
+            Ok(ActionType::Raise) => Some(PkActionType::Raise),
+            Ok(ActionType::AllIn) => Some(PkActionType::AllIn),
+            Ok(ActionType::Fold) => Some(PkActionType::Fold),
+            Ok(ActionType::Unspecified) | Err(_) => None,
+        });
+    pkcore::hand_history::AgentFidelity {
+        raw_response: p.raw_response,
+        was_coerced: p.was_coerced,
+        intended_action,
+        intended_amount: p.intended_amount.map(f64::from),
+        input_tokens: p.input_tokens,
+        output_tokens: p.output_tokens,
+        model: p.model,
+    }
+}
+
 /// Rewrites the full session [`HandCollection`] to `path` as YAML (EPIC-25
 /// Phase 2 disk sink), creating the parent directory if needed.
 ///
@@ -1394,6 +1436,8 @@ impl DealerServiceTrait for DealerService {
                 Ok(()) => {
                     // EPIC-25: this hand's starting stacks are now fixed.
                     guard.hand_starting_stacks = pre_blind_stacks;
+                    // EPIC-25 Phase 4: start a fresh per-hand agent-fidelity buffer.
+                    guard.hand_agent_fidelity.clear();
                     // Open the hand span for the full hand lifecycle.
                     let hand_id = uuid::Uuid::new_v4();
                     let span = tracing::info_span!(
@@ -1502,6 +1546,16 @@ impl DealerServiceTrait for DealerService {
                 proto_action.action_type
             ))
         })?;
+
+        // EPIC-25 Phase 4: capture optional agent-fidelity provenance, converted
+        // to the pkcore recorder type. Defaults to an empty `AgentFidelity` when
+        // the client submitted none, so the per-hand buffer keeps one entry per
+        // voluntary action (1:1 with the replayed action list). Buffered only on
+        // the success path below, after the action is accepted.
+        let agent_fidelity = proto_action
+            .agent
+            .map(proto_agent_to_pkcore)
+            .unwrap_or_default();
 
         // Verify the token authorizes this seat before acquiring the broader lock.
         {
@@ -1619,6 +1673,11 @@ impl DealerServiceTrait for DealerService {
 
         match guard.session.apply_action(seat, player_action) {
             Ok(()) => {
+                // EPIC-25 Phase 4: the action is now part of the hand's voluntary
+                // sequence; buffer its agent-fidelity in arrival order so the
+                // hand-end hook can zip it onto the recorded HandHistory.
+                guard.hand_agent_fidelity.push((seat, agent_fidelity));
+
                 // Record action attributes now that the action has been accepted.
                 action_span.record("action_type", format!("{action_type:?}").as_str());
                 action_span.record("amount", i64::try_from(amount).unwrap_or(i64::MAX));
@@ -2486,6 +2545,52 @@ mod tests {
     #[test]
     fn parse_hands_per_level_defaults_when_absent() {
         assert_eq!(parse_hands_per_level(None), DEFAULT_HANDS_PER_LEVEL);
+    }
+
+    // ── EPIC-25 Phase 4: agent-fidelity proto → pkcore conversion ──────────
+
+    #[test]
+    fn proto_agent_to_pkcore_full_conversion() {
+        use pkdealer_proto::dealer::{ActionType as ProtoAt, AgentFidelity as ProtoAgent};
+        let proto = ProtoAgent {
+            raw_response: Some("raise to 250".to_string()),
+            was_coerced: Some(true),
+            intended_action_type: Some(ProtoAt::Raise as i32),
+            intended_amount: Some(250),
+            input_tokens: Some(1200),
+            output_tokens: Some(8),
+            model: Some("claude-test".to_string()),
+        };
+        let pk = proto_agent_to_pkcore(proto);
+        assert_eq!(pk.raw_response.as_deref(), Some("raise to 250"));
+        assert_eq!(pk.was_coerced, Some(true));
+        assert_eq!(
+            pk.intended_action,
+            Some(pkcore::hand_history::ActionType::Raise)
+        );
+        assert_eq!(pk.intended_amount, Some(250.0)); // u32 chips widened to f64
+        assert_eq!(pk.input_tokens, Some(1200));
+        assert_eq!(pk.output_tokens, Some(8));
+        assert_eq!(pk.model.as_deref(), Some("claude-test"));
+    }
+
+    #[test]
+    fn proto_agent_to_pkcore_unspecified_intent_is_none() {
+        use pkdealer_proto::dealer::{ActionType as ProtoAt, AgentFidelity as ProtoAgent};
+        let proto = ProtoAgent {
+            intended_action_type: Some(ProtoAt::Unspecified as i32),
+            ..Default::default()
+        };
+        assert_eq!(proto_agent_to_pkcore(proto).intended_action, None);
+    }
+
+    #[test]
+    fn proto_agent_to_pkcore_empty_proto_is_default() {
+        use pkdealer_proto::dealer::AgentFidelity as ProtoAgent;
+        assert_eq!(
+            proto_agent_to_pkcore(ProtoAgent::default()),
+            pkcore::hand_history::AgentFidelity::default()
+        );
     }
 
     #[test]
