@@ -1846,7 +1846,7 @@ impl DealerServiceTrait for DealerService {
                                                 })
                                                 .collect()
                                         };
-                                        let hh = pkcore::hand_history::HandHistory::from_table_state_with_ids(
+                                        let mut hh = pkcore::hand_history::HandHistory::from_table_state_with_ids(
                                             rec_hand_num,
                                             rec_ts_secs,
                                             rec_button,
@@ -1859,6 +1859,45 @@ impl DealerServiceTrait for DealerService {
                                             "arena",
                                             rec_shuffled_deck,
                                         );
+
+                                        // EPIC-25 Phase 4: zip the buffered
+                                        // per-Act agent-fidelity onto the hand's
+                                        // voluntary actions. Skip when no act
+                                        // carried agent data (manual hands), so
+                                        // their YAML stays free of empty `agent`
+                                        // blocks and byte-identical to before.
+                                        let empty = pkcore::hand_history::AgentFidelity::default();
+                                        let entries = &guard.hand_agent_fidelity;
+                                        if entries.iter().any(|(_, f)| f != &empty) {
+                                            let annotated = hh.attach_agent_fidelity(entries);
+                                            // attach is a strict positional zip;
+                                            // a count mismatch means the buffer
+                                            // drifted from the replayed action
+                                            // list (see pkcore docs). Log it —
+                                            // recording stays best-effort.
+                                            if annotated != entries.len() {
+                                                tracing::warn!(
+                                                    hand = rec_hand_num,
+                                                    annotated,
+                                                    buffered = entries.len(),
+                                                    "agent-fidelity drift: annotated \
+                                                     != buffered; metadata may be \
+                                                     misaligned or dropped"
+                                                );
+                                            }
+                                            // attach stamps every aligned slot,
+                                            // including the empty placeholders
+                                            // buffered for acts that carried no
+                                            // agent data (mixed human/bot tables).
+                                            // Null those out so agent-less actions
+                                            // stay clean (no empty `agent` block).
+                                            for action in hh.voluntary_actions_mut() {
+                                                if action.agent.as_ref() == Some(&empty) {
+                                                    action.agent = None;
+                                                }
+                                            }
+                                        }
+
                                         guard.recorder.push(hh);
 
                                         // EPIC-25 Phase 2: flush the whole
