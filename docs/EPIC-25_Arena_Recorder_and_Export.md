@@ -11,10 +11,10 @@
 | In-memory `HandCollection` recorder on `TableState` | ✅ Done (Phase 1) |
 | Hand-end recording hook inside `act()` (snapshot-before / stacks-after) | ✅ Done (Phase 1) |
 | `ExportSession` RPC (YAML) | ✅ Done (Phase 1) |
-| `ExportSession` JSON format | Planned |
-| `GetSessionInfo` RPC | Planned |
-| Disk sink via `PKDEALER_RECORD_DIR` | Planned |
-| `drain` / `PKDEALER_RECORD_MAX_HANDS` buffer controls | Planned |
+| `ExportSession` JSON format | ✅ Done (Phase 2) |
+| `GetSessionInfo` RPC | ✅ Done (Phase 2) |
+| Disk sink via `PKDEALER_RECORD_DIR` | ✅ Done (Phase 2) |
+| `drain` / `PKDEALER_RECORD_MAX_HANDS` buffer controls | ✅ Done (Phase 2) |
 | Deck capture for exact replay (`shuffled_deck`) | Planned (Phase 3, pending `pkcore` accessor) |
 | Agent-fidelity per-action annotations | Planned (Phase 4, needs `pkcore` schema work) |
 | `audit.rs` replay + chip-conservation verification | Existing — reused as the oracle |
@@ -44,6 +44,30 @@ The export RPC requires the spectator token. Note the gRPC package is
 `pkdealer.dealer.v1`, so the service method is
 `pkdealer.dealer.v1.DealerService/ExportSession` (the grpcurl example in
 "Verification" below uses the wrong `dealer.DealerService` path).
+
+**Phase 2 additions / deviations:**
+
+3. **Disk sink is whole-file rewrite, not append.** `audit.rs` reads each file
+   as a complete `HandCollection` via `from_yaml`, and a `HandCollection` YAML
+   has header fields (`pkcore_version`, `format_version`) before `hands:`, so a
+   naive per-hand append would not parse. The sink therefore rewrites the full
+   in-memory collection to a single per-session file
+   (`<PKDEALER_RECORD_DIR>/session-<unix_ts>.yaml`) after every completed hand.
+   This keeps the file always audit-readable and preserves cross-hand chip-leak
+   detection, at the cost of O(n²) cumulative write volume over a long session
+   (acceptable: files are small and writes are best-effort, `tracing::warn!` on
+   failure, never aborting a hand).
+4. **`PKDEALER_RECORD_MAX_HANDS` caps the in-memory buffer only.** Because the
+   disk file is rewritten from memory, combining the cap with `PKDEALER_RECORD_DIR`
+   means the on-disk file reflects the capped in-memory window — i.e. dropped
+   oldest hands are not retained on disk. For a full-session file, leave the cap
+   unset. (This differs from the EPIC's "drops oldest once flushed to disk"
+   wording, which assumed an append-only sink incompatible with audit's reader.)
+5. `ExportSession` now honors `format` (YAML default / JSON via `serde_json`)
+   and `drain` (clears the buffer after a successful export). `GetSessionInfo`
+   returns `recording_enabled`, `hand_count`, first/last hand id, and the
+   resolved session-file path (empty when disk persistence is off); it needs no
+   token since it carries no hole cards.
 
 ---
 

@@ -66,9 +66,13 @@ service DealerService {
   rpc StreamEvents(StreamEventsRequest) returns (stream TableEvent);
 
   // Export every hand recorded so far this session as a serialized pkcore
-  // HandCollection (YAML). Requires the spectator token via x-player-token,
-  // because the payload contains every player's hole cards.
+  // HandCollection (YAML or JSON). Requires the spectator token via
+  // x-player-token, because the payload contains every player's hole cards.
   rpc ExportSession(ExportSessionRequest) returns (ExportSessionResponse);
+
+  // Lightweight progress check: how many hands are buffered, the id range, and
+  // whether/where hands are persisted to disk. No token required (no cards).
+  rpc GetSessionInfo(GetSessionInfoRequest) returns (GetSessionInfoResponse);
 }
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
@@ -291,16 +295,43 @@ message GetPotResponse { uint32 pot = 1; }
 message GetEventLogRequest  {}
 message GetEventLogResponse { string log = 1; }
 
-// Phase 1 export takes no parameters: the whole session is returned as YAML.
-// (A format selector and drain flag are reserved for a later phase.)
-message ExportSessionRequest {}
+// Serialization format for an exported HandCollection.
+enum RecordFormat {
+  RECORD_FORMAT_UNSPECIFIED = 0;  // server default (YAML)
+  RECORD_FORMAT_YAML = 1;
+  RECORD_FORMAT_JSON = 2;
+}
+
+message ExportSessionRequest {
+  // Output format. UNSPECIFIED defaults to YAML.
+  RecordFormat format = 1;
+  // If true, the in-memory buffer is cleared after a successful export so the
+  // next export starts fresh. Default false (idempotent reads).
+  bool drain = 2;
+}
 message ExportSessionResponse {
   // Number of hands in the exported collection.
   uint32 hand_count = 1;
-  // The session's HandCollection serialized as YAML.
+  // The session's HandCollection serialized in `format`.
   string payload = 2;
   // Source tag embedded in each recorded hand (always "arena").
   string source = 3;
+  // The format `payload` is encoded in (echoes the resolved request format).
+  RecordFormat format = 4;
+}
+
+message GetSessionInfoRequest {}
+message GetSessionInfoResponse {
+  // Always true in Phase 2 (in-memory recording is on by default).
+  bool recording_enabled = 1;
+  // Number of hands currently buffered in memory.
+  uint32 hand_count = 2;
+  // Id of the oldest buffered hand (empty when none).
+  string first_hand_id = 3;
+  // Id of the newest buffered hand (empty when none).
+  string last_hand_id = 4;
+  // Absolute path of the session YAML file, or empty if disk persistence is off.
+  string record_dir = 5;
 }
 
 message GetTableConfigRequest {}

@@ -274,7 +274,7 @@ async fn e2e_two_players_full_hand_with_token_enforcement() -> Result<(), Box<dy
     // ── EPIC-25: export the session and replay it off the wire ───────────────
     // The spectator token authorizes the export; the YAML must round-trip into a
     // HandCollection whose single hand replays with chip conservation.
-    let mut export_req = Request::new(ExportSessionRequest {});
+    let mut export_req = Request::new(ExportSessionRequest::default());
     export_req.metadata_mut().insert(
         PLAYER_TOKEN_KEY,
         MetadataValue::try_from("spectator").expect("valid token"),
@@ -294,7 +294,7 @@ async fn e2e_two_players_full_hand_with_token_enforcement() -> Result<(), Box<dy
 
     // Export without the spectator token must be denied (payload has all cards).
     let denied = orchestrator
-        .export_session(Request::new(ExportSessionRequest {}))
+        .export_session(Request::new(ExportSessionRequest::default()))
         .await;
     assert_eq!(
         denied.unwrap_err().code(),
