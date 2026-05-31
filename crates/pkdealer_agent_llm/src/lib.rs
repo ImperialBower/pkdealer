@@ -57,5 +57,5 @@ pub mod prompt;
 
 pub use agent::{LlmPokerAgent, fallback_decision};
 pub use backend::{LlmBackend, LlmError, LlmResponse};
-pub use parse::parse_action;
+pub use parse::{parse_action, parse_action_opt};
 pub use prompt::{build_prompt, pot_odds};

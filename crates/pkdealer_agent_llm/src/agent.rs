@@ -1,17 +1,17 @@
 //! The generic [`LlmPokerAgent`] wrapper.
 //!
 //! [`LlmPokerAgent<B>`] composes any [`LlmBackend`] with the shared
-//! [`build_prompt`] / [`parse_action`]
+//! [`build_prompt`] / [`parse_action_opt`]
 //! pipeline to produce a value that satisfies
 //! [`pkdealer_agent_core::PokerAgent`]. Backend authors only need to wire up
 //! HTTP — the poker-side concerns are handled here.
 
 use async_trait::async_trait;
-use pkdealer_agent_core::{Decision, HandState, PokerAgent};
+use pkdealer_agent_core::{AgentFidelity, Decision, HandState, PokerAgent};
 use tracing::Instrument as _;
 
 use crate::backend::LlmBackend;
-use crate::parse::parse_action;
+use crate::parse::parse_action_opt;
 use crate::prompt::{build_prompt, pot_odds};
 
 /// Generic poker agent driven by any [`LlmBackend`].
@@ -21,7 +21,7 @@ use crate::prompt::{build_prompt, pot_odds};
 /// 1. Builds a prompt from the [`HandState`] via [`build_prompt`].
 /// 2. Calls `backend.complete(&prompt)` inside an `llm.decision` span carrying
 ///    `gen_ai.*` OpenTelemetry semantic-convention attributes.
-/// 3. Parses the response with [`parse_action`] and records the chosen
+/// 3. Parses the response with [`parse_action_opt`] and records the chosen
 ///    action on the span.
 /// 4. On backend error, returns [`fallback_decision`] (`Check` when there is
 ///    nothing to call, `Fold` otherwise) so the agent never stalls a hand.
@@ -88,10 +88,15 @@ impl<B> LlmPokerAgent<B> {
 #[async_trait]
 impl<B: LlmBackend> PokerAgent for LlmPokerAgent<B> {
     async fn decide(&self, state: &HandState) -> Decision {
+        self.decide_with_fidelity(state).await.0
+    }
+
+    async fn decide_with_fidelity(&self, state: &HandState) -> (Decision, AgentFidelity) {
         let prompt = build_prompt(state);
         let pot_odds_val = pot_odds(state);
         let to_call = state.to_call;
         let street = state.street.clone();
+        let model = (!self.model.is_empty()).then(|| self.model.clone());
 
         let span = tracing::info_span!(
             "llm.decision",
@@ -115,7 +120,10 @@ impl<B: LlmBackend> PokerAgent for LlmPokerAgent<B> {
             Ok(response) => {
                 span.record("gen_ai.usage.input_tokens", response.input_tokens);
                 span.record("gen_ai.usage.output_tokens", response.output_tokens);
-                let decision = parse_action(&response.text, to_call);
+                // `None` ⇒ the model produced something unparseable; we apply a
+                // safe fallback and flag the coercion while keeping the raw text.
+                let parsed = parse_action_opt(&response.text);
+                let decision = parsed.clone().unwrap_or_else(|| fallback_decision(to_call));
                 span.record("poker.action_chosen", tracing::field::debug(&decision));
                 eprintln!(
                     "[{system}] {street} → {text:?} → {decision:?}  (in={in_tok} out={out_tok})",
@@ -128,7 +136,17 @@ impl<B: LlmBackend> PokerAgent for LlmPokerAgent<B> {
                     in_tok = response.input_tokens,
                     out_tok = response.output_tokens,
                 );
-                decision
+                let fidelity = AgentFidelity {
+                    raw_response: Some(response.text),
+                    was_coerced: Some(parsed.is_none()),
+                    // Intended-vs-applied is left to the runner's legality clamp;
+                    // a clean parse already equals the applied action here.
+                    intended_action: None,
+                    input_tokens: Some(response.input_tokens),
+                    output_tokens: Some(response.output_tokens),
+                    model,
+                };
+                (decision, fidelity)
             }
             Err(e) => {
                 eprintln!(
@@ -139,7 +157,12 @@ impl<B: LlmBackend> PokerAgent for LlmPokerAgent<B> {
                         self.system
                     }
                 );
-                fallback_decision(to_call)
+                let fidelity = AgentFidelity {
+                    was_coerced: Some(true),
+                    model,
+                    ..Default::default()
+                };
+                (fallback_decision(to_call), fidelity)
             }
         }
     }
@@ -214,6 +237,47 @@ mod tests {
     async fn decide_returns_parsed_action_on_success() {
         let agent = LlmPokerAgent::with_model(FixedBackend("call"), "test", "fake-model");
         assert_eq!(agent.decide(&sample_state(50)).await, Decision::Call);
+    }
+
+    #[tokio::test]
+    async fn decide_with_fidelity_clean_parse_surfaces_provenance() {
+        let agent = LlmPokerAgent::with_model(FixedBackend("call"), "test", "fake-model");
+        let (decision, f) = agent.decide_with_fidelity(&sample_state(50)).await;
+        assert_eq!(decision, Decision::Call);
+        assert_eq!(f.raw_response.as_deref(), Some("call"));
+        assert_eq!(f.was_coerced, Some(false));
+        assert_eq!(f.intended_action, None);
+        assert_eq!(f.input_tokens, Some(10));
+        assert_eq!(f.output_tokens, Some(2));
+        assert_eq!(f.model.as_deref(), Some("fake-model"));
+    }
+
+    #[tokio::test]
+    async fn decide_with_fidelity_unparseable_marks_coerced_keeps_text() {
+        let agent = LlmPokerAgent::with_model(FixedBackend("hmm maybe"), "test", "m");
+        let (decision, f) = agent.decide_with_fidelity(&sample_state(50)).await;
+        assert_eq!(decision, Decision::Fold); // safe fallback facing a bet
+        assert_eq!(f.was_coerced, Some(true));
+        assert_eq!(f.raw_response.as_deref(), Some("hmm maybe"));
+        assert_eq!(f.intended_action, None);
+    }
+
+    #[tokio::test]
+    async fn decide_with_fidelity_backend_error_has_no_text() {
+        let agent = LlmPokerAgent::with_model(FailingBackend, "test", "m");
+        let (decision, f) = agent.decide_with_fidelity(&sample_state(0)).await;
+        assert_eq!(decision, Decision::Check);
+        assert_eq!(f.was_coerced, Some(true));
+        assert_eq!(f.raw_response, None);
+        assert_eq!(f.input_tokens, None);
+        assert_eq!(f.model.as_deref(), Some("m"));
+    }
+
+    #[tokio::test]
+    async fn decide_with_fidelity_empty_model_is_none() {
+        let agent = LlmPokerAgent::new(FixedBackend("fold"));
+        let (_decision, f) = agent.decide_with_fidelity(&sample_state(50)).await;
+        assert_eq!(f.model, None);
     }
 
     #[tokio::test]

@@ -3,14 +3,14 @@
 use std::time::Duration;
 
 use pkdealer_proto::dealer::{
-    ActRequest, ActionType, EventType, GetNextToActRequest, GetStatusRequest,
-    GetTableConfigRequest, NextToActInfo, PlayerAction as ProtoAction, SeatPlayerAtRequest,
-    SeatPlayerRequest, StartHandRequest, StreamEventsRequest, Street, TableStatus, act_response,
-    dealer_service_client::DealerServiceClient, get_next_to_act_response, seat_player_at_response,
-    seat_player_response,
+    ActRequest, ActionType, AgentFidelity as ProtoAgentFidelity, EventType, GetNextToActRequest,
+    GetStatusRequest, GetTableConfigRequest, NextToActInfo, PlayerAction as ProtoAction,
+    SeatPlayerAtRequest, SeatPlayerRequest, StartHandRequest, StreamEventsRequest, Street,
+    TableStatus, act_response, dealer_service_client::DealerServiceClient,
+    get_next_to_act_response, seat_player_at_response, seat_player_response,
 };
 
-use crate::{AgentError, Decision, HandState, PokerAgent, hand_state::street_name};
+use crate::{AgentError, AgentFidelity, Decision, HandState, PokerAgent, hand_state::street_name};
 
 const PLAYER_TOKEN_METADATA_KEY: &str = "x-player-token";
 
@@ -286,7 +286,13 @@ async fn decide_and_act<A: PokerAgent>(
         action_history: action_history.to_vec(),
     };
 
-    let decision = agent.decide(&hand_state).await;
+    let (intended, mut fidelity) = agent.decide_with_fidelity(&hand_state).await;
+    // Default the model id from the agent's configured name when the agent
+    // itself didn't supply one (rules/random), so every arena action carries an
+    // identifier in its recorded provenance.
+    if fidelity.model.is_none() && !ctx.name.is_empty() {
+        fidelity.model = Some(ctx.name.to_string());
+    }
     // Raise(n) takes a total-amount; min_raise is the minimum increment above
     // the call.  Minimum valid total = amount_to_call + min_raise.  When
     // min_raise is 0 (blinds not yet swept into pot preflop) fall back to
@@ -298,21 +304,20 @@ async fn decide_and_act<A: PokerAgent>(
     } else {
         0
     };
-    let decision = match decision {
-        Decision::Raise(n) if n < floor_raise => Decision::Raise(floor_raise),
-        // Preflop the blind is a live bet; Bet is invalid when to_call==0
-        // (BB's option). Convert to Check so the service never rejects it.
-        Decision::Bet(_) if hand_state.street == "preflop" && info.amount_to_call == 0 => {
-            Decision::Check
-        }
-        other => other,
-    };
+    let is_preflop = hand_state.street == "preflop";
+    let decision = finalize_decision(
+        &intended,
+        &mut fidelity,
+        floor_raise,
+        is_preflop,
+        info.amount_to_call,
+    );
     eprintln!(
         "[{}] seat={my_seat} {} pot={} to_call={} → {decision:?}",
         ctx.name, hand_state.street, info.pot, info.amount_to_call
     );
 
-    if let Some(e) = send_action(client, my_seat, &decision, ctx.token).await? {
+    if let Some(e) = send_action(client, my_seat, &decision, ctx.token, &fidelity).await? {
         // Service rejected the action; fall back to a safe action so the table
         // isn't left stuck waiting for this seat.
         let safe = if hand_state.to_call > 0 {
@@ -320,11 +325,19 @@ async fn decide_and_act<A: PokerAgent>(
         } else {
             Decision::Check
         };
+        // Rejection retry (EPIC-25 Phase 4): the applied fallback is a coercion;
+        // keep the agent's raw/token/model provenance but record the original
+        // intent and the coerced flag.
+        let coerced = AgentFidelity {
+            was_coerced: Some(true),
+            intended_action: Some(intended.clone()),
+            ..fidelity.clone()
+        };
         eprintln!(
             "[{}] act rejected ({e}) — falling back to {safe:?}",
             ctx.name
         );
-        if let Some(e2) = send_action(client, my_seat, &safe, ctx.token).await? {
+        if let Some(e2) = send_action(client, my_seat, &safe, ctx.token, &coerced).await? {
             // The fallback was rejected too. Without escalating, the table hangs
             // forever on this seat (the dealer is purely reactive and only
             // advances when the acting seat submits a valid action). Fold is
@@ -335,7 +348,8 @@ async fn decide_and_act<A: PokerAgent>(
                 ctx.name
             );
             if !matches!(safe, Decision::Fold)
-                && let Some(e3) = send_action(client, my_seat, &Decision::Fold, ctx.token).await?
+                && let Some(e3) =
+                    send_action(client, my_seat, &Decision::Fold, ctx.token, &coerced).await?
             {
                 eprintln!("[{}] fold also rejected ({e3})", ctx.name);
             }
@@ -352,9 +366,10 @@ async fn send_action(
     seat: u8,
     decision: &Decision,
     token: &str,
+    fidelity: &AgentFidelity,
 ) -> Result<Option<String>, AgentError> {
     let mut req = tonic::Request::new(ActRequest {
-        action: Some(decision_to_proto(seat, decision)),
+        action: Some(decision_to_proto(seat, decision, fidelity)),
     });
     req.metadata_mut()
         .insert(PLAYER_TOKEN_METADATA_KEY, token.parse()?);
@@ -451,22 +466,79 @@ async fn fetch_next_to_act_info(
     })
 }
 
-fn decision_to_proto(seat: u8, decision: &Decision) -> ProtoAction {
-    let (action_type, amount) = match decision {
+/// Applies the runner's legality clamp to the agent's `intended` decision and
+/// records the coercion in `fidelity` when the applied action differs.
+///
+/// Two clamps keep the dealer from rejecting an otherwise-reasonable action: a
+/// `Raise` below the legal minimum is bumped up to `floor_raise`, and a preflop
+/// `Bet` with nothing to call (the big blind's option) becomes a `Check`. When
+/// either fires, `was_coerced` is set and the pre-clamp `intended_action` is
+/// preserved (EPIC-25 Phase 4).
+fn finalize_decision(
+    intended: &Decision,
+    fidelity: &mut AgentFidelity,
+    floor_raise: u32,
+    is_preflop: bool,
+    amount_to_call: u32,
+) -> Decision {
+    let applied = match intended {
+        Decision::Raise(n) if *n < floor_raise => Decision::Raise(floor_raise),
+        Decision::Bet(_) if is_preflop && amount_to_call == 0 => Decision::Check,
+        other => other.clone(),
+    };
+    if &applied != intended {
+        fidelity.was_coerced = Some(true);
+        fidelity.intended_action = Some(intended.clone());
+    }
+    applied
+}
+
+/// Maps a [`Decision`] to its proto `(action_type, amount)` pair. Amount is
+/// meaningful only for `Bet`/`Raise`; other actions report `0`.
+fn decision_parts(decision: &Decision) -> (ActionType, u32) {
+    match decision {
         Decision::Fold => (ActionType::Fold, 0),
         Decision::Check => (ActionType::Check, 0),
         Decision::Call => (ActionType::Call, 0),
         Decision::Bet(n) => (ActionType::Bet, *n),
         Decision::Raise(n) => (ActionType::Raise, *n),
         Decision::AllIn => (ActionType::AllIn, 0),
+    }
+}
+
+/// Maps core [`AgentFidelity`] provenance to the proto message, or `None` when
+/// it carries nothing — so a bare, un-annotated action emits no `agent` block.
+fn fidelity_to_proto(fidelity: &AgentFidelity) -> Option<ProtoAgentFidelity> {
+    if fidelity == &AgentFidelity::default() {
+        return None;
+    }
+    let (intended_action_type, intended_amount) = match fidelity.intended_action.as_ref() {
+        Some(decision) => {
+            let (action_type, amount) = decision_parts(decision);
+            let intended_amount =
+                matches!(decision, Decision::Bet(_) | Decision::Raise(_)).then_some(amount);
+            (Some(action_type as i32), intended_amount)
+        }
+        None => (None, None),
     };
+    Some(ProtoAgentFidelity {
+        raw_response: fidelity.raw_response.clone(),
+        was_coerced: fidelity.was_coerced,
+        intended_action_type,
+        intended_amount,
+        input_tokens: fidelity.input_tokens,
+        output_tokens: fidelity.output_tokens,
+        model: fidelity.model.clone(),
+    })
+}
+
+fn decision_to_proto(seat: u8, decision: &Decision, fidelity: &AgentFidelity) -> ProtoAction {
+    let (action_type, amount) = decision_parts(decision);
     ProtoAction {
         seat: u32::from(seat),
         action_type: action_type as i32,
         amount,
-        // Agent-fidelity provenance is attached later (EPIC-25 Phase 4, step 5);
-        // the core runner emits a bare decision for now.
-        agent: None,
+        agent: fidelity_to_proto(fidelity),
     }
 }
 
@@ -519,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_decision_to_proto_fold() {
-        let action = decision_to_proto(3, &Decision::Fold);
+        let action = decision_to_proto(3, &Decision::Fold, &AgentFidelity::default());
         assert_eq!(action.seat, 3);
         assert_eq!(action.action_type, ActionType::Fold as i32);
         assert_eq!(action.amount, 0);
@@ -527,21 +599,21 @@ mod tests {
 
     #[test]
     fn test_decision_to_proto_check() {
-        let action = decision_to_proto(5, &Decision::Check);
+        let action = decision_to_proto(5, &Decision::Check, &AgentFidelity::default());
         assert_eq!(action.action_type, ActionType::Check as i32);
         assert_eq!(action.amount, 0);
     }
 
     #[test]
     fn test_decision_to_proto_call() {
-        let action = decision_to_proto(2, &Decision::Call);
+        let action = decision_to_proto(2, &Decision::Call, &AgentFidelity::default());
         assert_eq!(action.action_type, ActionType::Call as i32);
         assert_eq!(action.amount, 0);
     }
 
     #[test]
     fn test_decision_to_proto_bet() {
-        let action = decision_to_proto(1, &Decision::Bet(250));
+        let action = decision_to_proto(1, &Decision::Bet(250), &AgentFidelity::default());
         assert_eq!(action.seat, 1);
         assert_eq!(action.action_type, ActionType::Bet as i32);
         assert_eq!(action.amount, 250);
@@ -549,22 +621,105 @@ mod tests {
 
     #[test]
     fn test_decision_to_proto_raise() {
-        let action = decision_to_proto(0, &Decision::Raise(400));
+        let action = decision_to_proto(0, &Decision::Raise(400), &AgentFidelity::default());
         assert_eq!(action.action_type, ActionType::Raise as i32);
         assert_eq!(action.amount, 400);
     }
 
     #[test]
     fn test_decision_to_proto_all_in() {
-        let action = decision_to_proto(7, &Decision::AllIn);
+        let action = decision_to_proto(7, &Decision::AllIn, &AgentFidelity::default());
         assert_eq!(action.action_type, ActionType::AllIn as i32);
         assert_eq!(action.amount, 0);
     }
 
     #[test]
     fn test_decision_to_proto_seat_encoded() {
-        let action = decision_to_proto(8, &Decision::Fold);
+        let action = decision_to_proto(8, &Decision::Fold, &AgentFidelity::default());
         assert_eq!(action.seat, 8);
+    }
+
+    // ── EPIC-25 Phase 4: agent-fidelity mapping + clamp coercion ───────────
+
+    #[test]
+    fn decision_to_proto_attaches_agent_when_present() {
+        let fidelity = AgentFidelity {
+            model: Some("rules-v1".to_string()),
+            ..Default::default()
+        };
+        let action = decision_to_proto(2, &Decision::Call, &fidelity);
+        assert_eq!(
+            action.agent.and_then(|a| a.model).as_deref(),
+            Some("rules-v1")
+        );
+    }
+
+    #[test]
+    fn decision_to_proto_no_agent_block_when_empty() {
+        let action = decision_to_proto(2, &Decision::Call, &AgentFidelity::default());
+        assert!(action.agent.is_none());
+    }
+
+    #[test]
+    fn fidelity_to_proto_maps_all_fields_with_intended() {
+        let fidelity = AgentFidelity {
+            raw_response: Some("raise to 250".to_string()),
+            was_coerced: Some(true),
+            intended_action: Some(Decision::Raise(250)),
+            input_tokens: Some(100),
+            output_tokens: Some(5),
+            model: Some("m".to_string()),
+        };
+        let Some(p) = fidelity_to_proto(&fidelity) else {
+            panic!("expected a populated fidelity");
+        };
+        assert_eq!(p.raw_response.as_deref(), Some("raise to 250"));
+        assert_eq!(p.was_coerced, Some(true));
+        assert_eq!(p.intended_action_type, Some(ActionType::Raise as i32));
+        assert_eq!(p.intended_amount, Some(250));
+        assert_eq!(p.input_tokens, Some(100));
+        assert_eq!(p.output_tokens, Some(5));
+        assert_eq!(p.model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn fidelity_to_proto_intended_fold_carries_no_amount() {
+        let fidelity = AgentFidelity {
+            intended_action: Some(Decision::Fold),
+            ..Default::default()
+        };
+        let Some(p) = fidelity_to_proto(&fidelity) else {
+            panic!("expected a populated fidelity");
+        };
+        assert_eq!(p.intended_action_type, Some(ActionType::Fold as i32));
+        assert_eq!(p.intended_amount, None);
+    }
+
+    #[test]
+    fn finalize_decision_clamps_sub_floor_raise_and_records_intent() {
+        let mut fidelity = AgentFidelity::default();
+        // Intended raise of 50 is below the 200 floor → bumped, coercion recorded.
+        let applied = finalize_decision(&Decision::Raise(50), &mut fidelity, 200, false, 100);
+        assert_eq!(applied, Decision::Raise(200));
+        assert_eq!(fidelity.was_coerced, Some(true));
+        assert_eq!(fidelity.intended_action, Some(Decision::Raise(50)));
+    }
+
+    #[test]
+    fn finalize_decision_converts_preflop_bet_with_no_call_to_check() {
+        let mut fidelity = AgentFidelity::default();
+        let applied = finalize_decision(&Decision::Bet(300), &mut fidelity, 0, true, 0);
+        assert_eq!(applied, Decision::Check);
+        assert_eq!(fidelity.was_coerced, Some(true));
+        assert_eq!(fidelity.intended_action, Some(Decision::Bet(300)));
+    }
+
+    #[test]
+    fn finalize_decision_legal_action_is_untouched() {
+        let mut fidelity = AgentFidelity::default();
+        let applied = finalize_decision(&Decision::Call, &mut fidelity, 200, false, 100);
+        assert_eq!(applied, Decision::Call);
+        assert_eq!(fidelity, AgentFidelity::default()); // no coercion recorded
     }
 
     #[test]
