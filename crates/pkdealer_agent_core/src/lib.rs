@@ -56,7 +56,7 @@ pub mod error;
 pub mod hand_state;
 pub mod runner;
 
-pub use agent::{Decision, PokerAgent};
+pub use agent::{AgentFidelity, Decision, PokerAgent};
 pub use error::AgentError;
 pub use hand_state::HandState;
 pub use runner::{AgentConfig, run_agent};

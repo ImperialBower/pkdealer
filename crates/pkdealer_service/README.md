@@ -61,6 +61,32 @@ Configuration options will be loaded from:
 - `PKDEALER_TOPUP_ENABLED` - When `true`, allows the `Rebuy` RPC for seats that still have chips; mid-hand top-ups are always rejected (default: false)
 - `PKDEALER_BLIND_SCHEDULE_ENABLED` - When `true`, escalates blinds on the fixed 12-level schedule every `PKDEALER_HANDS_PER_LEVEL` hands and recycles stacks at the top (default: false)
 - `PKDEALER_HANDS_PER_LEVEL` - Hands per blind level when the schedule is enabled (default: 20)
+- `PKDEALER_RECORD_DIR` - When set, every completed hand is recorded and the full session is rewritten to `<dir>/session-<unix_ts>.yaml` after each hand, ready for `audit` / `pkcore` replay. Recording is always on in memory regardless; this only adds disk durability (default: in-memory only)
+- `PKDEALER_RECORD_MAX_HANDS` - Caps the in-memory recorder, dropping the oldest hands once the buffer exceeds the limit. Combined with `PKDEALER_RECORD_DIR`, the on-disk file reflects the capped window, so leave this unset if you need the full session on disk (default: unbounded)
+
+### Session recording & export (EPIC-25)
+
+Every completed hand is recorded in memory as a `pkcore` `HandCollection`.
+Retrieve it with the `ExportSession` RPC (requires the spectator token, since
+the payload contains all hole cards); `GetSessionInfo` reports the buffered hand
+count, first/last hand ids, and the session-file path without a token.
+
+```bash
+# YAML export (default), spectator-gated:
+grpcurl -plaintext -H 'x-player-token: spectator' \
+  localhost:50051 pkdealer.dealer.v1.DealerService/ExportSession
+
+# JSON export, draining the buffer afterward:
+grpcurl -plaintext -H 'x-player-token: spectator' \
+  -d '{"format":"RECORD_FORMAT_JSON","drain":true}' \
+  localhost:50051 pkdealer.dealer.v1.DealerService/ExportSession
+
+# Progress check (no token needed):
+grpcurl -plaintext localhost:50051 pkdealer.dealer.v1.DealerService/GetSessionInfo
+
+# Replay + chip-conservation audit over a recorded directory:
+cargo run --example audit -p pkdealer_client -- "$PKDEALER_RECORD_DIR"/session-*.yaml
+```
 
 ### Tournament blind schedule
 

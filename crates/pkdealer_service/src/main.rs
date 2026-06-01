@@ -23,6 +23,8 @@
 //! | `PKDEALER_TOPUP_ENABLED`          | false             | Allow `Rebuy` for healthy stacks (between hands only)                   |
 //! | `PKDEALER_BLIND_SCHEDULE_ENABLED` | false             | Escalate blinds every N hands and recycle stacks at the top (demo)      |
 //! | `PKDEALER_HANDS_PER_LEVEL`        | 20                | Hands per blind level when the schedule is enabled                      |
+//! | `PKDEALER_RECORD_DIR`             | — (memory only)   | Persist each session's hands to a YAML file in this directory (EPIC-25) |
+//! | `PKDEALER_RECORD_MAX_HANDS`       | unbounded         | Cap the in-memory recorder, dropping oldest hands past the limit        |
 //!
 //! For the browser spectator UI, run [`pkspectator`](https://github.com/ImperialBower/pkspectator)
 //! as a separate process. It subscribes to this service via gRPC `StreamEvents`.
@@ -55,6 +57,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use opentelemetry::trace::TraceContextExt;
 use pkcore::analysis::name::HandRankName;
+use pkcore::card::Card;
 use pkcore::casino::table::seats::seatbit::Seatbit;
 use pkcore::casino::table::winnings::Winnings;
 use pkcore::casino::{
@@ -65,15 +68,17 @@ use pkcore::casino::{
     table_no_cell::{PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell},
 };
 use pkdealer_proto::dealer::{
-    ActRequest, ActResponse, ActionResult, ActionType, EventType, GetBoardRequest,
-    GetBoardResponse, GetChipsRequest, GetChipsResponse, GetEventLogRequest, GetEventLogResponse,
-    GetNextToActRequest, GetNextToActResponse, GetPlayerStatsRequest, GetPlayerStatsResponse,
-    GetPotRequest, GetPotResponse, GetStatusRequest, GetStatusResponse, GetTableConfigRequest,
-    GetTableConfigResponse, HandResult, NextToActInfo, PingReply, PingRequest, PlayerChips,
-    PlayerState as ProtoPlayerState, PlayerStats, RebuyInfo, RebuyRequest, RebuyResponse,
-    RemovePlayerRequest, RemovePlayerResponse, SeatInfo, SeatPlayerAtRequest, SeatPlayerAtResponse,
-    SeatPlayerRequest, SeatPlayerResponse, StartHandRequest, StartHandResponse,
-    StreamEventsRequest, Street, TableConfig, TableEvent, TableStatus, WinnerInfo, act_response,
+    ActRequest, ActResponse, ActionResult, ActionType, EventType, ExportSessionRequest,
+    ExportSessionResponse, GetBoardRequest, GetBoardResponse, GetChipsRequest, GetChipsResponse,
+    GetEventLogRequest, GetEventLogResponse, GetNextToActRequest, GetNextToActResponse,
+    GetPlayerStatsRequest, GetPlayerStatsResponse, GetPotRequest, GetPotResponse,
+    GetSessionInfoRequest, GetSessionInfoResponse, GetStatusRequest, GetStatusResponse,
+    GetTableConfigRequest, GetTableConfigResponse, HandResult, NextToActInfo, PingReply,
+    PingRequest, PlayerChips, PlayerState as ProtoPlayerState, PlayerStats, RebuyInfo,
+    RebuyRequest, RebuyResponse, RecordFormat, RemovePlayerRequest, RemovePlayerResponse, SeatInfo,
+    SeatPlayerAtRequest, SeatPlayerAtResponse, SeatPlayerRequest, SeatPlayerResponse,
+    StartHandRequest, StartHandResponse, StreamEventsRequest, Street, TableConfig, TableEvent,
+    TableStatus, WinnerInfo, act_response,
     dealer_service_server::{DealerService as DealerServiceTrait, DealerServiceServer},
     get_next_to_act_response, rebuy_response, remove_player_response, seat_player_at_response,
     seat_player_response, start_hand_response,
@@ -146,6 +151,17 @@ struct DealerConfig {
     /// all players are reset to `default_rebuy_amount` and the blind counter
     /// is reset to level 0, starting a new round. Off by default.
     round_reset_enabled: bool,
+    /// Directory to persist recorded hands to (EPIC-25 Phase 2). When `Some`,
+    /// the full session `HandCollection` is rewritten to one YAML file in this
+    /// directory after every completed hand. `None` (default) keeps recording
+    /// in memory only. Sourced from `PKDEALER_RECORD_DIR`.
+    record_dir: Option<std::path::PathBuf>,
+    /// Optional cap on the number of hands held in the in-memory recorder. When
+    /// `Some(n)`, the oldest hands are dropped once the buffer exceeds `n`,
+    /// bounding RAM on very long sessions. `None` (default) is unbounded.
+    /// Sourced from `PKDEALER_RECORD_MAX_HANDS`. Note: when combined with
+    /// `record_dir`, the on-disk file reflects the capped in-memory window.
+    record_max_hands: Option<usize>,
 }
 
 impl DealerConfig {
@@ -162,6 +178,11 @@ impl DealerConfig {
             blind_schedule_enabled: parse_env_bool("PKDEALER_BLIND_SCHEDULE_ENABLED"),
             hands_per_level: parse_hands_per_level(env::var("PKDEALER_HANDS_PER_LEVEL").ok()),
             round_reset_enabled: parse_env_bool("PKDEALER_ROUND_RESET_ENABLED"),
+            record_dir: env::var("PKDEALER_RECORD_DIR")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from),
+            record_max_hands: parse_record_max_hands(env::var("PKDEALER_RECORD_MAX_HANDS").ok()),
         }
     }
 }
@@ -175,6 +196,8 @@ impl Default for DealerConfig {
             blind_schedule_enabled: false,
             hands_per_level: DEFAULT_HANDS_PER_LEVEL,
             round_reset_enabled: false,
+            record_dir: None,
+            record_max_hands: None,
         }
     }
 }
@@ -200,6 +223,15 @@ fn parse_hands_per_level(raw: Option<String>) -> usize {
     raw.and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_HANDS_PER_LEVEL)
+}
+
+/// Parses `PKDEALER_RECORD_MAX_HANDS`-style input into an optional in-memory
+/// recorder cap. Unset, unparseable, or zero all mean "unbounded" (`None`) so a
+/// typo can't silently discard every recorded hand.
+///
+/// Split out from env reading so it can be unit-tested without env races.
+fn parse_record_max_hands(raw: Option<String>) -> Option<usize> {
+    raw.and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0)
 }
 
 // ── CardVisibility ────────────────────────────────────────────────────────────
@@ -256,6 +288,29 @@ struct TableState {
     /// first round begins at 1 and increments to 2 after the first reset).
     /// Only advances when `round_reset_enabled` triggers a round reset.
     round_number: u64,
+    /// All hands recorded this session (EPIC-25). Appended after every
+    /// successful `end_hand()`; exported via `ExportSession`.
+    recorder: pkcore::hand_history::HandCollection,
+    /// Per-seat stacks captured **before** `start_hand()` posts blinds, for the
+    /// hand currently in progress. Used as each player's starting stack in the
+    /// recorded `HandHistory`, since `pkcore` computes `net = ending - starting`.
+    hand_starting_stacks: Vec<(u8, usize)>,
+    /// Index into the cumulative `event_log` where the current hand's actions
+    /// begin. Lets each recorded hand take a clean per-hand slice of the log
+    /// without clearing it, so `GetEventLog` keeps the full-session history.
+    hand_event_log_start: usize,
+    /// Per-`Act` agent-fidelity metadata for the hand currently in progress, in
+    /// **arrival order** — one entry per successfully-applied voluntary action
+    /// (EPIC-25 Phase 4). Cleared on `start_hand`; zipped onto the recorded
+    /// `HandHistory` via `attach_agent_fidelity` in the hand-end hook. Entries
+    /// carry `AgentFidelity::default()` for acts submitted without agent data,
+    /// preserving 1:1 alignment with the replayed voluntary-action list.
+    hand_agent_fidelity: Vec<(u8, pkcore::hand_history::AgentFidelity)>,
+    /// Resolved path of the session YAML file when disk persistence is enabled
+    /// (EPIC-25 Phase 2), or `None` for in-memory only. Computed once at
+    /// construction from `DealerConfig::record_dir`. The full collection is
+    /// rewritten here after every completed hand.
+    record_file: Option<std::path::PathBuf>,
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -349,6 +404,15 @@ impl DealerService {
             ForcedBets::new(DEFAULT_SMALL_BLIND, DEFAULT_BIG_BLIND),
         );
         let session = PokerSession::new(table);
+        // EPIC-25 Phase 2: resolve a per-session YAML file under the configured
+        // record directory. One file per process start keeps the whole session
+        // in a single audit-friendly HandCollection.
+        let record_file = config.record_dir.as_ref().map(|dir| {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            dir.join(format!("session-{ts}.yaml"))
+        });
         let state = Arc::new(Mutex::new(TableState {
             session,
             token_to_seat: HashMap::new(),
@@ -361,6 +425,11 @@ impl DealerService {
             hands_completed: 0,
             banked_profit: std::collections::HashMap::new(),
             round_number: 1,
+            recorder: pkcore::hand_history::HandCollection::new(),
+            hand_starting_stacks: Vec::new(),
+            hand_event_log_start: 0,
+            hand_agent_fidelity: Vec::new(),
+            record_file,
         }));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let meter = opentelemetry::global::meter("pkdealer_service");
@@ -844,6 +913,95 @@ impl DealerService {
     }
 }
 
+/// Renders a seat's hole cards as a space-joined string (e.g. `"As Kd"`), or
+/// `None` if the seat holds no non-blank cards.
+///
+/// Used to build the `player_snapshot` passed to
+/// [`pkcore::hand_history::HandHistory::from_table_state_with_ids`] when
+/// recording a completed hand. Mirrors the stringify in
+/// `pkdealer_client/examples/demo.rs` so recorded arena hands parse and replay
+/// identically to demo-recorded ones.
+///
+/// # Examples
+///
+/// ```
+/// # // illustrative — `hole_cards_string` is private to the service binary.
+/// // A seat dealt As/Kd renders as Some("As Kd");
+/// // an unseated or undealt seat renders as None.
+/// ```
+fn hole_cards_string(seat: &SeatNoCell) -> Option<String> {
+    let cards: Vec<String> = seat
+        .cards
+        .as_slice()
+        .iter()
+        .filter(|c| **c != Card::BLANK)
+        .map(ToString::to_string)
+        .collect();
+    if cards.is_empty() {
+        None
+    } else {
+        Some(cards.join(" "))
+    }
+}
+
+/// Converts a proto [`pkdealer_proto::dealer::AgentFidelity`] into the pkcore
+/// recorder type [`pkcore::hand_history::AgentFidelity`] (EPIC-25 Phase 4).
+///
+/// Widens the wire representation to pkcore's: the intended-action enum (proto
+/// `ActionType` `i32`) maps to [`pkcore::hand_history::ActionType`], and
+/// `intended_amount` widens from `u32` chips to `f64`. An `UNSPECIFIED` or
+/// unknown intended action maps to `None`. Every other field carries over
+/// `Option`-for-`Option`, preserving the absent-vs-present distinction.
+fn proto_agent_to_pkcore(
+    p: pkdealer_proto::dealer::AgentFidelity,
+) -> pkcore::hand_history::AgentFidelity {
+    use pkcore::hand_history::ActionType as PkActionType;
+    let intended_action = p
+        .intended_action_type
+        .and_then(|v| match ActionType::try_from(v) {
+            Ok(ActionType::Bet) => Some(PkActionType::Bet),
+            Ok(ActionType::Call) => Some(PkActionType::Call),
+            Ok(ActionType::Check) => Some(PkActionType::Check),
+            Ok(ActionType::Raise) => Some(PkActionType::Raise),
+            Ok(ActionType::AllIn) => Some(PkActionType::AllIn),
+            Ok(ActionType::Fold) => Some(PkActionType::Fold),
+            Ok(ActionType::Unspecified) | Err(_) => None,
+        });
+    pkcore::hand_history::AgentFidelity {
+        raw_response: p.raw_response,
+        was_coerced: p.was_coerced,
+        intended_action,
+        intended_amount: p.intended_amount.map(f64::from),
+        input_tokens: p.input_tokens,
+        output_tokens: p.output_tokens,
+        model: p.model,
+    }
+}
+
+/// Rewrites the full session [`HandCollection`] to `path` as YAML (EPIC-25
+/// Phase 2 disk sink), creating the parent directory if needed.
+///
+/// Returns any I/O or serialization error so the caller can log it; recording
+/// is best-effort and must never abort a hand. The whole collection is rewritten
+/// (rather than appended) so the file is always a valid, audit-readable
+/// `HandCollection`.
+///
+/// # Errors
+///
+/// Returns `Err` if the parent directory cannot be created, the collection
+/// cannot be serialized to YAML, or the file cannot be written.
+fn write_collection_yaml(
+    path: &std::path::Path,
+    collection: &pkcore::hand_history::HandCollection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let yaml = collection.to_yaml()?;
+    std::fs::write(path, yaml)?;
+    Ok(())
+}
+
 /// Caps every occupied seat's stack to `cap`, leaving stacks already at or
 /// below `cap` untouched. Returns `(seat_index, handle, old_chips)` for each
 /// seat that was reduced, so the caller can log/emit the change.
@@ -1260,8 +1418,26 @@ impl DealerServiceTrait for DealerService {
                     .session
                     .set_blinds(ForcedBets::new(upd.small_blind, upd.big_blind));
             }
+            // EPIC-25: snapshot occupied-seat stacks BEFORE start_hand() posts
+            // blinds, so each recorded hand's starting stack is the true
+            // pre-blind value (pkcore computes net = ending - starting). Held in
+            // a local and only committed on the winning start_hand() below, so a
+            // losing racer's "already in progress" error can't clobber it.
+            let pre_blind_stacks: Vec<(u8, usize)> = {
+                let table = &guard.session.table;
+                (0..table.seats.size())
+                    .filter_map(|i| {
+                        let seat = table.seats.get_seat(i)?;
+                        (!seat.is_empty()).then_some((i, seat.player.chips))
+                    })
+                    .collect()
+            };
             match guard.session.start_hand() {
                 Ok(()) => {
+                    // EPIC-25: this hand's starting stacks are now fixed.
+                    guard.hand_starting_stacks = pre_blind_stacks;
+                    // EPIC-25 Phase 4: start a fresh per-hand agent-fidelity buffer.
+                    guard.hand_agent_fidelity.clear();
                     // Open the hand span for the full hand lifecycle.
                     let hand_id = uuid::Uuid::new_v4();
                     let span = tracing::info_span!(
@@ -1370,6 +1546,16 @@ impl DealerServiceTrait for DealerService {
                 proto_action.action_type
             ))
         })?;
+
+        // EPIC-25 Phase 4: capture optional agent-fidelity provenance, converted
+        // to the pkcore recorder type. Defaults to an empty `AgentFidelity` when
+        // the client submitted none, so the per-hand buffer keeps one entry per
+        // voluntary action (1:1 with the replayed action list). Buffered only on
+        // the success path below, after the action is accepted.
+        let agent_fidelity = proto_action
+            .agent
+            .map(proto_agent_to_pkcore)
+            .unwrap_or_default();
 
         // Verify the token authorizes this seat before acquiring the broader lock.
         {
@@ -1487,6 +1673,11 @@ impl DealerServiceTrait for DealerService {
 
         match guard.session.apply_action(seat, player_action) {
             Ok(()) => {
+                // EPIC-25 Phase 4: the action is now part of the hand's voluntary
+                // sequence; buffer its agent-fidelity in arrival order so the
+                // hand-end hook can zip it onto the recorded HandHistory.
+                guard.hand_agent_fidelity.push((seat, agent_fidelity));
+
                 // Record action attributes now that the action has been accepted.
                 action_span.record("action_type", format!("{action_type:?}").as_str());
                 action_span.record("amount", i64::try_from(amount).unwrap_or(i64::MAX));
@@ -1574,6 +1765,58 @@ impl DealerServiceTrait for DealerService {
                                 .hand_started_at
                                 .map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
+                            // EPIC-25: snapshot everything `end_hand()`/`reset()`
+                            // will clear or mutate, BEFORE the call (mirrors
+                            // demo.rs). `button` is captured here because
+                            // `button_up()` rotates it right after settlement.
+                            let rec_hand_num = guard.session.hand_number as usize;
+                            let rec_button = guard.session.table.button;
+                            let rec_forced = guard.session.table.forced; // Copy
+                            let rec_board = guard.session.table.board.to_string();
+                            let rec_ts_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_secs());
+                            // EPIC-25 Phase 3: the full post-shuffle deck string
+                            // pkcore captured at `start_hand` (before dealing),
+                            // for exact-replay / forensic reproducibility. Not
+                            // consumed by `replay()` — stored as record metadata.
+                            let rec_shuffled_deck = guard.session.shuffled_deck_str.clone();
+                            // Per-hand slice of the cumulative event log: only the
+                            // actions since the last hand ended, so the record
+                            // replays cleanly while `event_log` stays full-session.
+                            let rec_event_log: Vec<_> = guard
+                                .session
+                                .table
+                                .event_log
+                                .get(guard.hand_event_log_start..)
+                                .unwrap_or(&[])
+                                .to_vec();
+                            // 5-tuple PlayerSnapshot: seat, handle, PRE-blind
+                            // starting stack, hole cards, player UUID.
+                            let rec_player_snapshot: Vec<pkcore::hand_history::PlayerSnapshot> = {
+                                let table = &guard.session.table;
+                                (0..table.seats.size())
+                                    .filter_map(|i| {
+                                        let seat = table.seats.get_seat(i)?;
+                                        if seat.is_empty() {
+                                            return None;
+                                        }
+                                        let start = guard
+                                            .hand_starting_stacks
+                                            .iter()
+                                            .find(|(s, _)| *s == i)
+                                            .map_or(0, |(_, c)| *c);
+                                        Some((
+                                            i,
+                                            seat.player.handle.clone(),
+                                            start,
+                                            hole_cards_string(seat),
+                                            Some(seat.player.id),
+                                        ))
+                                    })
+                                    .collect()
+                            };
+
                             match guard.session.end_hand() {
                                 Ok(winnings) => {
                                     hand_complete = true;
@@ -1587,6 +1830,99 @@ impl DealerServiceTrait for DealerService {
                                     // without this the button — and therefore the
                                     // blinds — stay pinned to the same seats forever.
                                     guard.session.table.button_up();
+
+                                    // EPIC-25: record the completed hand. Ending
+                                    // stacks are read AFTER settlement; the rest
+                                    // was snapshotted before `end_hand()`.
+                                    // Best-effort: recording never fails the hand.
+                                    {
+                                        let ending_stacks: Vec<(u8, usize)> = {
+                                            let table = &guard.session.table;
+                                            (0..table.seats.size())
+                                                .filter_map(|i| {
+                                                    let seat = table.seats.get_seat(i)?;
+                                                    (!seat.is_empty())
+                                                        .then_some((i, seat.player.chips))
+                                                })
+                                                .collect()
+                                        };
+                                        let mut hh = pkcore::hand_history::HandHistory::from_table_state_with_ids(
+                                            rec_hand_num,
+                                            rec_ts_secs,
+                                            rec_button,
+                                            &rec_forced,
+                                            &rec_player_snapshot,
+                                            &rec_board,
+                                            &winnings,
+                                            &rec_event_log,
+                                            &ending_stacks,
+                                            "arena",
+                                            rec_shuffled_deck,
+                                        );
+
+                                        // EPIC-25 Phase 4: zip the buffered
+                                        // per-Act agent-fidelity onto the hand's
+                                        // voluntary actions. Skip when no act
+                                        // carried agent data (manual hands), so
+                                        // their YAML stays free of empty `agent`
+                                        // blocks and byte-identical to before.
+                                        let empty = pkcore::hand_history::AgentFidelity::default();
+                                        let entries = &guard.hand_agent_fidelity;
+                                        if entries.iter().any(|(_, f)| f != &empty) {
+                                            let annotated = hh.attach_agent_fidelity(entries);
+                                            // attach is a strict positional zip;
+                                            // a count mismatch means the buffer
+                                            // drifted from the replayed action
+                                            // list (see pkcore docs). Log it —
+                                            // recording stays best-effort.
+                                            if annotated != entries.len() {
+                                                tracing::warn!(
+                                                    hand = rec_hand_num,
+                                                    annotated,
+                                                    buffered = entries.len(),
+                                                    "agent-fidelity drift: annotated \
+                                                     != buffered; metadata may be \
+                                                     misaligned or dropped"
+                                                );
+                                            }
+                                            // attach stamps every aligned slot,
+                                            // including the empty placeholders
+                                            // buffered for acts that carried no
+                                            // agent data (mixed human/bot tables).
+                                            // Null those out so agent-less actions
+                                            // stay clean (no empty `agent` block).
+                                            for action in hh.voluntary_actions_mut() {
+                                                if action.agent.as_ref() == Some(&empty) {
+                                                    action.agent = None;
+                                                }
+                                            }
+                                        }
+
+                                        guard.recorder.push(hh);
+
+                                        // EPIC-25 Phase 2: flush the whole
+                                        // collection to disk (best-effort — a
+                                        // failure logs and never aborts the hand).
+                                        if let Some(path) = guard.record_file.clone()
+                                            && let Err(e) =
+                                                write_collection_yaml(&path, &guard.recorder)
+                                        {
+                                            tracing::warn!(
+                                                error = %e,
+                                                path = %path.display(),
+                                                "failed to persist session recording"
+                                            );
+                                        }
+
+                                        // Bound the in-memory buffer if configured,
+                                        // dropping the oldest hands first.
+                                        if let Some(max) = self.config.record_max_hands {
+                                            while guard.recorder.len() > max {
+                                                guard.recorder.hands.remove(0);
+                                            }
+                                        }
+                                    }
+
                                     let result = Self::build_hand_result(&guard.session, &winnings);
                                     // Describe the result by winner name(s) rather
                                     // than the raw seat/chip `Winnings` dump, so the
@@ -1689,8 +2025,19 @@ impl DealerServiceTrait for DealerService {
                                     let _ = guard.current_hand_span.take();
                                     guard.hand_started_at = None;
                                     guard.last_prompt_at = None;
+
+                                    // EPIC-25: the next hand's event-log slice
+                                    // starts after everything `end_hand()`/`reset()`
+                                    // just appended (ResetTable + audit markers).
+                                    guard.hand_event_log_start =
+                                        guard.session.table.event_log.len();
                                 }
                                 Err(e) => {
+                                    // EPIC-25: still advance the slice marker so a
+                                    // failed hand's actions don't contaminate the
+                                    // next recorded hand.
+                                    guard.hand_event_log_start =
+                                        guard.session.table.event_log.len();
                                     return Ok(Response::new(ActResponse {
                                         result: Some(act_response::Result::Error(e.to_string())),
                                     }));
@@ -1820,6 +2167,82 @@ impl DealerServiceTrait for DealerService {
             .collect::<Vec<_>>()
             .join("\n");
         Ok(Response::new(GetEventLogResponse { log }))
+    }
+
+    /// Exports every hand recorded so far this session as a serialized
+    /// `pkcore::hand_history::HandCollection` (EPIC-25).
+    ///
+    /// The `format` field selects YAML (default) or JSON; both round-trip the
+    /// same structs. When `drain` is true the in-memory buffer is cleared after
+    /// a successful export so the next export starts fresh.
+    ///
+    /// Access control: the payload contains every player's hole cards, so the
+    /// caller must present the spectator token via `x-player-token` metadata.
+    /// Any other (or missing) token yields `permission_denied`.
+    async fn export_session(
+        &self,
+        request: Request<ExportSessionRequest>,
+    ) -> Result<Response<ExportSessionResponse>, Status> {
+        let mut guard = self.lock()?;
+        if !matches!(
+            Self::card_visibility_from_metadata(request.metadata(), &guard),
+            CardVisibility::Spectator
+        ) {
+            return Err(Status::permission_denied(
+                "ExportSession requires the spectator token (payload contains all hole cards)",
+            ));
+        }
+        let req = request.into_inner();
+        // UNSPECIFIED resolves to YAML; echo the resolved format back.
+        let resolved = match req.format() {
+            RecordFormat::Json => RecordFormat::Json,
+            _ => RecordFormat::Yaml,
+        };
+        let payload = match resolved {
+            RecordFormat::Json => serde_json::to_string(&guard.recorder).map_err(|e| {
+                Status::internal(format!("failed to serialize session as JSON: {e}"))
+            })?,
+            _ => guard.recorder.to_yaml().map_err(|e| {
+                Status::internal(format!("failed to serialize session as YAML: {e}"))
+            })?,
+        };
+        let hand_count = guard.recorder.len() as u32;
+        if req.drain {
+            guard.recorder = pkcore::hand_history::HandCollection::new();
+        }
+        Ok(Response::new(ExportSessionResponse {
+            hand_count,
+            payload,
+            source: "arena".to_owned(),
+            format: resolved as i32,
+        }))
+    }
+
+    /// Returns a lightweight summary of the in-memory recorder (EPIC-25
+    /// Phase 2): how many hands are buffered, the first/last hand ids, and the
+    /// on-disk session file path when disk persistence is enabled.
+    ///
+    /// No token is required: the response carries no hole cards.
+    async fn get_session_info(
+        &self,
+        _request: Request<GetSessionInfoRequest>,
+    ) -> Result<Response<GetSessionInfoResponse>, Status> {
+        let guard = self.lock()?;
+        let hands = &guard.recorder.hands;
+        let first_hand_id = hands.first().map(|h| h.hand.id.clone()).unwrap_or_default();
+        let last_hand_id = hands.last().map(|h| h.hand.id.clone()).unwrap_or_default();
+        let record_dir = guard
+            .record_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        Ok(Response::new(GetSessionInfoResponse {
+            recording_enabled: true,
+            hand_count: hands.len() as u32,
+            first_hand_id,
+            last_hand_id,
+            record_dir,
+        }))
     }
 
     // ── Table config ──────────────────────────────────────────────────────────
@@ -2163,6 +2586,52 @@ mod tests {
         assert_eq!(parse_hands_per_level(None), DEFAULT_HANDS_PER_LEVEL);
     }
 
+    // ── EPIC-25 Phase 4: agent-fidelity proto → pkcore conversion ──────────
+
+    #[test]
+    fn proto_agent_to_pkcore_full_conversion() {
+        use pkdealer_proto::dealer::{ActionType as ProtoAt, AgentFidelity as ProtoAgent};
+        let proto = ProtoAgent {
+            raw_response: Some("raise to 250".to_string()),
+            was_coerced: Some(true),
+            intended_action_type: Some(ProtoAt::Raise as i32),
+            intended_amount: Some(250),
+            input_tokens: Some(1200),
+            output_tokens: Some(8),
+            model: Some("claude-test".to_string()),
+        };
+        let pk = proto_agent_to_pkcore(proto);
+        assert_eq!(pk.raw_response.as_deref(), Some("raise to 250"));
+        assert_eq!(pk.was_coerced, Some(true));
+        assert_eq!(
+            pk.intended_action,
+            Some(pkcore::hand_history::ActionType::Raise)
+        );
+        assert_eq!(pk.intended_amount, Some(250.0)); // u32 chips widened to f64
+        assert_eq!(pk.input_tokens, Some(1200));
+        assert_eq!(pk.output_tokens, Some(8));
+        assert_eq!(pk.model.as_deref(), Some("claude-test"));
+    }
+
+    #[test]
+    fn proto_agent_to_pkcore_unspecified_intent_is_none() {
+        use pkdealer_proto::dealer::{ActionType as ProtoAt, AgentFidelity as ProtoAgent};
+        let proto = ProtoAgent {
+            intended_action_type: Some(ProtoAt::Unspecified as i32),
+            ..Default::default()
+        };
+        assert_eq!(proto_agent_to_pkcore(proto).intended_action, None);
+    }
+
+    #[test]
+    fn proto_agent_to_pkcore_empty_proto_is_default() {
+        use pkdealer_proto::dealer::AgentFidelity as ProtoAgent;
+        assert_eq!(
+            proto_agent_to_pkcore(ProtoAgent::default()),
+            pkcore::hand_history::AgentFidelity::default()
+        );
+    }
+
     #[test]
     fn parse_hands_per_level_defaults_on_garbage() {
         assert_eq!(
@@ -2421,6 +2890,7 @@ mod tests {
                 seat: u32::from(seat),
                 action_type: action_type as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut().insert(
@@ -2841,6 +3311,7 @@ mod tests {
                     seat: u32::from(next_seat),
                     action_type: ActionType::Fold as i32,
                     amount: 0,
+                    agent: None,
                 }),
             }))
             .await;
@@ -2876,6 +3347,7 @@ mod tests {
                 seat: u32::from(next_seat),
                 action_type: ActionType::Fold as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut().insert(
@@ -3490,6 +3962,7 @@ mod tests {
                 seat: 4,
                 action_type: ActionType::Fold as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut()
@@ -3694,6 +4167,7 @@ mod tests {
                 // Heads-up preflop: SB must call to continue.
                 action_type: ActionType::Call as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut().insert(
@@ -4233,6 +4707,325 @@ mod tests {
         let guard = service.lock().expect("lock");
         assert_eq!(guard.session.table.forced.small_blind, 100);
         assert_eq!(guard.session.table.forced.big_blind, 200);
+        Ok(())
+    }
+
+    // ── EPIC-25: hand recorder + ExportSession ──────────────────────────────
+
+    #[test]
+    fn hole_cards_string_undealt_seat_is_none() {
+        let seat = SeatNoCell::new(PlayerNoCell::new_with_chips("Nobody".to_owned(), 1_000));
+        assert_eq!(hole_cards_string(&seat), None);
+    }
+
+    #[tokio::test]
+    async fn hole_cards_string_dealt_seat_has_two_cards() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let service = make_service();
+        seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+
+        let guard = service.lock().expect("lock");
+        let seat = guard.session.table.seats.get_seat(0).expect("seat 0");
+        let hole = hole_cards_string(seat).expect("dealt seat has cards");
+        assert_eq!(
+            hole.split_whitespace().count(),
+            2,
+            "hold'em hole string should be two space-joined cards, got {hole:?}"
+        );
+        Ok(())
+    }
+
+    /// A completed hand is recorded once and replays with chip conservation.
+    #[tokio::test]
+    async fn recorder_records_one_consistent_hand() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        play_hand_to_completion(&service, &tokens).await?;
+
+        let guard = service.lock().expect("lock");
+        assert_eq!(guard.recorder.len(), 1, "exactly one hand recorded");
+        let result = guard.recorder.hands[0].replay().expect("replay succeeds");
+        assert!(
+            result.is_consistent,
+            "recorded hand must replay with chip conservation"
+        );
+        Ok(())
+    }
+
+    /// Two consecutive hands each record cleanly — proves the per-hand
+    /// event-log slice is not contaminated by the previous hand's actions.
+    #[tokio::test]
+    async fn recorder_records_two_consistent_hands() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        for _ in 0..2 {
+            service
+                .start_hand(Request::new(StartHandRequest {}))
+                .await?;
+            play_hand_to_completion(&service, &tokens).await?;
+        }
+
+        let guard = service.lock().expect("lock");
+        assert_eq!(guard.recorder.len(), 2, "two hands recorded");
+        for (i, hand) in guard.recorder.hands.iter().enumerate() {
+            let result = hand.replay().expect("replay succeeds");
+            assert!(result.is_consistent, "recorded hand {i} must be consistent");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn export_session_rejects_missing_token() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let status = service
+            .export_session(Request::new(ExportSessionRequest::default()))
+            .await
+            .expect_err("export without a token must be denied");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn export_session_rejects_player_token() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        let player_token = tokens.values().next().expect("a player token");
+        let mut req = Request::new(ExportSessionRequest::default());
+        req.metadata_mut().insert(
+            PLAYER_TOKEN_METADATA_KEY,
+            player_token.parse().expect("valid token"),
+        );
+        let status = service
+            .export_session(req)
+            .await
+            .expect_err("a player token must not authorize export");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        Ok(())
+    }
+
+    /// The spectator-authorized export returns YAML that round-trips back into a
+    /// `HandCollection` of the same size, each hand replaying consistently.
+    #[tokio::test]
+    async fn export_session_yaml_roundtrips() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        play_hand_to_completion(&service, &tokens).await?;
+
+        let mut req = Request::new(ExportSessionRequest::default());
+        req.metadata_mut().insert(
+            PLAYER_TOKEN_METADATA_KEY,
+            DEFAULT_SPECTATOR_TOKEN.parse().expect("valid"),
+        );
+        let resp = service.export_session(req).await?.into_inner();
+        assert_eq!(resp.hand_count, 1);
+        assert_eq!(resp.source, "arena");
+
+        let parsed = pkcore::hand_history::HandCollection::from_yaml(&resp.payload)
+            .expect("exported YAML parses as a HandCollection");
+        assert_eq!(parsed.len(), 1, "round-tripped collection size matches");
+        assert!(
+            parsed.hands[0].replay().expect("replay").is_consistent,
+            "round-tripped hand replays consistently"
+        );
+        Ok(())
+    }
+
+    // ── EPIC-25 Phase 2: disk sink, cap, JSON, drain, GetSessionInfo ─────────
+
+    #[test]
+    fn parse_record_max_hands_accepts_positive() {
+        assert_eq!(parse_record_max_hands(Some("250".to_owned())), Some(250));
+    }
+
+    #[test]
+    fn parse_record_max_hands_none_on_absent_zero_or_garbage() {
+        assert_eq!(parse_record_max_hands(None), None);
+        assert_eq!(parse_record_max_hands(Some("0".to_owned())), None);
+        assert_eq!(parse_record_max_hands(Some("nope".to_owned())), None);
+    }
+
+    /// Returns a fresh temp directory unique to this test run.
+    fn unique_temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("pkdealer-rec-{}", Uuid::new_v4()))
+    }
+
+    /// With `record_dir` set, the full session is rewritten to a YAML file that
+    /// parses back into an audit-replayable `HandCollection`.
+    #[tokio::test]
+    async fn disk_sink_writes_replayable_session_file() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = unique_temp_dir();
+        let config = DealerConfig {
+            record_dir: Some(dir.clone()),
+            ..DealerConfig::default()
+        };
+        let service = make_service_with_config(config);
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        play_hand_to_completion(&service, &tokens).await?;
+
+        let path = {
+            let guard = service.lock().expect("lock");
+            guard.record_file.clone().expect("record_file resolved")
+        };
+        let yaml = std::fs::read_to_string(&path).expect("session file written");
+        let collection = pkcore::hand_history::HandCollection::from_yaml(&yaml)
+            .expect("disk YAML parses as a HandCollection");
+        assert_eq!(collection.len(), 1);
+        assert!(
+            collection.hands[0].replay().expect("replay").is_consistent,
+            "disk-recorded hand must replay consistently"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// `PKDEALER_RECORD_MAX_HANDS` bounds the in-memory buffer, dropping oldest.
+    #[tokio::test]
+    async fn record_max_hands_caps_in_memory_buffer() -> Result<(), Box<dyn std::error::Error>> {
+        let config = DealerConfig {
+            record_max_hands: Some(1),
+            ..DealerConfig::default()
+        };
+        let service = make_service_with_config(config);
+        let tokens = seat_two_players(&service).await?;
+        for _ in 0..2 {
+            service
+                .start_hand(Request::new(StartHandRequest {}))
+                .await?;
+            play_hand_to_completion(&service, &tokens).await?;
+        }
+
+        let guard = service.lock().expect("lock");
+        assert_eq!(
+            guard.recorder.len(),
+            1,
+            "buffer must be capped at 1 hand (oldest dropped)"
+        );
+        Ok(())
+    }
+
+    /// Builds a spectator-authorized `ExportSession` request.
+    fn spectator_export_request(
+        format: RecordFormat,
+        drain: bool,
+    ) -> Request<ExportSessionRequest> {
+        let mut req = Request::new(ExportSessionRequest {
+            format: format as i32,
+            drain,
+        });
+        req.metadata_mut().insert(
+            PLAYER_TOKEN_METADATA_KEY,
+            DEFAULT_SPECTATOR_TOKEN.parse().expect("valid"),
+        );
+        req
+    }
+
+    /// JSON export round-trips into the same collection via `serde_json`.
+    #[tokio::test]
+    async fn export_session_json_roundtrips() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        play_hand_to_completion(&service, &tokens).await?;
+
+        let resp = service
+            .export_session(spectator_export_request(RecordFormat::Json, false))
+            .await?
+            .into_inner();
+        assert_eq!(resp.format, RecordFormat::Json as i32);
+        let parsed: pkcore::hand_history::HandCollection =
+            serde_json::from_str(&resp.payload).expect("JSON payload parses");
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.hands[0].replay().expect("replay").is_consistent);
+        Ok(())
+    }
+
+    /// `drain = true` clears the in-memory buffer after a successful export.
+    #[tokio::test]
+    async fn export_session_drain_clears_buffer() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        play_hand_to_completion(&service, &tokens).await?;
+
+        let first = service
+            .export_session(spectator_export_request(RecordFormat::Yaml, true))
+            .await?
+            .into_inner();
+        assert_eq!(first.hand_count, 1);
+
+        let second = service
+            .export_session(spectator_export_request(RecordFormat::Yaml, false))
+            .await?
+            .into_inner();
+        assert_eq!(second.hand_count, 0, "buffer should be empty after drain");
+        Ok(())
+    }
+
+    /// EPIC-25 Phase 3: each recorded hand carries the full 52-card post-shuffle
+    /// deck string pkcore captured at `start_hand`.
+    #[tokio::test]
+    async fn recorded_hand_captures_shuffled_deck() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        play_hand_to_completion(&service, &tokens).await?;
+
+        let guard = service.lock().expect("lock");
+        let deck = guard.recorder.hands[0]
+            .shuffled_deck
+            .as_ref()
+            .expect("recorded hand should carry the shuffled deck");
+        assert_eq!(
+            deck.split_whitespace().count(),
+            52,
+            "shuffled deck should be 52 space-separated card tokens, got {deck:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_session_info_reports_counts_and_ids() -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+        service
+            .start_hand(Request::new(StartHandRequest {}))
+            .await?;
+        play_hand_to_completion(&service, &tokens).await?;
+
+        let info = service
+            .get_session_info(Request::new(GetSessionInfoRequest {}))
+            .await?
+            .into_inner();
+        assert!(info.recording_enabled);
+        assert_eq!(info.hand_count, 1);
+        assert!(!info.first_hand_id.is_empty(), "first hand id populated");
+        assert_eq!(
+            info.first_hand_id, info.last_hand_id,
+            "single hand → first == last"
+        );
+        assert!(
+            info.record_dir.is_empty(),
+            "no disk persistence configured in this test"
+        );
         Ok(())
     }
 }

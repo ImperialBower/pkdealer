@@ -64,6 +64,15 @@ service DealerService {
   // Stream all table events as they happen. Supply player_token to receive
   // your own hole cards in event status snapshots.
   rpc StreamEvents(StreamEventsRequest) returns (stream TableEvent);
+
+  // Export every hand recorded so far this session as a serialized pkcore
+  // HandCollection (YAML or JSON). Requires the spectator token via
+  // x-player-token, because the payload contains every player's hole cards.
+  rpc ExportSession(ExportSessionRequest) returns (ExportSessionResponse);
+
+  // Lightweight progress check: how many hands are buffered, the id range, and
+  // whether/where hands are persisted to disk. No token required (no cards).
+  rpc GetSessionInfo(GetSessionInfoRequest) returns (GetSessionInfoResponse);
 }
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
@@ -181,10 +190,30 @@ message ActResponse {
   }
 }
 
+// Per-action provenance: what an agent *produced* versus what the table
+// *applied*. Optional and analysis-only — game logic ignores it. Populated by
+// arena agents (agent_core / agent_llm); absent for plain client submissions.
+// Mirrors `pkcore::hand_history::AgentFidelity` (pkcore >= 0.1.3); the service
+// zips these onto the recorded HandHistory via `attach_agent_fidelity`.
+message AgentFidelity {
+  optional string     raw_response         = 1;  // raw LLM/agent response text
+  optional bool       was_coerced          = 2;  // applied action != intended
+  optional ActionType intended_action_type = 3;  // action the agent intended
+  optional uint32     intended_amount      = 4;  // intended bet/raise size (chips)
+  optional uint32     input_tokens         = 5;  // prompt tokens (LLM)
+  optional uint32     output_tokens        = 6;  // completion tokens (LLM)
+  optional string     model                = 7;  // model / agent id
+}
+
 message PlayerAction {
   uint32     seat        = 1;
   ActionType action_type = 2;
   uint32     amount      = 3;  // used for Bet and Raise only
+
+  // Optional agent-fidelity provenance (EPIC-25 Phase 4). Absent for plain
+  // client actions; populated by arena agents. Ignored by game logic; recorded
+  // for analysis via HandHistory::attach_agent_fidelity.
+  AgentFidelity agent = 4;
 }
 
 message ActionResult {
@@ -285,6 +314,45 @@ message GetPotResponse { uint32 pot = 1; }
 
 message GetEventLogRequest  {}
 message GetEventLogResponse { string log = 1; }
+
+// Serialization format for an exported HandCollection.
+enum RecordFormat {
+  RECORD_FORMAT_UNSPECIFIED = 0;  // server default (YAML)
+  RECORD_FORMAT_YAML = 1;
+  RECORD_FORMAT_JSON = 2;
+}
+
+message ExportSessionRequest {
+  // Output format. UNSPECIFIED defaults to YAML.
+  RecordFormat format = 1;
+  // If true, the in-memory buffer is cleared after a successful export so the
+  // next export starts fresh. Default false (idempotent reads).
+  bool drain = 2;
+}
+message ExportSessionResponse {
+  // Number of hands in the exported collection.
+  uint32 hand_count = 1;
+  // The session's HandCollection serialized in `format`.
+  string payload = 2;
+  // Source tag embedded in each recorded hand (always "arena").
+  string source = 3;
+  // The format `payload` is encoded in (echoes the resolved request format).
+  RecordFormat format = 4;
+}
+
+message GetSessionInfoRequest {}
+message GetSessionInfoResponse {
+  // Always true in Phase 2 (in-memory recording is on by default).
+  bool recording_enabled = 1;
+  // Number of hands currently buffered in memory.
+  uint32 hand_count = 2;
+  // Id of the oldest buffered hand (empty when none).
+  string first_hand_id = 3;
+  // Id of the newest buffered hand (empty when none).
+  string last_hand_id = 4;
+  // Absolute path of the session YAML file, or empty if disk persistence is off.
+  string record_dir = 5;
+}
 
 message GetTableConfigRequest {}
 message GetTableConfigResponse { TableConfig config = 1; }

@@ -8,16 +8,78 @@
 
 | Component | Status |
 |---|---|
-| In-memory `HandCollection` recorder on `TableState` | Planned |
-| Hand-end recording hook inside `act()` (snapshot-before / stacks-after) | Planned |
-| `ExportSession` RPC (YAML) | Planned |
-| `ExportSession` JSON format | Planned |
-| `GetSessionInfo` RPC | Planned |
-| Disk sink via `PKDEALER_RECORD_DIR` | Planned |
-| `drain` / `PKDEALER_RECORD_MAX_HANDS` buffer controls | Planned |
-| Deck capture for exact replay (`shuffled_deck`) | Planned (Phase 3, pending `pkcore` accessor) |
+| In-memory `HandCollection` recorder on `TableState` | ✅ Done (Phase 1) |
+| Hand-end recording hook inside `act()` (snapshot-before / stacks-after) | ✅ Done (Phase 1) |
+| `ExportSession` RPC (YAML) | ✅ Done (Phase 1) |
+| `ExportSession` JSON format | ✅ Done (Phase 2) |
+| `GetSessionInfo` RPC | ✅ Done (Phase 2) |
+| Disk sink via `PKDEALER_RECORD_DIR` | ✅ Done (Phase 2) |
+| `drain` / `PKDEALER_RECORD_MAX_HANDS` buffer controls | ✅ Done (Phase 2) |
+| Deck capture for exact replay (`shuffled_deck`) | ✅ Done (Phase 3 — `PokerSession::shuffled_deck_str`) |
 | Agent-fidelity per-action annotations | Planned (Phase 4, needs `pkcore` schema work) |
 | `audit.rs` replay + chip-conservation verification | Existing — reused as the oracle |
+
+### Phase 1 implementation notes (deviations from the pseudo-code below)
+
+Two corrections were required against the live code; later phases should follow
+the implemented behavior, not the original snippets:
+
+1. **Starting stacks.** The `player_snapshot` must use each seat's stack
+   captured **before `start_hand()` posts blinds**, not `seat.player.chips` at
+   `HandComplete` (those are post-betting). Implemented via a new
+   `TableState.hand_starting_stacks`, snapshotted just before `start_hand()` and
+   committed on the winning `Ok(())` branch. `pkcore` computes
+   `net = ending − starting` from this field, so getting it wrong corrupts every
+   record.
+2. **`event_log` is cumulative and is kept that way.** `TableNoCell::reset()`
+   *appends* `ResetTable`+audit to `event_log` rather than clearing it, and we
+   deliberately do **not** clear it (so `GetEventLog` keeps the full session).
+   Each recorded hand instead takes a *slice* `event_log[hand_event_log_start..]`
+   captured before `end_hand()`; the marker advances to `event_log.len()` after
+   every hand (Ok and Err) so the next slice is clean.
+
+Phase 1 ships YAML-only with an empty `ExportSessionRequest` (no `RecordFormat`
+enum / `drain` yet — deferred to Phase 2 to keep the proto change additive).
+The export RPC requires the spectator token. Note the gRPC package is
+`pkdealer.dealer.v1`, so the service method is
+`pkdealer.dealer.v1.DealerService/ExportSession` (the grpcurl example in
+"Verification" below uses the wrong `dealer.DealerService` path).
+
+**Phase 2 additions / deviations:**
+
+3. **Disk sink is whole-file rewrite, not append.** `audit.rs` reads each file
+   as a complete `HandCollection` via `from_yaml`, and a `HandCollection` YAML
+   has header fields (`pkcore_version`, `format_version`) before `hands:`, so a
+   naive per-hand append would not parse. The sink therefore rewrites the full
+   in-memory collection to a single per-session file
+   (`<PKDEALER_RECORD_DIR>/session-<unix_ts>.yaml`) after every completed hand.
+   This keeps the file always audit-readable and preserves cross-hand chip-leak
+   detection, at the cost of O(n²) cumulative write volume over a long session
+   (acceptable: files are small and writes are best-effort, `tracing::warn!` on
+   failure, never aborting a hand).
+4. **`PKDEALER_RECORD_MAX_HANDS` caps the in-memory buffer only.** Because the
+   disk file is rewritten from memory, combining the cap with `PKDEALER_RECORD_DIR`
+   means the on-disk file reflects the capped in-memory window — i.e. dropped
+   oldest hands are not retained on disk. For a full-session file, leave the cap
+   unset. (This differs from the EPIC's "drops oldest once flushed to disk"
+   wording, which assumed an append-only sink incompatible with audit's reader.)
+5. `ExportSession` now honors `format` (YAML default / JSON via `serde_json`)
+   and `drain` (clears the buffer after a successful export). `GetSessionInfo`
+   returns `recording_enabled`, `hand_count`, first/last hand id, and the
+   resolved session-file path (empty when disk persistence is off); it needs no
+   token since it carries no hole cards.
+
+**Phase 3 — deck capture (no `pkcore` follow-up needed):** the anticipated
+accessor already exists. `PokerSession::start_hand` runs
+`self.shuffled_deck_str = Some(self.table.deck.to_string())` immediately after
+the shuffle (before any dealing) and exposes it as the public field
+`shuffled_deck_str: Option<String>`, which `end_hand` does not clear. The
+recorder snapshots `guard.session.shuffled_deck_str.clone()` before `end_hand()`
+and passes it as `shuffled_deck` to `from_table_state_with_ids`, so every record
+carries the full 52-card post-shuffle order. Note `pkcore`'s `replay()` does
+**not** consume this field — it reconstructs from recorded actions + hole cards
++ board — so the deck is forensic/exact-reproducibility metadata, not a replay
+input. No `TableNoCell` accessor work or follow-up is required.
 
 ---
 
@@ -321,18 +383,22 @@ async fn export_session(&self, req: Request<ExportSessionRequest>)
 - `uuid` is already a service dependency (token maps), so the 5-tuple snapshot
   is free.
 
-### Deck capture (optional, for exact replay)
+### Deck capture (✅ Phase 3 — shipped)
 
 `from_table_state*` accepts `shuffled_deck: Option<String>`; when present a hand
-"can be fully replayed from this deck alone." `demo.rs` passes `None`, and
-`replay()` still works by re-running the recorded actions against the recorded
-board — so this is a **nice-to-have**, not a blocker.
+"can be fully replayed from this deck alone." `replay()` does not require it (it
+re-runs the recorded actions against the recorded board), so it remains a
+forensic/exact-reproducibility nice-to-have, not a blocker.
 
-Action: confirm the accessor for the post-shuffle deck on `TableNoCell` (e.g. a
-`deck`/`to_deck_string()` method). If it exists and can be read at `start_hand`
-time, stash it in `TableState` for the duration of the hand and pass
-`Some(deck_str)` into the recorder. If not, ship with `None` and file a
-follow-up to expose it in `pkcore`.
+**Resolved:** no `pkcore` accessor follow-up is needed — the post-shuffle deck
+is already captured. `PokerSession::start_hand` runs
+`self.shuffled_deck_str = Some(self.table.deck.to_string())` right after the
+shuffle (before dealing) and stores it on the public field
+`shuffled_deck_str: Option<String>`; `end_hand` never clears it. The recorder
+clones `guard.session.shuffled_deck_str` in the pre-`end_hand` snapshot block and
+passes it straight into `from_table_state_with_ids`, so every recorded hand
+carries the full 52-card order. (No need to read `TableNoCell.deck` directly or
+stash anything extra in `TableState`.)
 
 ### Concurrency, memory, failure
 
@@ -369,9 +435,9 @@ follow-up to expose it in `pkcore`.
    `record_dir`, with `tracing::warn!` on failure.
 9. Implement `drain = true` buffer clearing and the optional
    `PKDEALER_RECORD_MAX_HANDS` cap.
-10. (Phase 3) Confirm/stash the post-shuffle deck string and pass
-    `Some(deck_str)` into the recorder; otherwise file the `pkcore` accessor
-    follow-up.
+10. ✅ (Phase 3) Pass the post-shuffle deck string into the recorder. No stash or
+    `pkcore` follow-up needed — `PokerSession::shuffled_deck_str` is captured at
+    `start_hand` and read in the pre-`end_hand` snapshot block.
 11. Write the unit, e2e, round-trip, and regression-harness tests (see
     Verification).
 12. Document `PKDEALER_RECORD_DIR` / `PKDEALER_RECORD_MAX_HANDS` in the service
@@ -428,13 +494,13 @@ cargo run --bin audit -- ./recordings   # expect zero inconsistencies/leaks
 
 ## Rollout phases
 
-1. **Phase 1 — in-memory recorder + `ExportSession` (YAML).** Smallest change
+1. ✅ **Phase 1 — in-memory recorder + `ExportSession` (YAML).** Smallest change
    that unblocks all downstream analysis. Hook in `act()`, buffer in
    `TableState`, one RPC.
-2. **Phase 2 — disk sink (`PKDEALER_RECORD_DIR`) + `GetSessionInfo` + JSON
+2. ✅ **Phase 2 — disk sink (`PKDEALER_RECORD_DIR`) + `GetSessionInfo` + JSON
    format.** Durability and web-friendly output; drain/cap controls.
-3. **Phase 3 — deck capture** for exact replay (pending the `pkcore` accessor in
-   "Deck capture").
+3. ✅ **Phase 3 — deck capture** for exact replay — shipped via
+   `PokerSession::shuffled_deck_str` (no `pkcore` accessor follow-up needed).
 4. **Phase 4 — agent-fidelity annotations** (Step 2 of the eval roadmap): thread
    each agent's raw response + `was_coerced` flag into the hand history as
    per-action metadata. This is a separate change in `agent_core`/`agent_llm`
@@ -449,6 +515,98 @@ cargo run --bin audit -- ./recordings   # expect zero inconsistencies/leaks
 | 1 | Default export format | YAML (reuses `audit.rs` as-is); add JSON in Phase 2 |
 | 2 | Recording on by default? | Yes, in-memory; disk opt-in via env |
 | 3 | Access control on `ExportSession` | Require spectator/admin token (payload has all hole cards) |
-| 4 | Capture deck for exact replay? | Phase 3, after confirming the `pkcore` accessor |
+| 4 | Capture deck for exact replay? | ✅ Done — `PokerSession::shuffled_deck_str` already exists; threaded into every record |
 | 5 | Use `from_table_state_with_ids` (Uuid)? | Yes — needed for `StatsRegistry` correlation in Step 3 |
-| 6 | Does anything reach the `pkcore 0.1.2` pin? | No bump needed for the recorder; revisit only for Phase 4 schema work |
+| 6 | Does anything reach the `pkcore 0.1.2` pin? | No bump needed for Phases 1–3; Phase 4 **does** require a pkcore schema change + bump (see below) |
+
+---
+
+## Phase 4 scope — agent-fidelity per-action annotations
+
+**Goal.** For every voluntary action, record what the agent *actually produced*
+vs what the table *applied*: the raw model response text, an `was_coerced` flag,
+the originally-intended action, and (for LLM agents) token counts / model id.
+This lets the eval surface measure model obedience and parse quality, not just
+outcomes.
+
+### Why this is bigger than Phases 1–3
+
+The data does not exist anywhere the recorder can currently see it. pkcore builds
+each `Action` record **from the `TableAction` event log** inside
+`from_table_state_with_ids`, and `pkcore::hand_history::Action`
+(`seat, player_id, action, amount, all_in`) has **no slot** for agent metadata.
+Meanwhile the raw text and coercion decisions live only in the **agent process**
+— the service receives just the final `seat/action_type/amount` over `Act`. So
+Phase 4 touches four layers, with pkcore as a hard dependency.
+
+### Where coercion actually happens (verified)
+
+"Was coerced" is **multi-source**, not a single flag:
+
+1. **`agent_llm` parse fallback** — `parse_action(text, to_call)` maps
+   unrecognized model output to a safe default (`Check` when `to_call == 0`, else
+   `Fold`); `fallback_decision` does the same on backend error
+   (`pkdealer_agent_llm/src/{parse,agent}.rs`).
+2. **`agent_core` runner clamping** — `decide_and_act` rewrites
+   `Raise(n) < floor_raise → Raise(floor_raise)` and `Bet preflop with no call →
+   Check` (`pkdealer_agent_core/src/runner.rs`).
+3. **`agent_core` server-rejection retry** — if `Act` is rejected, the runner
+   retries with a `safe` action and finally `Fold`. The *applied* action then
+   differs from the agent's intent.
+
+A faithful record must capture the **intended** decision, the **applied** action,
+and *which* of these substitutions fired.
+
+### Work by layer
+
+1. **pkcore (blocking — needs a new release + version bump).** Adds an optional
+   `agent: Option<AgentFidelity>` field to `Action` plus an injection API
+   (`attach_agent_fidelity` / `voluntary_actions_mut`), all additive. **Fully
+   specced separately in
+   [`EPIC-25_Phase4_pkcore_AgentFidelity_spec.md`](./EPIC-25_Phase4_pkcore_AgentFidelity_spec.md).**
+   Until that release lands and the workspace pin is bumped, the rest of Phase 4
+   cannot complete in `pkdealer`.
+
+2. **proto (additive).** Add optional fields to `PlayerAction` (or `ActRequest`):
+   `raw_response`, `was_coerced`, `intended_action_type`, `intended_amount`,
+   `input_tokens`, `output_tokens`, `model`. Old clients omit them → recorded as
+   `None`.
+
+3. **service.** Capture the per-action metadata as each `Act` arrives, buffered
+   per hand in `TableState` keyed by `(seat, sequence)`; at record time zip it
+   onto the derived `Action`s (skipping `Post`/blind entries, matching street +
+   order). Best-effort: missing metadata leaves the fields `None`.
+
+4. **agents (`agent_core` + `agent_llm`).** Surface fidelity from the decision
+   path: `agent_llm` returns the raw `LlmResponse.text` + a parse/​fallback flag;
+   the runner records intended-vs-applied for its clamp/retry coercions. Populate
+   the new `Act` fields in `send_action`. Likely a richer return type than the
+   bare `Decision` (e.g. `DecisionWithMeta`) or a side-channel on the agent.
+
+### Action-matching is the main risk
+
+pkcore's per-street `actions` include forced `Post` entries and is ordered by the
+engine; the agent metadata only covers voluntary actions. The zip must align on
+`(street, seat, voluntary-action ordinal)` and degrade gracefully (leave `None`)
+on any mismatch, never corrupting the action record. Worth a dedicated test
+matrix (folds, all-ins, multi-raise streets, dead button).
+
+### Effort / sequencing
+
+- Gated on the **pkcore schema change landing first** (external release). Until
+  then this phase cannot complete in `pkdealer` alone.
+- Rough size: pkcore (schema + injection API + tests) is the bulk; proto +
+  service plumbing is moderate; agent changes are moderate and ripple across
+  `agent_core`, `agent_llm`, and the `agent_rules`/`agent_random` binaries
+  (which currently send a bare `Decision`).
+- Independent of Phases 1–3 on the wire (all additive), so it can ship later
+  without reworking existing records.
+
+### Open decisions for Phase 4
+
+| # | Decision | Leaning |
+|---|---|---|
+| A | Flatten fidelity fields onto `Action` vs nest under `agent:` | Nest under `Option<AgentFidelity>` — keeps `Action` clean, trivially skipped when absent |
+| B | Record intended-vs-applied, or just `was_coerced`? | Record both intended action + applied + flag — the flag alone loses the most useful signal |
+| C | Where does the agent expose raw text? | Extend the agent return type (`DecisionWithMeta`); avoids a hidden side-channel |
+| D | pkcore injection: new constructor vs post-build setter | Setter on `HandHistory` (additive, smallest pkcore surface) |

@@ -36,6 +36,53 @@ pub enum Decision {
     AllIn,
 }
 
+/// Per-decision provenance: what an agent *produced* versus what the table will
+/// *apply* (EPIC-25 Phase 4).
+///
+/// Surfaced alongside a [`Decision`] by [`PokerAgent::decide_with_fidelity`] and
+/// mapped onto the `PlayerAction.agent` proto field by the runner. Every field
+/// is optional; an empty value (all `None`) means "no provenance", which the
+/// recorder treats as an un-annotated action.
+///
+/// The applied action lives in the surrounding [`Decision`]; this struct records
+/// the agent-side story — raw model text, token usage, model id, whether the
+/// action was coerced (parse fallback, legality clamp, or rejection retry), and
+/// the originally [`intended_action`](Self::intended_action) when it differs.
+///
+/// # Examples
+///
+/// ```rust
+/// use pkdealer_agent_core::{AgentFidelity, Decision};
+///
+/// let fidelity = AgentFidelity {
+///     raw_response: Some("raise to 250".to_string()),
+///     was_coerced: Some(true),
+///     intended_action: Some(Decision::Raise(250)),
+///     model: Some("claude-sonnet".to_string()),
+///     ..Default::default()
+/// };
+/// assert_eq!(fidelity.intended_action, Some(Decision::Raise(250)));
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentFidelity {
+    /// Raw, unparsed model/agent response text (LLM agents). `None` for agents
+    /// that produce a structured decision directly (rules/random).
+    pub raw_response: Option<String>,
+    /// True when the applied action differs from what the agent intended — an
+    /// unparseable response, a bet/raise clamped to a legal size, or a
+    /// server-rejected action replaced by a safe fallback.
+    pub was_coerced: Option<bool>,
+    /// The action the agent originally intended, when it differs from the
+    /// applied [`Decision`].
+    pub intended_action: Option<Decision>,
+    /// Prompt/input tokens reported by the backend (LLM agents).
+    pub input_tokens: Option<u32>,
+    /// Completion/output tokens reported by the backend (LLM agents).
+    pub output_tokens: Option<u32>,
+    /// Model / agent identifier (e.g. `"claude-..."`, `"rules-v1"`).
+    pub model: Option<String>,
+}
+
 /// Decision-making interface implemented by every agent type.
 ///
 /// The `decide` method is called each time it is the agent's turn to act.
@@ -60,6 +107,18 @@ pub trait PokerAgent: Send + Sync {
     /// }
     /// ```
     async fn decide(&self, state: &HandState) -> Decision;
+
+    /// Choose an action *and* surface its [`AgentFidelity`] provenance.
+    ///
+    /// The default implementation returns the bare [`decide`](Self::decide)
+    /// result with empty fidelity, so structured agents (rules/random) need no
+    /// changes. LLM agents override this to surface raw response text, token
+    /// usage, the model id, and parse-level coercions. The runner finalizes
+    /// `was_coerced` / `intended_action` around its own legality clamp and
+    /// rejection retries.
+    async fn decide_with_fidelity(&self, state: &HandState) -> (Decision, AgentFidelity) {
+        (self.decide(state).await, AgentFidelity::default())
+    }
 }
 
 #[cfg(test)]

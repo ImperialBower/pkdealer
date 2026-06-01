@@ -13,9 +13,9 @@ use std::{
 };
 
 use pkdealer_proto::dealer::{
-    ActRequest, ActionType, GetChipsRequest, GetNextToActRequest, PlayerAction, SeatPlayerRequest,
-    StartHandRequest, act_response, dealer_service_client::DealerServiceClient,
-    get_next_to_act_response, seat_player_response,
+    ActRequest, ActionType, AgentFidelity, ExportSessionRequest, GetChipsRequest,
+    GetNextToActRequest, PlayerAction, SeatPlayerRequest, StartHandRequest, act_response,
+    dealer_service_client::DealerServiceClient, get_next_to_act_response, seat_player_response,
 };
 use tonic::{Request, metadata::MetadataValue};
 
@@ -114,6 +114,7 @@ impl PlayerClient {
                 seat: self.seat,
                 action_type: action as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut().insert(
@@ -134,6 +135,7 @@ impl PlayerClient {
                 seat: self.seat,
                 action_type: action as i32,
                 amount: 0,
+                agent: None,
             }),
         });
         req.metadata_mut().insert(
@@ -141,6 +143,27 @@ impl PlayerClient {
             foreign_token
                 .parse::<MetadataValue<_>>()
                 .expect("valid token"),
+        );
+        self.client.act(req).await
+    }
+
+    /// Sends `Act` with agent-fidelity metadata attached to the `PlayerAction`.
+    async fn act_with_agent(
+        &mut self,
+        action: ActionType,
+        agent: AgentFidelity,
+    ) -> Result<tonic::Response<pkdealer_proto::dealer::ActResponse>, tonic::Status> {
+        let mut req = Request::new(ActRequest {
+            action: Some(PlayerAction {
+                seat: self.seat,
+                action_type: action as i32,
+                amount: 0,
+                agent: Some(agent),
+            }),
+        });
+        req.metadata_mut().insert(
+            PLAYER_TOKEN_KEY,
+            self.token.parse::<MetadataValue<_>>().expect("valid token"),
         );
         self.client.act(req).await
     }
@@ -271,6 +294,37 @@ async fn e2e_two_players_full_hand_with_token_enforcement() -> Result<(), Box<dy
     let total: u32 = chips.iter().map(|p| p.chips).sum();
     assert_eq!(total, 2_000, "chips must be conserved end-to-end");
 
+    // ── EPIC-25: export the session and replay it off the wire ───────────────
+    // The spectator token authorizes the export; the YAML must round-trip into a
+    // HandCollection whose single hand replays with chip conservation.
+    let mut export_req = Request::new(ExportSessionRequest::default());
+    export_req.metadata_mut().insert(
+        PLAYER_TOKEN_KEY,
+        MetadataValue::try_from("spectator").expect("valid token"),
+    );
+    let export = orchestrator.export_session(export_req).await?.into_inner();
+    assert_eq!(export.hand_count, 1, "one hand recorded this session");
+    assert_eq!(export.source, "arena");
+
+    let collection = pkcore::hand_history::HandCollection::from_yaml(&export.payload)
+        .expect("exported YAML parses as a HandCollection");
+    assert_eq!(collection.len(), 1);
+    let replay = collection.hands[0].replay().expect("replay succeeds");
+    assert!(
+        replay.is_consistent,
+        "exported hand must replay with chip conservation"
+    );
+
+    // Export without the spectator token must be denied (payload has all cards).
+    let denied = orchestrator
+        .export_session(Request::new(ExportSessionRequest::default()))
+        .await;
+    assert_eq!(
+        denied.unwrap_err().code(),
+        tonic::Code::PermissionDenied,
+        "export without spectator token must be PERMISSION_DENIED"
+    );
+
     Ok(())
 }
 
@@ -307,6 +361,155 @@ async fn e2e_two_players_receive_distinct_tokens() -> Result<(), Box<dyn std::er
     );
     assert!(!player_a.token.is_empty());
     assert!(!player_b.token.is_empty());
+
+    Ok(())
+}
+
+/// Counts actions carrying agent-fidelity across every street of a hand.
+fn count_agent_actions(hand: &pkcore::hand_history::HandHistory) -> usize {
+    let Some(streets) = hand.streets.as_ref() else {
+        return 0;
+    };
+    [
+        streets.preflop.as_ref().map(|s| &s.actions),
+        streets.flop.as_ref().map(|s| &s.actions),
+        streets.turn.as_ref().map(|s| &s.actions),
+        streets.river.as_ref().map(|s| &s.actions),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(|acts| acts.iter())
+    .filter(|a| a.agent.is_some())
+    .count()
+}
+
+/// EPIC-25 Phase 4: agent-fidelity submitted on an `Act` is recorded onto the
+/// matching action in the exported `HandHistory`, while acts submitted without
+/// it stay clean (no empty `agent` blocks) and replay is unaffected.
+#[tokio::test]
+async fn e2e_agent_fidelity_recorded_in_hand_history() -> Result<(), Box<dyn std::error::Error>> {
+    let service_path = service_bin_path()?;
+    let port = reserve_local_port()?;
+    let service_addr = format!("127.0.0.1:{port}");
+    let endpoint = format!("http://{service_addr}");
+
+    let _guard = ChildProcessGuard::new(
+        Command::new(&service_path)
+            .env("PKDEALER_ADDR", &service_addr)
+            .spawn()?,
+    );
+    assert!(
+        wait_for_service_ready(&endpoint, Duration::from_secs(15)).await,
+        "service should become ready"
+    );
+
+    let mut player_a = PlayerClient::connect(&endpoint, "Alice", 1_000).await?;
+    let mut player_b = PlayerClient::connect(&endpoint, "Bob", 1_000).await?;
+    let mut orchestrator = DealerServiceClient::connect(endpoint.clone()).await?;
+    orchestrator
+        .start_hand(Request::new(StartHandRequest {}))
+        .await?;
+
+    // Play to completion. Attach agent-fidelity to the FIRST voluntary act only;
+    // every later act is a bare check (no agent data), exercising the strip pass.
+    let mut tagged_first = false;
+    let mut hand_complete = false;
+    for _ in 0..24 {
+        if hand_complete {
+            break;
+        }
+        let next_seat = {
+            let resp = orchestrator
+                .get_next_to_act(Request::new(GetNextToActRequest {}))
+                .await?
+                .into_inner();
+            match resp.result {
+                Some(get_next_to_act_response::Result::Info(info)) => info.seat,
+                _ => break,
+            }
+        };
+        let actor = if next_seat == player_a.seat {
+            &mut player_a
+        } else {
+            &mut player_b
+        };
+        let resp = if tagged_first {
+            actor.act(ActionType::Check).await?.into_inner()
+        } else {
+            tagged_first = true;
+            let agent = AgentFidelity {
+                raw_response: Some("call to keep range wide".to_string()),
+                was_coerced: Some(true),
+                intended_action_type: Some(ActionType::Raise as i32),
+                intended_amount: Some(300),
+                input_tokens: Some(1234),
+                output_tokens: Some(7),
+                model: Some("claude-e2e".to_string()),
+            };
+            actor
+                .act_with_agent(ActionType::Call, agent)
+                .await?
+                .into_inner()
+        };
+        match resp.result {
+            Some(act_response::Result::ActionResult(r)) => hand_complete = r.hand_complete,
+            Some(act_response::Result::Error(e)) => return Err(e.into()),
+            None => return Err("empty act response".into()),
+        }
+    }
+    assert!(hand_complete, "hand must reach completion via Act alone");
+
+    // Export and inspect the recorded hand off the wire.
+    let mut export_req = Request::new(ExportSessionRequest::default());
+    export_req.metadata_mut().insert(
+        PLAYER_TOKEN_KEY,
+        MetadataValue::try_from("spectator").expect("valid token"),
+    );
+    let export = orchestrator.export_session(export_req).await?.into_inner();
+    assert_eq!(export.hand_count, 1);
+
+    let collection = pkcore::hand_history::HandCollection::from_yaml(&export.payload)
+        .expect("exported YAML parses as a HandCollection");
+    let hand = &collection.hands[0];
+
+    // Exactly one action across the whole hand is annotated — the strip pass
+    // cleared the empty placeholders buffered for the bare-check acts.
+    assert_eq!(
+        count_agent_actions(hand),
+        1,
+        "only the agent-tagged act keeps an agent block"
+    );
+
+    // That one annotation carries exactly the values we sent, converted to the
+    // pkcore representation (enum mapped, amount widened to f64).
+    let agent = hand
+        .streets
+        .as_ref()
+        .and_then(|s| s.preflop.as_ref())
+        .expect("preflop street")
+        .actions
+        .iter()
+        .find_map(|a| a.agent.as_ref())
+        .expect("an annotated preflop action");
+    assert_eq!(
+        agent.raw_response.as_deref(),
+        Some("call to keep range wide")
+    );
+    assert_eq!(agent.was_coerced, Some(true));
+    assert_eq!(
+        agent.intended_action,
+        Some(pkcore::hand_history::ActionType::Raise)
+    );
+    assert_eq!(agent.intended_amount, Some(300.0));
+    assert_eq!(agent.input_tokens, Some(1234));
+    assert_eq!(agent.output_tokens, Some(7));
+    assert_eq!(agent.model.as_deref(), Some("claude-e2e"));
+
+    // Replay ignores the metadata — the hand still replays consistently.
+    assert!(
+        hand.replay().expect("replay succeeds").is_consistent,
+        "agent metadata must not affect replay"
+    );
 
     Ok(())
 }
