@@ -257,6 +257,7 @@ Run:
 | Phase 2 / EPIC-21 | Web spectator app | Shipped (separate `pkspectator` repo) |
 | Phase 4 / EPIC-23 | AI agent clients | ✅ Shipped — see EPIC-23 below |
 | EPIC-40 | Local LLM backend | ✅ Shipped — see EPIC-40 below |
+| EPIC-41 | Reproducible agent-vs-bots scenarios (deck injection + comparison harness) | Not started — see `docs/EPIC-41_Reproducible_Scenarios.md` |
 | Future | Multi-table support via `pkcore::TableManager` | Not started |
 
 ---
