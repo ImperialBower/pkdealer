@@ -293,17 +293,13 @@ async fn decide_and_act<A: PokerAgent>(
     if fidelity.model.is_none() && !ctx.name.is_empty() {
         fidelity.model = Some(ctx.name.to_string());
     }
-    // Raise(n) takes a total-amount; min_raise is the minimum increment above
-    // the call.  Minimum valid total = amount_to_call + min_raise.  When
-    // min_raise is 0 (blinds not yet swept into pot preflop) fall back to
-    // 2× BB per standard NLHE rules.
-    let floor_raise = if info.min_raise > 0 {
-        info.amount_to_call.saturating_add(info.min_raise)
-    } else if info.amount_to_call > 0 {
-        ctx.big_blind.saturating_mul(2)
-    } else {
-        0
-    };
+    // Raise(n) is a *total* bet level; pkcore validates `n - current_bet >= min_raise`.
+    // The floor is therefore `current_bet + min_raise`, not `to_call + min_raise` —
+    // those differ whenever the acting player already has chips in this street
+    // (e.g. the small blind preflop, or the opener facing a re-raise).
+    let floor_raise = info
+        .current_bet
+        .saturating_add(info.min_raise.max(ctx.big_blind));
     let is_preflop = hand_state.street == "preflop";
     let decision = finalize_decision(
         &intended,
