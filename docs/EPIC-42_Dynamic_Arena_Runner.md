@@ -4,13 +4,19 @@
 
 | Component | Status |
 |---|---|
-| `arena.toml` player registry | Not started |
-| `bin/arena` CLI driver (compose override generation) | Not started |
-| Multiplicity syntax (`gto gto` → two uniquely-named containers) | Not started |
-| Seat-count validation (≤ 9) + unknown-name help text | Not started |
-| `pkdealer_agent_gemini` crate (`gwen`) | Not started |
-| `gwen` registered in arena registry | Not started |
-| `Dockerfile.agent` support for gemini binary | Not started |
+| `arena.toml` player registry | ✅ Done |
+| `bin/arena` CLI driver (compose override generation) | ✅ Done |
+| Multiplicity syntax (`gto gto` → two uniquely-named containers) | ✅ Done |
+| Seat-count validation (≤ 9) + unknown-name help text | ✅ Done |
+| `gwen` registered in arena registry (flagged not-yet-available) | ✅ Done |
+| `pkdealer_agent_gemini` crate (`gwen`) | ⏸ Deferred — Phase 3, no API key |
+| `Dockerfile.agent` support for gemini binary | ⏸ Deferred (no-op: builds any `BIN_NAME`) |
+
+> **Phase 1-2 shipped** (registry + dynamic runner). Phase 3 — the
+> `pkdealer_agent_gemini` crate — is **deferred** until a `GEMINI_API_KEY` is
+> available; `bin/arena` already lists `gwen` in `arena.toml` but rejects it with
+> a clear "not yet implemented" message so no un-buildable container is launched.
+> `claude` works but is flagged TODO for live verification (also needs a key).
 
 ---
 

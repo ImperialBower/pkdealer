@@ -1,0 +1,80 @@
+# arena.toml — player registry for ./bin/arena (EPIC-42 Dynamic Arena Runner).
+#
+# Maps short player names to an agent type + config. `bin/arena` reads this file
+# to build an ad-hoc table from the command line, e.g.:
+#
+#   ./bin/arena gto gto lag llama          # two GTO bots, a LAG bot, one llama
+#   ./bin/arena gto:3 claude               # colon multiplicity shorthand
+#
+# The registry is additive: new entries here need no script changes.
+#
+# `type` must be one of: rules | ollama | claude | gemini
+#   rules  — pkdealer_agent_rules,  uses `profile` (a pkcore built-in archetype)
+#   ollama — pkdealer_agent_ollama, uses `model` (talks to host `ollama serve`)
+#   claude — pkdealer_agent_claude, uses `model`  ┐ live LLM, needs an API key
+#   gemini — pkdealer_agent_gemini, uses `model`  ┘
+#
+# ── TODO / availability (EPIC-42 scope) ───────────────────────────────────────
+#   claude  — requires ANTHROPIC_API_KEY in the calling shell (live, billed).
+#             bin/arena emits the container but warns when the key is missing.
+#             TODO: verify a live Claude run once a key is available.
+#   gwen    — type = gemini: the pkdealer_agent_gemini crate is NOT YET BUILT
+#             (EPIC-42 Phase 3, deferred — no API key on hand). Selecting `gwen`
+#             makes bin/arena exit with a clear "not yet implemented" message
+#             rather than attempting an un-buildable container.
+
+[players.gto]
+type    = "rules"
+profile = "gto"
+
+[players.lag]
+type    = "rules"
+profile = "loose_aggressive"
+
+[players.tag]
+type    = "rules"
+profile = "tight_aggressive"
+
+[players.tp]
+type    = "rules"
+profile = "tight_passive"
+
+[players.lp]
+type    = "rules"
+profile = "loose_passive"
+
+[players.maniac]
+type    = "rules"
+profile = "maniac"
+
+[players.abc]
+type    = "rules"
+profile = "abc"
+
+[players.ssn]
+type    = "rules"
+profile = "short_stack_ninja"
+
+[players.joker]
+type    = "rules"
+profile = "joker"
+
+[players.llama]
+type  = "ollama"
+model = "llama3.1"
+
+[players.mistral]
+type  = "ollama"
+model = "mistral"
+
+[players.gemma]
+type  = "ollama"
+model = "gemma2"
+
+[players.claude]
+type  = "claude"
+model = "claude-sonnet-4-6"
+
+[players.gwen]
+type  = "gemini"
+model = "gemini-2.0-flash"
