@@ -49,6 +49,40 @@ compose profiles (`aiarena` vs `botarena`), so don't run both at once — they
 share the dealer's port. Tear one down (`docker compose down -v`) before
 launching the other.
 
+### Custom line-ups (`./bin/arena`)
+
+`./bin/aiarena` and `./bin/botarena` are fixed rosters. To compose an arbitrary
+table from the terminal — without editing `docker-compose.yml` — use
+`./bin/arena` and pass a space-separated player list (EPIC-42). The player
+registry lives in [`arena.toml`](arena.toml); run `./bin/arena --help` to list
+the 14 known names and their types.
+
+```bash
+# Classic 6-seat mixed arena (equivalent to ./bin/aiarena):
+./bin/arena gto lag tag llama mistral gemma
+
+# Two GTO bots + a Claude agent + three rule archetypes:
+./bin/arena gto:2 claude tag maniac lp        # `gto:2` == `gto gto`
+
+# All-bot 9-seat ring (equivalent to ./bin/botarena):
+./bin/arena gto lag tag tp lp maniac abc ssn joker
+
+# Quick 3-seat debug table:
+./bin/arena gto lag claude
+```
+
+`bin/arena` generates a one-off compose override in `/tmp` and brings up the
+same infra + observability stack; the teardown command (which references the
+override file) is printed at the end. Add `--dry-run` to generate and inspect
+the override without starting anything. Notes:
+
+- **At most 9 seats**; repeats get unique names (`gto gto` → `agent_gto_1`,
+  `agent_gto_2`), each its own Jaeger service and `--name`.
+- **`claude`** needs `ANTHROPIC_API_KEY` exported in your shell (live, billed);
+  without it the container is still created but exits until the key is set.
+- **`gwen`** (Gemini) is **not yet available** — its agent crate is EPIC-42
+  Phase 3, deferred. Selecting it is rejected with a clear message.
+
 ## What to show
 
 Arrange three browser tabs side-by-side:

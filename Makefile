@@ -6,7 +6,15 @@
 # Example: make demo-audit COUNT=5
 COUNT ?= 1
 
-.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve ddown demo demo-audit
+# Player line-up for `make arena` (override on the command line).
+# Example: make arena PLAYERS="gto gto lag llama"
+PLAYERS ?= gto lag tag llama mistral gemma
+
+# Docker compose project name (containers are labelled with this). Override only
+# if you launched with a custom COMPOSE_PROJECT_NAME.
+PROJECT ?= pkdealer
+
+.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve ddown arena-down demo demo-audit arena
 
 # Default target
 default: ayce
@@ -41,6 +49,11 @@ help:
 	@echo "  make demo           - Run the 9-player client demo (service must be running)"
 	@echo "  make demo-audit [COUNT=N] - Run demo+audit N times (default 1)"
 	@echo ""
+	@echo "Arena (EPIC-42 dynamic line-ups; see ./bin/arena --help):"
+	@echo "  make arena [PLAYERS=\"gto lag llama\"] - Launch an ad-hoc arena table"
+	@echo "  (or call directly: ./bin/arena gto:2 claude tag)"
+	@echo "  make arena-down     - Force-tear-down ALL arena containers + volumes"
+	@echo ""
 	@echo "Tools:"
 	@echo "  make install-tools  - Install cargo-deny, cargo-udeps, etc."
 	@echo ""
@@ -71,10 +84,32 @@ serve:
 	@echo "Starting pkdealer_service on 127.0.0.1:50051..."
 	cargo run --bin pkdealer_service -p pkdealer_service
 
+# Launch an ad-hoc arena table (EPIC-42). Override the line-up with PLAYERS,
+# e.g. make arena PLAYERS="gto:2 claude tag". For the full multiplicity and
+# registry options, call ./bin/arena directly.
+arena:
+	@./bin/arena $(PLAYERS)
+
 # Tear down the demo stack and drop its named volumes.
 ddown:
 	@echo "Stopping demo stack and removing volumes..."
-	docker compose down -v
+	docker compose down -v --remove-orphans
+
+# Forcefully tear down EVERY container in the '$(PROJECT)' compose project — no
+# matter what. Works even for agents launched by ./bin/arena (whose /tmp compose
+# override may already be deleted), and even if compose's own state is confused:
+# it targets the project by name, then sweeps any survivors by compose label.
+# Idempotent and safe to run when nothing is up.
+arena-down:
+	@echo "Tearing down the '$(PROJECT)' arena (all containers + volumes)..."
+	-docker compose -p $(PROJECT) down -v --remove-orphans
+	@leftover=$$(docker ps -aq --filter "label=com.docker.compose.project=$(PROJECT)"); \
+	if [ -n "$$leftover" ]; then \
+		echo "Force-removing leftover containers..."; \
+		docker rm -f $$leftover; \
+	else \
+		echo "No leftover '$(PROJECT)' containers — clean."; \
+	fi
 
 # Build all crates
 build:

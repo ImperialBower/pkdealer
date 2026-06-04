@@ -5,6 +5,10 @@
 # Grafana, and six agent containers: three rule bots (gto, lag, tag) and
 # three LLMs (llama, mistral, gemma).
 # The pkspectator UI runs separately from its own repo — see DEMO.md.
+#
+# This is a fixed roster. For an ad-hoc lineup from the command line, use the
+# flexible successor ./bin/arena (EPIC-42) — e.g. the equivalent of this script:
+#   ./bin/arena gto lag tag llama mistral gemma
 
 set -euo pipefail
 

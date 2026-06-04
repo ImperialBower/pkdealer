@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Launch the all-bots pkdealer demo stack.
+#
+# A pure rule-bot shootout: the dealer service, OpenTelemetry collector,
+# Jaeger, Prometheus, Grafana, and a full 9-handed ring of every pkcore
+# archetype — gto, tag, lag, tp, lp, maniac, abc, ssn, joker. No LLMs, so
+# no ollama dependency: the table runs entirely offline.
+#
+# Sibling of ./bin/aiarena (the 3-bots-plus-3-LLMs demo); both share one
+# docker-compose.yml and select their agents via compose profiles.
+# The pkspectator UI runs separately from its own repo — see DEMO.md.
+#
+# This is a fixed roster. For an ad-hoc lineup from the command line, use the
+# flexible successor ./bin/arena (EPIC-42) — e.g. the equivalent of this script:
+#   ./bin/arena gto lag tag tp lp maniac abc ssn joker
+
+set -euo pipefail
+
+echo "Starting pkdealer all-bots stack..."
+# The "botarena" compose profile selects the 9 rule-bot archetypes.
+# Infra services carry no profile and start regardless.
+docker compose --profile botarena up -d --build
+
+echo ""
+echo "Waiting for dealer service to accept connections on :50051..."
+for _ in $(seq 1 60); do
+  if nc -z localhost 50051 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+
+if ! nc -z localhost 50051 2>/dev/null; then
+  echo "❌ Dealer service did not become reachable within 60s."
+  echo "   Inspect logs: docker compose logs pkdealer_service"
+  exit 1
+fi
+
+cat <<'EOF'
+
+All-bots demo is live (9 pkcore archetypes head-to-head):
+  Seats:     gto, tag, lag, tp, lp, maniac, abc, ssn, joker
+  Jaeger:    http://localhost:16686
+  Grafana:   http://localhost:3001
+  Prom:      http://localhost:9090
+
+To watch the table, run pkspectator from a separate checkout:
+  cd ../pkspectator && cargo run
+  open http://localhost:3000
+
+Tail logs:    docker compose logs -f
+Tear down:    docker compose down -v
+EOF
