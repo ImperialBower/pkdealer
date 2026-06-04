@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# Dynamic arena runner — compose an ad-hoc pkdealer table from the command line.
+#
+# Unlike ./bin/aiarena (fixed 3 bots + 3 LLMs) and ./bin/botarena (fixed 9 rule
+# bots), which select a baked-in lineup via a docker compose `--profile`, this
+# script reads ./arena.toml and generates a one-off compose override file with
+# exactly the agents you name — no edits, no committed profile.
+#
+#   ./bin/arena gto gto lag llama          # two GTO bots, a LAG bot, one llama
+#   ./bin/arena gto:2 claude tag maniac    # colon multiplicity shorthand
+#   ./bin/arena --help                     # list the registry
+#
+# Infra (dealer service, OTel collector, Jaeger, Prometheus, Grafana) comes from
+# the unchanged, profile-less docker-compose.yml; only the agent services are
+# generated here. EPIC-42.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ARENA_TOML="$ROOT/arena.toml"
+COMPOSE_BASE="$ROOT/docker-compose.yml"
+MAX_SEATS=9
+
+# Pacing knobs, resolved here so `PKDEALER_ACTION_DELAY_SECS=2 ./bin/arena …`
+# still works (mirrors bin/aiarena's documented override). Baked into the
+# generated override as literal values.
+ACTION_DELAY="${PKDEALER_ACTION_DELAY_SECS:-1}"
+HAND_END_DELAY="${PKDEALER_HAND_END_DELAY_SECS:-5}"
+OLLAMA_HOST_VAL="${OLLAMA_HOST:-http://host.docker.internal:11434}"
+
+if [[ ! -f "$ARENA_TOML" ]]; then
+  echo "❌ registry not found: $ARENA_TOML" >&2
+  exit 1
+fi
+
+# ── arena.toml readers (pure awk; the repo has no TOML tooling) ───────────────
+
+# Print every player name declared as a [players.<name>] table, in file order.
+registry_names() {
+  awk '
+    /^[[:space:]]*\[players\./ {
+      s = $0
+      sub(/^[[:space:]]*\[players\./, "", s)
+      sub(/\].*$/, "", s)
+      gsub(/[[:space:]]/, "", s)
+      print s
+    }
+  ' "$ARENA_TOML"
+}
+
+# registry_field <name> <field> — print the value of <field> within the
+# [players.<name>] table, or nothing if the table/field is absent.
+registry_field() {
+  awk -v target="$1" -v field="$2" '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*\[players\./ {
+      s = $0
+      sub(/^[[:space:]]*\[players\./, "", s)
+      sub(/\].*$/, "", s)
+      gsub(/[[:space:]]/, "", s)
+      in_target = (s == target)
+      next
+    }
+    in_target && $0 ~ ("^[[:space:]]*" field "[[:space:]]*=") {
+      v = $0
+      sub(/^[^=]*=[[:space:]]*/, "", v)   # strip "key   = "
+      sub(/[[:space:]]*#.*$/, "", v)       # strip inline comment
+      gsub(/"/, "", v)                      # strip quotes
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      print v
+      exit
+    }
+  ' "$ARENA_TOML"
+}
+
+# ── help ──────────────────────────────────────────────────────────────────────
+
+print_help() {
+  cat <<EOF
+Usage: ./bin/arena PLAYER [PLAYER ...] [--dry-run]
+
+PLAYER may be:
+  <name>        one instance        (e.g. gto)
+  <name>:<n>    n instances         (e.g. gto:2)
+
+Options:
+  --dry-run     generate the compose override and print its path, but do not
+                run 'docker compose up' (handy for inspecting the output)
+  -h, --help    show this message
+
+At most ${MAX_SEATS} seats. Known players (from arena.toml):
+
+EOF
+  local n t cfg
+  while IFS= read -r n; do
+    t="$(registry_field "$n" type)"
+    case "$t" in
+      rules) cfg="profile=$(registry_field "$n" profile)" ;;
+      *)     cfg="model=$(registry_field "$n" model)" ;;
+    esac
+    printf '  %-9s %-7s %s\n' "$n" "$t" "$cfg"
+  done < <(registry_names)
+  cat <<EOF
+
+Notes:
+  claude  needs ANTHROPIC_API_KEY in your shell (live, billed). The container is
+          still generated when the key is missing; it will exit until set.
+  gwen    (gemini) is NOT YET AVAILABLE — the pkdealer_agent_gemini crate is
+          EPIC-42 Phase 3 (deferred). Selecting it is rejected.
+EOF
+}
+
+# ── arg parsing ───────────────────────────────────────────────────────────────
+
+DRY_RUN=0
+positional=()
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) print_help; exit 0 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -*)        echo "❌ unknown option: $arg" >&2; exit 1 ;;
+    *)         positional+=("$arg") ;;
+  esac
+done
+
+if (( ${#positional[@]} == 0 )); then
+  echo "❌ no players given." >&2
+  echo "" >&2
+  print_help >&2
+  exit 1
+fi
+
+# Expand each PLAYER into one entry per seat, validating names and multiplicity.
+players=()
+for arg in "${positional[@]}"; do
+  name="${arg%%:*}"
+  if [[ "$arg" == *:* ]]; then
+    count="${arg#*:}"
+  else
+    count=1
+  fi
+
+  if ! [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+    echo "❌ invalid multiplicity in '$arg' (expected <name>:<positive-int>)." >&2
+    exit 1
+  fi
+
+  if [[ -z "$(registry_field "$name" type)" ]]; then
+    echo "❌ unknown player: '$name'." >&2
+    echo "   Known players:" >&2
+    registry_names | sed 's/^/     /' >&2
+    exit 1
+  fi
+
+  for ((i = 0; i < count; i++)); do
+    players+=("$name")
+  done
+done
+
+if (( ${#players[@]} > MAX_SEATS )); then
+  echo "❌ ${#players[@]} seats requested; the table seats at most ${MAX_SEATS}." >&2
+  exit 1
+fi
+
+# ── type gating: reject gemini, collect soft-check flags ──────────────────────
+
+need_ollama=0
+missing_anthropic=0
+for name in "${players[@]}"; do
+  case "$(registry_field "$name" type)" in
+    gemini)
+      cat >&2 <<EOF
+❌ '$name' uses the Gemini backend, which is not yet implemented.
+   The pkdealer_agent_gemini crate ("gwen") is EPIC-42 Phase 3 — deferred until
+   a GEMINI_API_KEY is available and the crate is built. Drop '$name' from the
+   lineup for now (rule bots, ollama, and claude all work).
+EOF
+      exit 1
+      ;;
+    ollama) need_ollama=1 ;;
+    claude) [[ -z "${ANTHROPIC_API_KEY:-}" ]] && missing_anthropic=1 ;;
+  esac
+done
+
+if (( need_ollama )) && ! curl -fsS http://localhost:11434/api/tags >/dev/null 2>&1; then
+  cat <<'EOF'
+⚠  Ollama not reachable at http://localhost:11434
+   Any ollama agents (llama, mistral, gemma) will exit until ollama is running:
+     ollama serve && ollama pull llama3.1
+   Rule bots in the lineup still play.
+
+EOF
+fi
+
+if (( missing_anthropic )); then
+  cat <<'EOF'
+⚠  ANTHROPIC_API_KEY is not set.
+   claude containers will exit until you export it. Rule bots / ollama still
+   play. (TODO: live-verify a Claude run once a key is available.)
+
+EOF
+fi
+
+# ── generate the compose override ─────────────────────────────────────────────
+
+# BSD (macOS) mktemp needs the X's at the end of the template, so create the
+# temp file first and then add the .yml suffix.
+OVERRIDE_BASE="$(mktemp "${TMPDIR:-/tmp}/docker-compose.arena.XXXXXX")"
+OVERRIDE="${OVERRIDE_BASE}.yml"
+mv "$OVERRIDE_BASE" "$OVERRIDE"
+
+# Append one fully-inlined service block (no cross-file YAML anchors) for the
+# instance <id> of registry player <name>.
+emit_service() {
+  local id="$1" name="$2"
+  local t bin image profile model
+  t="$(registry_field "$name" type)"
+  case "$t" in
+    rules)  bin=pkdealer_agent_rules;  image=pkdealer/agent_rules:latest ;;
+    ollama) bin=pkdealer_agent_ollama; image=pkdealer/agent_ollama:latest ;;
+    claude) bin=pkdealer_agent_claude; image=pkdealer/agent_claude:latest ;;
+  esac
+
+  {
+    printf '  agent_%s:\n' "$id"
+    printf '    image: %s\n' "$image"
+    printf '    build:\n'
+    printf '      context: .\n'
+    printf '      dockerfile: Dockerfile.agent\n'
+    printf '      args:\n'
+    printf '        BIN_NAME: %s\n' "$bin"
+    if [[ "$t" == rules ]]; then
+      profile="$(registry_field "$name" profile)"
+      printf '    command: ["--name", "%s", "--profile", "%s"]\n' "$id" "$profile"
+    else
+      printf '    command: ["--name", "%s"]\n' "$id"
+    fi
+    printf '    restart: unless-stopped\n'
+    printf '    environment:\n'
+    printf '      PKDEALER_ACTION_DELAY_SECS: %s\n' "$ACTION_DELAY"
+    printf '      PKDEALER_HAND_END_DELAY_SECS: %s\n' "$HAND_END_DELAY"
+    printf '      PKDEALER_ENDPOINT: http://pkdealer_service:50051\n'
+    printf '      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317\n'
+    printf '      OTEL_SERVICE_NAME: agent_%s\n' "$id"
+    printf '      RUST_LOG: info\n'
+    if [[ "$t" == ollama ]]; then
+      model="$(registry_field "$name" model)"
+      printf '      OLLAMA_HOST: %s\n' "$OLLAMA_HOST_VAL"
+      printf '      OLLAMA_MODEL: %s\n' "$model"
+    elif [[ "$t" == claude ]]; then
+      model="$(registry_field "$name" model)"
+      # Left as a compose interpolation so the secret is read from the host at
+      # 'up' time and never written into the /tmp override file.
+      printf '      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}\n'
+      printf '      ANTHROPIC_MODEL: %s\n' "$model"
+    fi
+    if [[ "$t" == ollama ]]; then
+      printf '    extra_hosts:\n'
+      printf '      - "host.docker.internal:host-gateway"\n'
+    fi
+    printf '    depends_on:\n'
+    printf '      - pkdealer_service\n'
+    printf '      - otel-collector\n'
+  } >> "$OVERRIDE"
+}
+
+{
+  printf '# Generated by bin/arena — ad-hoc agent lineup. Safe to delete.\n'
+  printf '# Lineup: %s\n' "${positional[*]}"
+  printf 'services:\n'
+} > "$OVERRIDE"
+
+# Unique names in first-seen order (awk dedup avoids bash-4 assoc arrays).
+uniq_names=()
+while IFS= read -r u; do
+  uniq_names+=("$u")
+done < <(printf '%s\n' "${players[@]}" | awk '!seen[$0]++')
+
+# Emit name_1 … name_k for each player so repeats get unique service names,
+# --name flags, and OTEL_SERVICE_NAME values.
+for name in "${uniq_names[@]}"; do
+  k="$(printf '%s\n' "${players[@]}" | grep -cx -- "$name" || true)"
+  for ((n = 1; n <= k; n++)); do
+    emit_service "${name}_${n}" "$name"
+  done
+done
+
+echo "Lineup (${#players[@]} seat(s)): ${positional[*]}"
+echo "Override file: $OVERRIDE"
+
+if (( DRY_RUN )); then
+  echo ""
+  echo "Dry run — not starting the stack. Inspect the override above, or:"
+  echo "  docker compose -f \"$COMPOSE_BASE\" -f \"$OVERRIDE\" config"
+  exit 0
+fi
+
+# ── bring up the stack ────────────────────────────────────────────────────────
+
+echo ""
+echo "Starting pkdealer arena stack..."
+docker compose -f "$COMPOSE_BASE" -f "$OVERRIDE" up -d --build
+
+echo ""
+echo "Waiting for dealer service to accept connections on :50051..."
+for _ in $(seq 1 60); do
+  if nc -z localhost 50051 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+
+if ! nc -z localhost 50051 2>/dev/null; then
+  echo "❌ Dealer service did not become reachable within 60s."
+  echo "   Inspect logs: docker compose -f \"$COMPOSE_BASE\" -f \"$OVERRIDE\" logs pkdealer_service"
+  exit 1
+fi
+
+cat <<EOF
+
+Arena is live:
+  Jaeger:    http://localhost:16686
+  Grafana:   http://localhost:3001
+  Prom:      http://localhost:9090
+
+To watch the table, run pkspectator from a separate checkout:
+  cd ../pkspectator && cargo run
+  open http://localhost:3000
+
+Tail logs:    docker compose -f "$COMPOSE_BASE" -f "$OVERRIDE" logs -f
+Tear down:    docker compose -f "$COMPOSE_BASE" -f "$OVERRIDE" down -v
+EOF
