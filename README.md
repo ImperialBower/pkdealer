@@ -9,9 +9,16 @@
 
 # PKDealer — gRPC Poker Dealer Service
 
-PKDealer is a Rust workspace providing a gRPC poker dealer service, a matching gRPC client, and
-shared Protobuf definitions. The service manages a poker table: seating players, dealing hands,
-processing actions (bet / call / raise / fold), advancing streets, and resolving showdowns.
+PKDealer is a Rust workspace providing a gRPC poker dealer service, a matching gRPC client,
+shared Protobuf definitions, and a family of bot agents. The service manages a poker table:
+seating players, dealing hands, processing actions (bet / call / raise / fold), advancing
+streets, and resolving showdowns.
+
+Agents connect over gRPC and play autonomously — rule-based archetypes from `pkcore`, a random
+baseline, and live LLM players backed by Claude or a local Ollama model. The **arena** scripts
+compose ad-hoc tables from these agents and bring up a full OpenTelemetry observability stack
+(collector + Jaeger + Prometheus + Grafana) alongside the dealer. A browser spectator lives in
+the separate [`pkspectator`](https://github.com/ImperialBower/pkspectator) repo.
 
 ---
 
@@ -22,6 +29,8 @@ processing actions (bet / call / raise / fold), advancing streets, and resolving
 - [Getting Started](#getting-started)
 - [Building](#building)
 - [Running](#running)
+- [Agents and the Arena](#agents-and-the-arena)
+- [Observability](#observability)
 - [Testing](#testing)
 - [Development Workflow](#development-workflow)
 - [Make Targets Reference](#make-targets-reference)
@@ -36,20 +45,28 @@ processing actions (bet / call / raise / fold), advancing streets, and resolving
 
 ```
 pkdealer/
-├── Cargo.toml               # Workspace root
+├── Cargo.toml               # Workspace root (9 member crates)
 ├── Makefile                 # Developer convenience targets
 ├── deny.toml                # cargo-deny configuration
+├── arena.toml               # Player registry for ./bin/arena (name → agent type)
+├── docker-compose.yml       # Dealer + agents + OTel collector + Jaeger + Prometheus + Grafana
+├── bin/                     # Launcher scripts (arena, aiarena, botarena, …)
+├── ops/                     # Observability stack config (collector, Grafana, Prometheus)
+├── proto/                   # Protobuf workspace assets
 ├── crates/
 │   ├── pkdealer_proto/      # Shared Protobuf definitions + generated Rust types
 │   │   ├── proto/dealer.proto
 │   │   ├── build.rs         # tonic-build code generation
 │   │   └── src/lib.rs
-│   ├── pkdealer_service/    # gRPC server binary
-│   │   ├── src/main.rs
-│   │   └── tests/e2e_ping.rs
-│   └── pkdealer_client/     # gRPC client binary
-│       └── src/main.rs
-└── docs/notes/              # Development notes and decision records
+│   ├── pkdealer_service/    # gRPC server binary (the dealer)
+│   ├── pkdealer_client/     # gRPC client binary
+│   ├── pkdealer_agent_core/    # Shared gRPC agent infrastructure
+│   ├── pkdealer_agent_random/  # Random baseline bot
+│   ├── pkdealer_agent_rules/   # Rule-based bot driven by a pkcore BotProfile
+│   ├── pkdealer_agent_llm/     # Shared LlmBackend trait + poker-prompt logic
+│   ├── pkdealer_agent_claude/  # Claude LLM agent
+│   └── pkdealer_agent_ollama/  # Ollama (local LLM) agent
+└── docs/                    # EPIC specs, notes, and presentations
 ```
 
 ### Crate Roles
@@ -57,8 +74,14 @@ pkdealer/
 | Crate | Type | Purpose |
 |---|---|---|
 | `pkdealer_proto` | library | Protobuf schema (`dealer.proto`) + tonic-generated Rust types |
-| `pkdealer_service` | binary | gRPC server that implements `DealerService` |
+| `pkdealer_service` | binary | gRPC server that implements `DealerService` (the dealer) |
 | `pkdealer_client` | binary | gRPC client that connects to the service |
+| `pkdealer_agent_core` | library | Shared gRPC agent plumbing used by every bot |
+| `pkdealer_agent_random` | binary | Random baseline bot agent |
+| `pkdealer_agent_rules` | binary | Rule-based bot driven by a `pkcore` `BotProfile` archetype |
+| `pkdealer_agent_llm` | library | Shared `LlmBackend` trait + poker-prompt logic for LLM agents |
+| `pkdealer_agent_claude` | binary | Claude-backed LLM agent (OTel `gen_ai` instrumented) |
+| `pkdealer_agent_ollama` | binary | Ollama-backed local-LLM agent (OTel `gen_ai` instrumented) |
 
 The browser spectator lives in a separate repo: [`pkspectator`](https://github.com/ImperialBower/pkspectator).
 
@@ -150,6 +173,55 @@ cargo run -p pkdealer_client
 PKDEALER_ENDPOINT=http://127.0.0.1:9090 \
 PKDEALER_CLIENT_ID=my-client \
 cargo run -p pkdealer_client
+```
+
+---
+
+## Agents and the Arena
+
+Bot agents are standalone gRPC clients that seat themselves at the dealer and play
+autonomously. Three launcher scripts in `bin/` bring up a dealer plus a line-up of agents
+via Docker Compose, from simplest to most flexible:
+
+| Script | Line-up | External deps | Notes |
+|---|---|---|---|
+| `./bin/botarena` | Full 9-handed ring of every `pkcore` rule archetype | none | Pure offline rule-bot shootout |
+| `./bin/aiarena` | Fixed 3 rule bots + 3 local LLMs | Ollama on the host | The full demo stack — see [DEMO.md](DEMO.md) |
+| `./bin/arena` | Any line-up you name | depends on agents chosen | Reads [`arena.toml`](arena.toml), generates a one-off compose override |
+
+The **dynamic arena runner** composes ad-hoc tables from the registry in `arena.toml`,
+which maps short names to an agent type (`rules`, `ollama`, `claude`, `gemini`) and config:
+
+```sh
+# Two GTO bots, a loose-aggressive bot, and one llama
+./bin/arena gto gto lag llama
+
+# Colon multiplicity shorthand: three GTO bots + one Claude
+./bin/arena gto:3 claude
+
+# Makefile wrappers
+make arena PLAYERS="gto lag llama"
+make arena-down            # force-tear-down ALL arena containers + volumes
+```
+
+Live LLM players need credentials in the calling shell: the `claude` agent requires
+`ANTHROPIC_API_KEY` (live, billed). Rule bots and Ollama agents run fully locally.
+
+---
+
+## Observability
+
+The service is OpenTelemetry-instrumented. `docker compose up -d --build` brings up the
+dealer plus the full telemetry stack — OTel collector, Jaeger (traces), Prometheus (metrics),
+and Grafana (dashboards). Stack config lives in `ops/`. The LLM agents emit `gen_ai`
+spans so model calls are traceable end-to-end.
+
+See [`crates/pkdealer_service/README.md`](crates/pkdealer_service/README.md) for environment
+variables and the full quickstart. Toggle OTel off with `OTEL_SDK_DISABLED=true` when running
+tests or `cargo run` without a collector.
+
+```sh
+make ddown                 # tear down the demo stack (docker compose down -v)
 ```
 
 ---
@@ -259,6 +331,12 @@ Run `make help` to print a summary at any time.
 |---|---|
 | `make build` | Debug build of the full workspace |
 | `make build-release` | Release build |
+| `make serve` | Build and start the dealer service |
+| `make ddown` | Tear down the demo stack (`docker compose down -v`) |
+| `make demo` | Run the 9-player client demo (service must be running) |
+| `make demo-audit [COUNT=N]` | Run demo + audit N times (default 1) |
+| `make arena [PLAYERS="gto lag llama"]` | Launch an ad-hoc arena table (see `./bin/arena --help`) |
+| `make arena-down` | Force-tear-down ALL arena containers + volumes |
 | `make test` | Run all workspace tests |
 | `make test-verbose` | Tests with `--nocapture` |
 | `make test-service` | Tests for `pkdealer_service` only |
