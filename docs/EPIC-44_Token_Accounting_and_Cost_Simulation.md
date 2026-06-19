@@ -7,7 +7,7 @@
 | Token capture (`prompt_eval_count`/`eval_count` → `LlmResponse`) | ✅ Done (EPIC-40) |
 | `AgentFidelity` carries `input_tokens`/`output_tokens`/`model` | ✅ Done (EPIC-25 P4) |
 | Per-action persistence into `HandCollection` (`proto_agent_to_pkcore` → `write_collection_yaml`) | ✅ Done (EPIC-25) |
-| Post-hoc cost analysis pass over `HandCollection` | 📋 Planned — Phase 0 |
+| Post-hoc cost analysis pass over `HandCollection` | ✅ Done — Phase 0 (`crates/pkdealer_costsim`) |
 | Per-seat live token accumulator on `SessionState` | 📋 Planned — Phase 1 |
 | `SeatInfo` token fields + `build_table_status` wiring | 📋 Planned — Phase 1 |
 | Live token column (pkspectator / pktui render) | 📋 Planned — Phase 1 |
