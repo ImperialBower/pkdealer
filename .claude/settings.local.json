@@ -28,7 +28,9 @@
       "Bash(cargo fmt *)",
       "Bash(echo \"exit=$?\")",
       "Read(//tmp/**)",
-      "Bash(cd *)"
+      "Bash(cd *)",
+      "Bash(sed -n '/pub struct Streets {/,/^}/p' src/hand_history.rs)",
+      "Bash(sed -n '/pub struct Street {/,/^}/p' src/hand_history.rs)"
     ]
   }
 }
