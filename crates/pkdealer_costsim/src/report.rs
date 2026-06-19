@@ -1,7 +1,7 @@
 //! Per-seat token rollup and notional costing over a recorded session.
 //!
 //! [`rollup`] flattens every action in a [`HandCollection`] and sums the LLM
-//! token usage carried by each action's [`AgentFidelity`], grouped by seat.
+//! token usage carried by each action's [`pkcore::hand_history::AgentFidelity`], grouped by seat.
 //! [`cost_seats`] then joins that usage against a [`Pricing`] table (with
 //! optional per-model overrides) to produce a costed leaderboard.
 
