@@ -28,7 +28,15 @@ services:
       # so this scopes the feature to those demos.
       PKDEALER_BLIND_SCHEDULE_ENABLED: "true"
       PKDEALER_HANDS_PER_LEVEL: "20"
+      # EPIC-44: notional cost simulation. Price each seat's tokens against
+      # pricing.toml (mounted below). Local Ollama model ids are priced *as* a
+      # commercial model via PKDEALER_PRICE_AS, so the spectator's Cost$ column
+      # lights up for LLM seats. Override the map from the host shell as needed.
+      PKDEALER_PRICING: /pricing.toml
+      PKDEALER_PRICE_AS: ${PKDEALER_PRICE_AS:-gemma2=claude-opus-4-8,llama3.1=gpt-4.1,mistral=claude-haiku-4-5}
     ports: ["50051:50051"]
+    volumes:
+      - ./pricing.toml:/pricing.toml:ro
     depends_on:
       - otel-collector
 
