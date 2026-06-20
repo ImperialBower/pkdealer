@@ -109,6 +109,75 @@ impl Pricing {
     }
 }
 
+/// Resolves a recorded model id to the [`Price`] it should be billed at.
+///
+/// The recorded `model` is first remapped through `overrides` (a
+/// model→notional-model map, e.g. price local `"gemma"` as `"claude-opus-4-8"`),
+/// then looked up in `pricing`. Returns `None` for a bot (`model: None`) or when
+/// the resolved model is absent from the table.
+///
+/// This is the single resolution path shared by the live `pkdealer_service`
+/// (EPIC-44 Phase 2) and the offline `pkdealer_costsim` tool (Phase 0), so the
+/// two produce identical figures for the same `(model, tokens)`.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// use pkdealer_pricing::{resolve_price, Pricing};
+///
+/// let pricing = Pricing::from_toml(
+///     "[models.\"claude-opus-4-8\"]\ninput = 5.0\noutput = 25.0\n",
+/// ).unwrap();
+/// let mut overrides = HashMap::new();
+/// overrides.insert("gemma".to_string(), "claude-opus-4-8".to_string());
+///
+/// // The local "gemma" seat is priced as Opus via the override.
+/// assert_eq!(resolve_price(&pricing, &overrides, Some("gemma")).unwrap().input, 5.0);
+/// // A bot has no model and no price.
+/// assert!(resolve_price(&pricing, &overrides, None).is_none());
+/// ```
+#[must_use]
+pub fn resolve_price<'a>(
+    pricing: &'a Pricing,
+    overrides: &HashMap<String, String>,
+    model: Option<&str>,
+) -> Option<&'a Price> {
+    let actual = model?;
+    // An override remaps the recorded model to a notional one; absent → itself.
+    let notional = overrides.get(actual).map_or(actual, String::as_str);
+    pricing.price(notional)
+}
+
+/// Computes the notional cost in integer **micro-USD** (1e-6 USD), rounded.
+///
+/// Integer micro-USD keeps the value wire-exact for the `SeatInfo.cost_micro_usd`
+/// proto field (renderers divide by 1e6). Rates are non-negative, so the result
+/// is clamped to `[0, u64::MAX]` defensively.
+///
+/// # Examples
+///
+/// ```
+/// use pkdealer_pricing::{cost_micro_usd, Price};
+///
+/// // 1M input + 1M output at $5 / $25 per million = $30.00 = 30_000_000 µUSD.
+/// let price = Price { input: 5.00, output: 25.00 };
+/// assert_eq!(cost_micro_usd(&price, 1_000_000, 1_000_000), 30_000_000);
+/// assert_eq!(cost_micro_usd(&price, 0, 0), 0);
+/// ```
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn cost_micro_usd(price: &Price, input_tokens: u64, output_tokens: u64) -> u64 {
+    let micros = (cost_usd(price, input_tokens, output_tokens) * 1e6).round();
+    if micros <= 0.0 {
+        0
+    } else if micros >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        micros as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +247,58 @@ output = 0.28
         let pricing =
             Pricing::from_toml("[models.\"x\"]\ninput = 1.0\noutput = 2.0\n").expect("valid");
         assert!(pricing.price("not-in-table").is_none());
+    }
+
+    fn opus_table() -> Pricing {
+        Pricing::from_toml("[models.\"claude-opus-4-8\"]\ninput = 5.0\noutput = 25.0\n")
+            .expect("valid")
+    }
+
+    #[test]
+    fn resolve_price_passthrough_when_no_override() {
+        let pricing = opus_table();
+        let overrides = HashMap::new();
+        let price = resolve_price(&pricing, &overrides, Some("claude-opus-4-8")).expect("priced");
+        assert_eq!(price.input, 5.0);
+    }
+
+    #[test]
+    fn resolve_price_applies_override() {
+        let pricing = opus_table();
+        let mut overrides = HashMap::new();
+        overrides.insert("gemma".to_string(), "claude-opus-4-8".to_string());
+        let price = resolve_price(&pricing, &overrides, Some("gemma")).expect("priced via override");
+        assert_eq!(price.output, 25.0);
+    }
+
+    #[test]
+    fn resolve_price_none_for_bot() {
+        let pricing = opus_table();
+        assert!(resolve_price(&pricing, &HashMap::new(), None).is_none());
+    }
+
+    #[test]
+    fn resolve_price_none_for_unpriced_model() {
+        let pricing = opus_table();
+        assert!(resolve_price(&pricing, &HashMap::new(), Some("llama")).is_none());
+    }
+
+    #[test]
+    fn cost_micro_usd_rounds_to_integer_micros() {
+        // 500k input at $2/M = $1.00; 100k output at $8/M = $0.80; total $1.80.
+        let price = Price {
+            input: 2.00,
+            output: 8.00,
+        };
+        assert_eq!(cost_micro_usd(&price, 500_000, 100_000), 1_800_000);
+    }
+
+    #[test]
+    fn cost_micro_usd_zero_tokens_is_zero() {
+        let price = Price {
+            input: 5.00,
+            output: 25.00,
+        };
+        assert_eq!(cost_micro_usd(&price, 0, 0), 0);
     }
 }
