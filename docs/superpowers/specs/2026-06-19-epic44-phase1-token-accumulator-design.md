@@ -29,8 +29,11 @@ render a token column. This phase ships the **data plane** plus a small in-repo
 
 ## Existing pattern to mirror
 
-`SessionState.banked_profit: HashMap<u8, i64>` (`crates/pkdealer_service/src/main.rs:286`):
-- Declared on `SessionState`, initialized empty (`:431`).
+> **Note:** the EPIC doc calls this struct `SessionState`; the actual struct in
+> `main.rs` is **`TableState`** (`:257`). This spec uses the real name, `TableState`.
+
+`TableState.banked_profit: HashMap<u8, i64>` (`crates/pkdealer_service/src/main.rs:286`):
+- Declared on `TableState`, initialized empty (`:431`).
 - Populated into `SeatInfo.profit_loss` by `build_table_status` (`:462`), which
   threads `banked: &HashMap<u8,i64>` through all ~12 call sites.
 - Cleared per-seat on seat departure (`:1337`).
@@ -52,7 +55,7 @@ uint64 output_tokens = 11;  // cumulative completion tokens this session
 `crates/pkdealer_proto/build.rs` regenerates bindings on build. Bots leave these 0
 (their `AgentFidelity` is all `None`).
 
-### 2. Accumulator — `SessionState` (main.rs, beside `banked_profit` ~286)
+### 2. Accumulator — `TableState` (main.rs, beside `banked_profit` ~286)
 
 ```rust
 /// Per-seat cumulative LLM token usage (input, output) over the session.
