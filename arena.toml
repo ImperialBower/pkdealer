@@ -94,3 +94,11 @@ model = "pkpoker-llama"
 [players.pkmistral]
 type  = "ollama"
 model = "pkpoker-mistral"
+
+# Small/fast PokerBench variant (EPIC-43/44). Same baked-in solver-optimal
+# examples as the others, but FROM qwen2.5:3b (~1.9GB) instead of the 9B gemma2,
+# so it decides with much lower latency. Seat it like any ollama player, e.g.
+#   ./bin/arena pkqwen gto lag tag
+[players.pkqwen]
+type  = "ollama"
+model = "pkpoker-qwen"

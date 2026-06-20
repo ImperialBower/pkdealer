@@ -37,6 +37,10 @@ DEFAULT_MODELS: dict[str, str] = {
     "pkpoker-gemma": "gemma2",
     "pkpoker-llama": "llama3.1",
     "pkpoker-mistral": "mistral",
+    # Small/fast base (~3B) for low-latency play. The PokerBench data is baked
+    # into the system prompt, not the weights, so it ports to any base with no
+    # retraining — this one just runs far faster than the 9B gemma2 above.
+    "pkpoker-qwen": "qwen2.5:3b",
 }
 
 # Test sets are smallest (1k / 10k) and ideal to sample from. The trainer-sized

@@ -105,13 +105,23 @@ Override per run, e.g. `PKDEALER_PRICE_AS="gemma2=gpt-4.1-nano" ./bin/arena gto 
 **PokerBench-guided models.** `make pokerbench-models` bakes sampled
 solver-optimal PokerBench decisions into each base model's system prompt and
 runs `ollama create`, producing `pkpoker-gemma` / `pkpoker-llama` /
-`pkpoker-mistral` (seated as `pkgemma` / `pkllama` / `pkmistral`). It runs
-entirely on local Ollama — no GPU, no cloud — and auto-downloads the dataset:
+`pkpoker-mistral` / `pkpoker-qwen` (seated as `pkgemma` / `pkllama` /
+`pkmistral` / `pkqwen`). It runs entirely on local Ollama — no GPU, no cloud —
+and auto-downloads the dataset:
 
 ```bash
-ollama serve && ollama pull gemma2 llama3.1 mistral   # one-time prereqs
+ollama serve && ollama pull gemma2 llama3.1 mistral qwen2.5:3b   # one-time prereqs
 make pokerbench-models                                 # downloads data + creates models
 ./bin/arena pkgemma gto lag                            # seat the guided model
+```
+
+Because the PokerBench knowledge lives in the system prompt rather than the
+weights, the same examples port to any base with no retraining. `pkqwen` builds
+FROM the small `qwen2.5:3b` (~1.9 GB) instead of the 9B `gemma2` (~5.4 GB), so it
+decides with much lower latency — seat it when the larger seats feel slow:
+
+```bash
+./bin/arena pkqwen gto lag tag                         # fast PokerBench seat
 ```
 
 The few-shot system prompt adds ~1.5–2k input tokens per decision, so the
