@@ -145,6 +145,9 @@ impl<B: LlmBackend> PokerAgent for LlmPokerAgent<B> {
                     input_tokens: Some(response.input_tokens),
                     output_tokens: Some(response.output_tokens),
                     model,
+                    // EPIC-44 Phase 3: capture the exact prompt sent to the model so
+                    // offline analysis can re-tokenize it against a target tokenizer.
+                    prompt: Some(prompt),
                 };
                 (decision, fidelity)
             }

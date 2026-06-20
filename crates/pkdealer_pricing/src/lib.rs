@@ -166,7 +166,11 @@ pub fn resolve_price<'a>(
 /// assert_eq!(cost_micro_usd(&price, 0, 0), 0);
 /// ```
 #[must_use]
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub fn cost_micro_usd(price: &Price, input_tokens: u64, output_tokens: u64) -> u64 {
     let micros = (cost_usd(price, input_tokens, output_tokens) * 1e6).round();
     if micros <= 0.0 {
@@ -267,7 +271,8 @@ output = 0.28
         let pricing = opus_table();
         let mut overrides = HashMap::new();
         overrides.insert("gemma".to_string(), "claude-opus-4-8".to_string());
-        let price = resolve_price(&pricing, &overrides, Some("gemma")).expect("priced via override");
+        let price =
+            resolve_price(&pricing, &overrides, Some("gemma")).expect("priced via override");
         assert_eq!(price.output, 25.0);
     }
 

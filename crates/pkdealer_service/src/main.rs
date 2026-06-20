@@ -255,7 +255,9 @@ fn parse_price_as(raw: Option<String>) -> std::collections::HashMap<String, Stri
             continue;
         }
         match pair.split_once('=') {
-            Some((actual, notional)) if !actual.trim().is_empty() && !notional.trim().is_empty() => {
+            Some((actual, notional))
+                if !actual.trim().is_empty() && !notional.trim().is_empty() =>
+            {
                 map.insert(actual.trim().to_owned(), notional.trim().to_owned());
             }
             _ => tracing::warn!(entry = %pair, "ignoring malformed PKDEALER_PRICE_AS entry"),
@@ -1120,6 +1122,7 @@ fn proto_agent_to_pkcore(
         input_tokens: p.input_tokens,
         output_tokens: p.output_tokens,
         model: p.model,
+        prompt: p.prompt,
     }
 }
 
@@ -2814,6 +2817,7 @@ mod tests {
             input_tokens: Some(1200),
             output_tokens: Some(8),
             model: Some("claude-test".to_string()),
+            prompt: Some("Hero holds AhKh...".to_string()),
         };
         let pk = proto_agent_to_pkcore(proto);
         assert_eq!(pk.raw_response.as_deref(), Some("raise to 250"));
@@ -2826,6 +2830,7 @@ mod tests {
         assert_eq!(pk.input_tokens, Some(1200));
         assert_eq!(pk.output_tokens, Some(8));
         assert_eq!(pk.model.as_deref(), Some("claude-test"));
+        assert_eq!(pk.prompt.as_deref(), Some("Hero holds AhKh..."));
     }
 
     #[test]
@@ -3069,8 +3074,13 @@ mod tests {
 
     #[test]
     fn parse_price_as_reads_pairs() {
-        let map = parse_price_as(Some("gemma=claude-opus-4-8, llama=deepseek-v3.2".to_owned()));
-        assert_eq!(map.get("gemma").map(String::as_str), Some("claude-opus-4-8"));
+        let map = parse_price_as(Some(
+            "gemma=claude-opus-4-8, llama=deepseek-v3.2".to_owned(),
+        ));
+        assert_eq!(
+            map.get("gemma").map(String::as_str),
+            Some("claude-opus-4-8")
+        );
         assert_eq!(map.get("llama").map(String::as_str), Some("deepseek-v3.2"));
     }
 

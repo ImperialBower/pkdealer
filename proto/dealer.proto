@@ -203,6 +203,7 @@ message AgentFidelity {
   optional uint32     input_tokens         = 5;  // prompt tokens (LLM)
   optional uint32     output_tokens        = 6;  // completion tokens (LLM)
   optional string     model                = 7;  // model / agent id
+  optional string     prompt               = 8;  // reconstructed prompt text (LLM), for offline re-tokenization
 }
 
 message PlayerAction {

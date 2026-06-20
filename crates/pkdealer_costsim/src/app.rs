@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use pkcore::hand_history::HandCollection;
 
 use crate::pricing::Pricing;
-use crate::report::{SeatCost, cost_seats, rollup};
+use crate::report::{SeatCost, cost_seats, rollup, rollup_exact};
 
 /// Errors surfaced by the `pkdealer_costsim` tool.
 #[derive(Debug)]
@@ -21,6 +21,8 @@ pub enum CostsimError {
     BadOverride(String),
     /// A `--scenario` name is not recognized.
     UnknownScenario(String),
+    /// The exact-mode tokenizer could not be initialized.
+    Tokenizer(String),
 }
 
 impl std::fmt::Display for CostsimError {
@@ -40,6 +42,7 @@ impl std::fmt::Display for CostsimError {
                     "unknown --scenario '{name}' (try: mixed, all-opus, all-haiku)"
                 )
             }
+            CostsimError::Tokenizer(msg) => write!(f, "tokenizer error: {msg}"),
         }
     }
 }
@@ -232,6 +235,10 @@ pub struct RunConfig {
     pub price_as: Vec<String>,
     /// Optional named `--scenario` (`mixed`, `all-opus`, `all-haiku`).
     pub scenario: Option<String>,
+    /// When true, re-tokenize each decision's recorded prompt/response with a
+    /// commercial tokenizer instead of trusting the backend's reported counts
+    /// (EPIC-44 Phase 3). Removes the local-tokenizer skew from notional dollars.
+    pub exact: bool,
 }
 
 /// Executes a full cost-analysis run and returns the rendered leaderboard.
@@ -251,7 +258,16 @@ pub fn run(config: &RunConfig) -> Result<String, CostsimError> {
         None => Pricing::default(),
     };
 
-    let usages = rollup(&collection);
+    // EPIC-44 Phase 3: `--exact` re-tokenizes recorded prompts/responses with a
+    // commercial (GPT-family) tokenizer to remove local-tokenizer skew. Claude's
+    // exact count would need the Anthropic count_tokens API (backlogged).
+    let usages = if config.exact {
+        let encoder =
+            tiktoken_rs::o200k_base().map_err(|e| CostsimError::Tokenizer(e.to_string()))?;
+        rollup_exact(&collection, &encoder)
+    } else {
+        rollup(&collection)
+    };
 
     // Distinct models present in the session, for scenario expansion.
     let models: Vec<String> = {
@@ -464,6 +480,7 @@ output = 5.00
             pricing: Some(pricing.clone()),
             price_as: vec![],
             scenario: None,
+            exact: false,
         })
         .expect("run succeeds");
         // 5000/1e6*5 + 46/1e6*25 = 0.025 + 0.00115 = 0.02615.
@@ -482,6 +499,7 @@ output = 5.00
             pricing: Some(pricing.clone()),
             price_as: vec![],
             scenario: Some("all-opus".to_string()),
+            exact: false,
         })
         .unwrap();
         let haiku = run(&RunConfig {
@@ -489,6 +507,7 @@ output = 5.00
             pricing: Some(pricing.clone()),
             price_as: vec![],
             scenario: Some("all-haiku".to_string()),
+            exact: false,
         })
         .unwrap();
         // all-opus: 0.026150; all-haiku: 5000/1e6*1 + 46/1e6*5 = 0.005230 (5x).
@@ -506,6 +525,7 @@ output = 5.00
             pricing: None,
             price_as: vec![],
             scenario: None,
+            exact: false,
         })
         .expect("run succeeds without pricing");
         assert!(out.contains("5000"), "tokens missing:\n{out}");

@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use pkcore::hand_history::{Action, HandCollection, HandHistory};
+use tiktoken_rs::CoreBPE;
 
 use crate::pricing::{Pricing, cost_usd, resolve_price};
 
@@ -77,6 +78,44 @@ pub struct SeatUsage {
 /// ```
 #[must_use]
 pub fn rollup(collection: &HandCollection) -> Vec<SeatUsage> {
+    rollup_inner(collection, None)
+}
+
+/// Like [`rollup`], but recomputes each decision's token counts by re-tokenizing
+/// the recorded prompt and response with `encoder` instead of trusting the
+/// backend's reported counts (EPIC-44 Phase 3, `--exact`).
+///
+/// Local Ollama reports tokens using its own tokenizer; pricing those at a
+/// commercial model's rates carries a tokenizer-skew bias. Re-tokenizing the
+/// recorded prompt (input) and `raw_response` (output) with the target model's
+/// tokenizer removes that bias. Actions lacking a recorded prompt fall back to
+/// the reported counts, so older recordings still contribute.
+///
+/// # Examples
+///
+/// ```
+/// use pkcore::hand_history::HandCollection;
+/// use pkdealer_costsim::report::rollup_exact;
+///
+/// let bpe = tiktoken_rs::o200k_base().expect("encoder");
+/// let collection = HandCollection::default();
+/// assert!(rollup_exact(&collection, &bpe).is_empty());
+/// ```
+#[must_use]
+pub fn rollup_exact(collection: &HandCollection, encoder: &CoreBPE) -> Vec<SeatUsage> {
+    rollup_inner(collection, Some(encoder))
+}
+
+/// Counts the tokens in `text` under `encoder`, saturating at `u64::MAX`.
+fn token_count(encoder: &CoreBPE, text: &str) -> u64 {
+    u64::try_from(encoder.encode_with_special_tokens(text).len()).unwrap_or(u64::MAX)
+}
+
+/// Shared body of [`rollup`] / [`rollup_exact`]. When `encoder` is `Some`, each
+/// action's tokens come from re-tokenizing its recorded prompt/response (falling
+/// back to the reported counts when the text is absent); when `None`, the
+/// reported counts are used directly.
+fn rollup_inner(collection: &HandCollection, encoder: Option<&CoreBPE>) -> Vec<SeatUsage> {
     // BTreeMap keeps the result deterministically ordered by seat.
     let mut by_seat: BTreeMap<u8, SeatUsage> = BTreeMap::new();
 
@@ -106,11 +145,21 @@ pub fn rollup(collection: &HandCollection) -> Vec<SeatUsage> {
                 input_tokens: 0,
                 output_tokens: 0,
             });
-            if let Some(input) = agent.input_tokens {
-                entry.input_tokens += u64::from(input);
+            // Exact mode re-tokenizes the recorded text; fall back to the
+            // reported count when the text (or the encoder) is absent.
+            let input = match (encoder, agent.prompt.as_deref()) {
+                (Some(enc), Some(prompt)) => Some(token_count(enc, prompt)),
+                _ => agent.input_tokens.map(u64::from),
+            };
+            let output = match (encoder, agent.raw_response.as_deref()) {
+                (Some(enc), Some(response)) => Some(token_count(enc, response)),
+                _ => agent.output_tokens.map(u64::from),
+            };
+            if let Some(input) = input {
+                entry.input_tokens += input;
             }
-            if let Some(output) = agent.output_tokens {
-                entry.output_tokens += u64::from(output);
+            if let Some(output) = output {
+                entry.output_tokens += output;
             }
             if entry.model.is_none()
                 && let Some(model) = agent.model.as_ref()
@@ -305,6 +354,43 @@ hands:
         assert_eq!(bot.model, None);
         assert_eq!(bot.input_tokens, 0);
         assert_eq!(bot.output_tokens, 0);
+    }
+
+    #[test]
+    fn rollup_exact_recounts_from_recorded_text() {
+        let prompt = "Hero holds AhKh on a Qd7s2c flop. Pot is 30, to call 10.";
+        let response = "raise to 20";
+        let yaml = format!(
+            r#"
+hands:
+  - hand: {{ id: "h1", game: holdem }}
+    table: {{ stakes: {{ small_blind: 1.0, big_blind: 2.0 }} }}
+    players:
+      - {{ seat: 1, name: "Opus", stack: 200.0 }}
+    streets:
+      preflop:
+        actions:
+          - {{ seat: 1, action: raise, amount: 6.0, agent: {{ model: "gpt-4.1", input_tokens: 9999, output_tokens: 9999, prompt: "{prompt}", raw_response: "{response}" }} }}
+"#
+        );
+        let collection = HandCollection::from_yaml(&yaml).expect("yaml parses");
+        let bpe = tiktoken_rs::o200k_base().expect("encoder");
+        let seats = rollup_exact(&collection, &bpe);
+
+        let want_in = u64::try_from(bpe.encode_with_special_tokens(prompt).len()).expect("fits");
+        let want_out = u64::try_from(bpe.encode_with_special_tokens(response).len()).expect("fits");
+        assert_eq!(seats[0].input_tokens, want_in);
+        assert_eq!(seats[0].output_tokens, want_out);
+        // The reported (Ollama-tokenizer) 9999 counts were replaced, not used.
+        assert_ne!(seats[0].input_tokens, 9999);
+    }
+
+    #[test]
+    fn rollup_exact_falls_back_to_reported_when_no_prompt() {
+        // The standard fixture has no `prompt`/`raw_response`, so exact mode must
+        // fall back to the reported counts — identical to plain rollup.
+        let bpe = tiktoken_rs::o200k_base().expect("encoder");
+        assert_eq!(rollup_exact(&fixture(), &bpe), rollup(&fixture()));
     }
 
     fn pricing() -> Pricing {

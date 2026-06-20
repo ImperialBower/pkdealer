@@ -525,6 +525,7 @@ fn fidelity_to_proto(fidelity: &AgentFidelity) -> Option<ProtoAgentFidelity> {
         input_tokens: fidelity.input_tokens,
         output_tokens: fidelity.output_tokens,
         model: fidelity.model.clone(),
+        prompt: fidelity.prompt.clone(),
     })
 }
 
@@ -665,6 +666,7 @@ mod tests {
             input_tokens: Some(100),
             output_tokens: Some(5),
             model: Some("m".to_string()),
+            prompt: Some("hero prompt".to_string()),
         };
         let Some(p) = fidelity_to_proto(&fidelity) else {
             panic!("expected a populated fidelity");
@@ -676,6 +678,7 @@ mod tests {
         assert_eq!(p.input_tokens, Some(100));
         assert_eq!(p.output_tokens, Some(5));
         assert_eq!(p.model.as_deref(), Some("m"));
+        assert_eq!(p.prompt.as_deref(), Some("hero prompt"));
     }
 
     #[test]

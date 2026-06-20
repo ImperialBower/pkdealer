@@ -81,6 +81,10 @@ pub struct AgentFidelity {
     pub output_tokens: Option<u32>,
     /// Model / agent identifier (e.g. `"claude-..."`, `"rules-v1"`).
     pub model: Option<String>,
+    /// The prompt text sent to the model (LLM agents), captured at decision time
+    /// so offline cost analysis can re-tokenize it against a target model's
+    /// tokenizer (EPIC-44 Phase 3). `None` for structured agents.
+    pub prompt: Option<String>,
 }
 
 /// Decision-making interface implemented by every agent type.

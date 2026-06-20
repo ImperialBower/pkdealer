@@ -35,6 +35,12 @@ struct Cli {
     /// Named pricing scenario: `mixed` (default), `all-opus`, or `all-haiku`.
     #[arg(long, value_name = "NAME")]
     scenario: Option<String>,
+
+    /// Re-tokenize each decision's recorded prompt/response with a commercial
+    /// (GPT-family) tokenizer instead of trusting the backend's reported counts,
+    /// removing local-tokenizer skew from notional dollars (EPIC-44 Phase 3).
+    #[arg(long)]
+    exact: bool,
 }
 
 fn main() -> ExitCode {
@@ -44,6 +50,7 @@ fn main() -> ExitCode {
         pricing: cli.pricing,
         price_as: cli.price_as,
         scenario: cli.scenario,
+        exact: cli.exact,
     };
     match run(&config) {
         Ok(table) => {
