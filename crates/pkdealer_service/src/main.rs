@@ -162,6 +162,15 @@ struct DealerConfig {
     /// Sourced from `PKDEALER_RECORD_MAX_HANDS`. Note: when combined with
     /// `record_dir`, the on-disk file reflects the capped in-memory window.
     record_max_hands: Option<usize>,
+    /// Notional per-model pricing table (EPIC-44 Phase 2). Loaded once at boot
+    /// from the `PKDEALER_PRICING` TOML path; a missing/unreadable/invalid file
+    /// falls back to an empty table (every cost becomes 0) so pricing config
+    /// never blocks startup.
+    pricing: pkdealer_pricing::Pricing,
+    /// Model→notional-model override map (EPIC-44 Phase 2), parsed from
+    /// `PKDEALER_PRICE_AS` (comma-separated `actual=notional` pairs). Lets a local
+    /// Ollama model id be priced as a commercial model. Empty when unset.
+    price_as: std::collections::HashMap<String, String>,
 }
 
 impl DealerConfig {
@@ -183,6 +192,8 @@ impl DealerConfig {
                 .filter(|s| !s.is_empty())
                 .map(std::path::PathBuf::from),
             record_max_hands: parse_record_max_hands(env::var("PKDEALER_RECORD_MAX_HANDS").ok()),
+            pricing: load_pricing_from_env(env::var("PKDEALER_PRICING").ok()),
+            price_as: parse_price_as(env::var("PKDEALER_PRICE_AS").ok()),
         }
     }
 }
@@ -198,8 +209,61 @@ impl Default for DealerConfig {
             round_reset_enabled: false,
             record_dir: None,
             record_max_hands: None,
+            pricing: pkdealer_pricing::Pricing::default(),
+            price_as: std::collections::HashMap::new(),
         }
     }
+}
+
+/// Loads the notional pricing table from the `PKDEALER_PRICING` path (EPIC-44
+/// Phase 2). An unset path, an unreadable file, or invalid pricing TOML each log
+/// a warning and yield an empty table, so cost config never blocks startup.
+///
+/// Split out from [`DealerConfig::from_env`] so it can be unit-tested.
+fn load_pricing_from_env(path: Option<String>) -> pkdealer_pricing::Pricing {
+    let Some(path) = path.filter(|s| !s.is_empty()) else {
+        return pkdealer_pricing::Pricing::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match pkdealer_pricing::Pricing::from_toml(&text) {
+            Ok(pricing) => pricing,
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "invalid PKDEALER_PRICING; using empty table");
+                pkdealer_pricing::Pricing::default()
+            }
+        },
+        Err(e) => {
+            tracing::warn!(path = %path, error = %e, "cannot read PKDEALER_PRICING; using empty table");
+            pkdealer_pricing::Pricing::default()
+        }
+    }
+}
+
+/// Parses `PKDEALER_PRICE_AS` (comma-separated `actual=notional` pairs) into a
+/// model override map (EPIC-44 Phase 2). Malformed entries (no `=`, empty key)
+/// are skipped with a logged warning; unset input yields an empty map.
+///
+/// Split out from [`DealerConfig::from_env`] so it can be unit-tested.
+fn parse_price_as(raw: Option<String>) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return map;
+    };
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        match pair.split_once('=') {
+            Some((actual, notional))
+                if !actual.trim().is_empty() && !notional.trim().is_empty() =>
+            {
+                map.insert(actual.trim().to_owned(), notional.trim().to_owned());
+            }
+            _ => tracing::warn!(entry = %pair, "ignoring malformed PKDEALER_PRICE_AS entry"),
+        }
+    }
+    map
 }
 
 /// Parses an env var as a boolean. Recognizes `"true"`, `"1"`, `"yes"` (case
@@ -249,6 +313,35 @@ enum CardVisibility {
 
 // ── TableState ───────────────────────────────────────────────────────────────
 
+/// Per-seat cumulative LLM token usage and the model that produced it.
+///
+/// EPIC-44 Phase 2: the live accumulator must retain each seat's `model` (not
+/// just its token counts) because notional cost is `price(model) × tokens`. A
+/// bot never produces one of these (its `AgentFidelity` carries no model/tokens).
+#[derive(Clone, Debug, Default)]
+struct SeatTokens {
+    /// Cumulative prompt tokens this session.
+    input: u64,
+    /// Cumulative completion tokens this session.
+    output: u64,
+    /// The model that produced the tokens, for pricing. Last-write-wins; a seat
+    /// runs one agent, so this is stable in practice.
+    model: Option<String>,
+}
+
+/// Borrowed pricing configuration threaded into [`DealerService::build_table_status`].
+///
+/// EPIC-44 Phase 2: `build_table_status` is a static associated fn and one of its
+/// call sites (`fresh_seat_at_inner`) is also static, so it cannot read
+/// `self.config`. Rather than convert the call chain to `&self`, the pricing table
+/// and override map are bundled into one borrowed parameter and threaded through —
+/// the same pattern Phase 1 used for `session_tokens`, kept to a single argument.
+#[derive(Clone, Copy)]
+struct PricingCtx<'a> {
+    pricing: &'a pkdealer_pricing::Pricing,
+    price_as: &'a std::collections::HashMap<String, String>,
+}
+
 /// Wraps [`PokerSession`] and the player auth token maps for use behind an `Arc<Mutex<_>>`.
 ///
 /// [`PokerSession`] wraps [`TableNoCell`], which has no `Cell`/`RefCell` interior
@@ -284,6 +377,12 @@ struct TableState {
     /// cumulative profit/loss zero-sum across cycles. A seat's entry is cleared
     /// when the seat is vacated so a later occupant starts clean.
     banked_profit: std::collections::HashMap<u8, i64>,
+    /// Per-seat cumulative LLM token usage plus the model that produced it.
+    /// Mirrors `banked_profit`; bots never create an entry. Surfaced on `SeatInfo`
+    /// (tokens, and — via the model — the notional cost). EPIC-44 Phase 2 extended
+    /// the value from a bare `(input, output)` tuple to `SeatTokens` so the model
+    /// is retained for pricing; cost is a pure function of `(model, in, out)`.
+    session_tokens: std::collections::HashMap<u8, SeatTokens>,
     /// Monotonically increasing count of completed rounds. Starts at 1 (the
     /// first round begins at 1 and increments to 2 after the first reset).
     /// Only advances when `round_reset_enabled` triggers a round reset.
@@ -336,6 +435,10 @@ struct Metrics {
     /// Per-seat cumulative profit/loss recorded after every completed hand.
     /// Labels: `seat`, `handle`.
     player_profit_loss: Gauge<i64>,
+    /// Per-seat cumulative prompt/completion tokens, recorded after each accepted
+    /// LLM action. Labels: `seat`.
+    player_tokens_in: Gauge<u64>,
+    player_tokens_out: Gauge<u64>,
 }
 
 impl Metrics {
@@ -368,6 +471,16 @@ impl Metrics {
                 .i64_gauge("pkdealer.player.profit_loss")
                 .with_description("Per-seat cumulative profit/loss in chips")
                 .with_unit("chips")
+                .build(),
+            player_tokens_in: meter
+                .u64_gauge("pkdealer.player.tokens_in")
+                .with_description("Per-seat cumulative prompt tokens this session")
+                .with_unit("tokens")
+                .build(),
+            player_tokens_out: meter
+                .u64_gauge("pkdealer.player.tokens_out")
+                .with_description("Per-seat cumulative completion tokens this session")
+                .with_unit("tokens")
                 .build(),
         }
     }
@@ -424,6 +537,7 @@ impl DealerService {
             last_prompt_at: None,
             hands_completed: 0,
             banked_profit: std::collections::HashMap::new(),
+            session_tokens: std::collections::HashMap::new(),
             round_number: 1,
             recorder: pkcore::hand_history::HandCollection::new(),
             hand_starting_stacks: Vec::new(),
@@ -453,6 +567,15 @@ impl DealerService {
             .map_err(|_| Status::internal("table state lock is poisoned"))
     }
 
+    /// Borrows the configured pricing table + override map as a [`PricingCtx`]
+    /// for [`Self::build_table_status`] (EPIC-44 Phase 2).
+    fn pricing_ctx(&self) -> PricingCtx<'_> {
+        PricingCtx {
+            pricing: &self.config.pricing,
+            price_as: &self.config.price_as,
+        }
+    }
+
     /// Builds a [`TableStatus`] snapshot from the current dealer state.
     ///
     /// The `visibility` parameter controls which hole cards are included:
@@ -462,6 +585,8 @@ impl DealerService {
     fn build_table_status(
         session: &PokerSession,
         banked: &std::collections::HashMap<u8, i64>,
+        session_tokens: &std::collections::HashMap<u8, SeatTokens>,
+        pricing: &PricingCtx<'_>,
         visibility: CardVisibility,
         round_number: u64,
     ) -> TableStatus {
@@ -490,6 +615,21 @@ impl DealerService {
                         banked.get(&i).copied().unwrap_or(0),
                     ),
                     bet: seat.player.bet as u32,
+                    input_tokens: session_tokens.get(&i).map_or(0, |t| t.input),
+                    output_tokens: session_tokens.get(&i).map_or(0, |t| t.output),
+                    // EPIC-44 Phase 2: notional cost = price(resolved model) × tokens,
+                    // via the same shared `pkdealer_pricing` path as the offline tool.
+                    // Unpriceable (no table, model absent, or bot) → 0.
+                    cost_micro_usd: session_tokens.get(&i).map_or(0, |t| {
+                        pkdealer_pricing::resolve_price(
+                            pricing.pricing,
+                            pricing.price_as,
+                            t.model.as_deref(),
+                        )
+                        .map_or(0, |price| {
+                            pkdealer_pricing::cost_micro_usd(price, t.input, t.output)
+                        })
+                    }),
                 });
             }
         }
@@ -559,6 +699,7 @@ impl DealerService {
     /// (when non-empty) the `client_secret → token` binding.
     fn fresh_seat_at_inner(
         state: &mut TableState,
+        pricing: &PricingCtx<'_>,
         requested_seat: u8,
         name: &str,
         chips: usize,
@@ -598,6 +739,8 @@ impl DealerService {
         let status = Self::build_table_status(
             &state.session,
             &state.banked_profit,
+            &state.session_tokens,
+            pricing,
             CardVisibility::Spectator,
             state.round_number,
         );
@@ -773,6 +916,8 @@ impl DealerService {
         let status = Self::build_table_status(
             &state.session,
             &state.banked_profit,
+            &state.session_tokens,
+            &self.pricing_ctx(),
             CardVisibility::Spectator,
             state.round_number,
         );
@@ -861,6 +1006,8 @@ impl DealerService {
         let status = Self::build_table_status(
             &state.session,
             &state.banked_profit,
+            &state.session_tokens,
+            &self.pricing_ctx(),
             CardVisibility::Spectator,
             state.round_number,
         );
@@ -975,6 +1122,7 @@ fn proto_agent_to_pkcore(
         input_tokens: p.input_tokens,
         output_tokens: p.output_tokens,
         model: p.model,
+        prompt: p.prompt,
     }
 }
 
@@ -1049,6 +1197,30 @@ fn compute_profit_loss(player: &PlayerNoCell, banked: i64) -> i32 {
         - i64::try_from(player.withdrawn).unwrap_or(i64::MAX)
         + banked;
     i32::try_from(pl).unwrap_or(if pl < 0 { i32::MIN } else { i32::MAX })
+}
+
+/// Adds one accepted action's LLM token counts (and model) to a seat's total.
+///
+/// Increments `acc[seat]` by `(input, output)` only when **both** counts are
+/// present; a missing count (bot action, or partial fidelity) is a no-op so bots
+/// never appear in the map. When the counts are recorded, `model` is stored on the
+/// entry (last-write-wins) so the seat's tokens can later be priced. Mirrors the
+/// `banked_profit` accumulator shape.
+fn accumulate_session_tokens(
+    acc: &mut std::collections::HashMap<u8, SeatTokens>,
+    seat: u8,
+    input: Option<u32>,
+    output: Option<u32>,
+    model: Option<&str>,
+) {
+    if let (Some(i), Some(o)) = (input, output) {
+        let entry = acc.entry(seat).or_default();
+        entry.input += u64::from(i);
+        entry.output += u64::from(o);
+        if let Some(m) = model {
+            entry.model = Some(m.to_owned());
+        }
+    }
 }
 
 /// Records the chips removed by [`cap_stacks_to`] into the per-seat `banked`
@@ -1178,6 +1350,8 @@ impl DealerServiceTrait for DealerService {
                         let status = Self::build_table_status(
                             &guard.session,
                             &guard.banked_profit,
+                            &guard.session_tokens,
+                            &self.pricing_ctx(),
                             CardVisibility::Spectator,
                             guard.round_number,
                         );
@@ -1267,8 +1441,10 @@ impl DealerServiceTrait for DealerService {
                     // Secret known but token no longer maps to a seat — stale entry.
                     // Drop it and fall through to fresh-seat allocation.
                     guard.secret_to_token.remove(&req.client_secret);
+                    let ctx = self.pricing_ctx();
                     Self::fresh_seat_at_inner(
                         &mut guard,
+                        &ctx,
                         requested_seat,
                         &req.name,
                         chips,
@@ -1276,8 +1452,10 @@ impl DealerServiceTrait for DealerService {
                     )
                 }
             } else {
+                let ctx = self.pricing_ctx();
                 Self::fresh_seat_at_inner(
                     &mut guard,
+                    &ctx,
                     requested_seat,
                     &req.name,
                     chips,
@@ -1335,6 +1513,7 @@ impl DealerServiceTrait for DealerService {
             // Drop any banked profit for this seat so a later occupant starts
             // with a clean cumulative profit/loss.
             guard.banked_profit.remove(&seat);
+            guard.session_tokens.remove(&seat);
             if let Some(uuid) = guard.seat_to_token.remove(&seat) {
                 guard.token_to_seat.remove(&uuid);
                 guard.secret_to_token.retain(|_, t| *t != uuid);
@@ -1343,6 +1522,8 @@ impl DealerServiceTrait for DealerService {
             let status = Self::build_table_status(
                 &guard.session,
                 &guard.banked_profit,
+                &guard.session_tokens,
+                &self.pricing_ctx(),
                 CardVisibility::Spectator,
                 guard.round_number,
             );
@@ -1459,6 +1640,8 @@ impl DealerServiceTrait for DealerService {
                     let event_status = Self::build_table_status(
                         &guard.session,
                         &guard.banked_profit,
+                        &guard.session_tokens,
+                        &self.pricing_ctx(),
                         CardVisibility::Spectator,
                         guard.round_number,
                     );
@@ -1673,6 +1856,20 @@ impl DealerServiceTrait for DealerService {
 
         match guard.session.apply_action(seat, player_action) {
             Ok(()) => {
+                // EPIC-44 Phase 1: accumulate per-seat token usage on the accepted
+                // path (read before agent_fidelity is moved into the buffer below).
+                accumulate_session_tokens(
+                    &mut guard.session_tokens,
+                    seat,
+                    agent_fidelity.input_tokens,
+                    agent_fidelity.output_tokens,
+                    agent_fidelity.model.as_deref(),
+                );
+                if let Some(tokens) = guard.session_tokens.get(&seat) {
+                    let attrs = [KeyValue::new("seat", i64::from(seat))];
+                    self.metrics.player_tokens_in.record(tokens.input, &attrs);
+                    self.metrics.player_tokens_out.record(tokens.output, &attrs);
+                }
                 // EPIC-25 Phase 4: the action is now part of the hand's voluntary
                 // sequence; buffer its agent-fidelity in arrival order so the
                 // hand-end hook can zip it onto the recorded HandHistory.
@@ -1693,6 +1890,8 @@ impl DealerServiceTrait for DealerService {
                 let status = Self::build_table_status(
                     &guard.session,
                     &guard.banked_profit,
+                    &guard.session_tokens,
+                    &self.pricing_ctx(),
                     CardVisibility::Spectator,
                     guard.round_number,
                 );
@@ -1746,6 +1945,8 @@ impl DealerServiceTrait for DealerService {
                             let status = Self::build_table_status(
                                 &guard.session,
                                 &guard.banked_profit,
+                                &guard.session_tokens,
+                                &self.pricing_ctx(),
                                 CardVisibility::Spectator,
                                 guard.round_number,
                             );
@@ -1900,6 +2101,17 @@ impl DealerServiceTrait for DealerService {
 
                                         guard.recorder.push(hh);
 
+                                        // EPIC-44 Phase 1: surface running token totals per seat for offline verification.
+                                        for (seat, tokens) in &guard.session_tokens {
+                                            tracing::debug!(
+                                                seat = *seat,
+                                                input_tokens = tokens.input,
+                                                output_tokens = tokens.output,
+                                                model = tokens.model.as_deref().unwrap_or(""),
+                                                "session token totals",
+                                            );
+                                        }
+
                                         // EPIC-25 Phase 2: flush the whole
                                         // collection to disk (best-effort — a
                                         // failure logs and never aborts the hand).
@@ -1932,6 +2144,8 @@ impl DealerServiceTrait for DealerService {
                                     let status = Self::build_table_status(
                                         &guard.session,
                                         &guard.banked_profit,
+                                        &guard.session_tokens,
+                                        &self.pricing_ctx(),
                                         CardVisibility::Spectator,
                                         guard.round_number,
                                     );
@@ -2075,6 +2289,8 @@ impl DealerServiceTrait for DealerService {
         let status = Self::build_table_status(
             &guard.session,
             &guard.banked_profit,
+            &guard.session_tokens,
+            &self.pricing_ctx(),
             visibility,
             guard.round_number,
         );
@@ -2376,6 +2592,8 @@ impl DealerServiceTrait for DealerService {
             let status = Self::build_table_status(
                 &guard.session,
                 &guard.banked_profit,
+                &guard.session_tokens,
+                &self.pricing_ctx(),
                 CardVisibility::Spectator,
                 guard.round_number,
             );
@@ -2599,6 +2817,7 @@ mod tests {
             input_tokens: Some(1200),
             output_tokens: Some(8),
             model: Some("claude-test".to_string()),
+            prompt: Some("Hero holds AhKh...".to_string()),
         };
         let pk = proto_agent_to_pkcore(proto);
         assert_eq!(pk.raw_response.as_deref(), Some("raise to 250"));
@@ -2611,6 +2830,7 @@ mod tests {
         assert_eq!(pk.input_tokens, Some(1200));
         assert_eq!(pk.output_tokens, Some(8));
         assert_eq!(pk.model.as_deref(), Some("claude-test"));
+        assert_eq!(pk.prompt.as_deref(), Some("Hero holds AhKh..."));
     }
 
     #[test]
@@ -2841,6 +3061,67 @@ mod tests {
             session.table.seats.get_seat(2).unwrap().player.chips,
             10_000
         );
+    }
+
+    #[test]
+    fn accumulate_session_tokens_sums_per_seat() {
+        let mut acc = std::collections::HashMap::new();
+        accumulate_session_tokens(&mut acc, 2, Some(1200), Some(8), Some("gemma"));
+        accumulate_session_tokens(&mut acc, 2, Some(300), Some(5), Some("gemma"));
+        let entry = acc.get(&2).expect("seat 2 present");
+        assert_eq!((entry.input, entry.output), (1500, 13));
+    }
+
+    #[test]
+    fn parse_price_as_reads_pairs() {
+        let map = parse_price_as(Some(
+            "gemma=claude-opus-4-8, llama=deepseek-v3.2".to_owned(),
+        ));
+        assert_eq!(
+            map.get("gemma").map(String::as_str),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(map.get("llama").map(String::as_str), Some("deepseek-v3.2"));
+    }
+
+    #[test]
+    fn parse_price_as_skips_malformed_and_empty() {
+        let map = parse_price_as(Some("gemma=opus,nonsense,=missingkey,trailing=".to_owned()));
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("gemma").map(String::as_str), Some("opus"));
+    }
+
+    #[test]
+    fn parse_price_as_none_is_empty() {
+        assert!(parse_price_as(None).is_empty());
+        assert!(parse_price_as(Some(String::new())).is_empty());
+    }
+
+    #[test]
+    fn accumulate_session_tokens_records_model() {
+        let mut acc = std::collections::HashMap::new();
+        accumulate_session_tokens(&mut acc, 2, Some(1200), Some(8), Some("gemma"));
+        assert_eq!(acc.get(&2).expect("seat 2").model.as_deref(), Some("gemma"));
+    }
+
+    #[test]
+    fn accumulate_session_tokens_ignores_missing_counts() {
+        let mut acc = std::collections::HashMap::new();
+        accumulate_session_tokens(&mut acc, 0, None, None, Some("gemma"));
+        accumulate_session_tokens(&mut acc, 0, Some(10), None, Some("gemma"));
+        accumulate_session_tokens(&mut acc, 0, None, Some(10), Some("gemma"));
+        assert!(!acc.contains_key(&0));
+    }
+
+    #[test]
+    fn accumulate_session_tokens_separate_seats() {
+        let mut acc = std::collections::HashMap::new();
+        accumulate_session_tokens(&mut acc, 0, Some(100), Some(2), None);
+        accumulate_session_tokens(&mut acc, 1, Some(200), Some(4), None);
+        let s0 = acc.get(&0).expect("seat 0");
+        let s1 = acc.get(&1).expect("seat 1");
+        assert_eq!((s0.input, s0.output), (100, 2));
+        assert_eq!((s1.input, s1.output), (200, 4));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

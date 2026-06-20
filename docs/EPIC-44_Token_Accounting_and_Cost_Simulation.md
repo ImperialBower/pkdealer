@@ -7,13 +7,15 @@
 | Token capture (`prompt_eval_count`/`eval_count` → `LlmResponse`) | ✅ Done (EPIC-40) |
 | `AgentFidelity` carries `input_tokens`/`output_tokens`/`model` | ✅ Done (EPIC-25 P4) |
 | Per-action persistence into `HandCollection` (`proto_agent_to_pkcore` → `write_collection_yaml`) | ✅ Done (EPIC-25) |
-| Post-hoc cost analysis pass over `HandCollection` | 📋 Planned — Phase 0 |
-| Per-seat live token accumulator on `SessionState` | 📋 Planned — Phase 1 |
-| `SeatInfo` token fields + `build_table_status` wiring | 📋 Planned — Phase 1 |
-| Live token column (pkspectator / pktui render) | 📋 Planned — Phase 1 |
-| `pricing.toml` + notional cost computation | 📋 Planned — Phase 2 |
-| Live cost column (notional USD) | 📋 Planned — Phase 2 |
-| Tokenizer-variance correction (reconstruct via `build_prompt`, re-tokenize) | 📋 Planned — Phase 3 |
+| Post-hoc cost analysis pass over `HandCollection` | ✅ Done — Phase 0 (`crates/pkdealer_costsim`) |
+| Per-seat live token accumulator on `TableState` (`session_tokens`) | ✅ Done — Phase 1 |
+| `SeatInfo` token fields (`input_tokens`/`output_tokens`) + `build_table_status` wiring | ✅ Done — Phase 1 |
+| OTel gauges (`pkdealer.player.tokens_in`/`tokens_out`) + hand-end token debug log | ✅ Done — Phase 1 |
+| Live token column (pkspectator / pktui render) | 📋 Planned — Phase 1 (external pktui repo) |
+| `pricing.toml` + notional cost computation (shared `pkdealer_pricing` crate) | ✅ Done — Phase 2 |
+| Live `cost_micro_usd` on `SeatInfo` + `PKDEALER_PRICING`/`PKDEALER_PRICE_AS` config | ✅ Done — Phase 2 |
+| Cost column render (notional USD) | 📋 Planned — Phase 2 (external pktui repo) |
+| Tokenizer-variance correction (capture-at-source prompt + `--exact` re-tokenize) | ✅ Done — Phase 3 (GPT/tiktoken; Claude `count_tokens` backlogged) |
 | Cached-input / batch / reasoning-token modeling | ⏸ Stretch — Phase 4 |
 
 > **The hard 80% already shipped.** EPIC-40 made the Ollama backend read
@@ -224,6 +226,47 @@ estimates.
 - **Reasoning-token multiplier.** Reasoning models bill hidden reasoning as
   output; local Ollama produces none, so this can't be derived from observed
   tokens — model it as an output multiplier per reasoning model.
+
+---
+
+## Backlog — more realistic pricing
+
+Captured 2026-06-19. Ordered roughly by value-for-effort. These extend the
+shipped Phases 0–2 toward dollar-accurate simulation of commercial LLMs.
+
+### B1. Real networked LLM backends (highest value, sidesteps Phase 3)
+`pkdealer_agent_claude` already calls the live Anthropic Messages API and records
+**exact** `usage.input_tokens`/`output_tokens` from the response into
+`LlmResponse` → `AgentFidelity` → the recording. A real networked seat therefore
+yields exact tokens and true cost through Phases 0–2 with **no tokenizer
+correction**. There is **no OpenAI/GPT or Gemini backend yet.**
+- **B1a.** `pkdealer_agent_openai` crate mirroring `pkdealer_agent_claude`
+  (reqwest → Chat Completions / Responses API; capture `usage` exactly). Needs
+  `OPENAI_API_KEY`.
+- **B1b.** `pkdealer_agent_gemini` (deferred previously for lack of a key).
+- **Why this beats Phase 3:** running the real model removes tokenizer skew
+  entirely instead of correcting for it.
+
+### B2. Phase 3 — tokenizer-variance correction ✅ DONE (capture-at-source)
+Shipped via **capture-at-source**: `pkcore 0.1.7` added `AgentFidelity.prompt`,
+the agent records the built prompt at decision time, it flows proto → recording,
+and `pkdealer_costsim --exact` re-tokenizes the recorded prompt/`raw_response`
+with `tiktoken` (`o200k_base`, GPT-family) to replace the local-tokenizer counts.
+The offline-reconstruction alternative was rejected (brittle). **Remaining:**
+- **Claude-exact** still needs the Anthropic `count_tokens` API (network +
+  `ANTHROPIC_API_KEY`); no exact offline Claude tokenizer exists. `--exact` today
+  uses the GPT tokenizer as the commercial proxy for all notional models.
+- Per-notional-model tokenizer selection (map notional model → encoding) instead
+  of a single `o200k_base` proxy.
+
+### B3. Phase 4 — pricing realism knobs (see Phase 4 section above)
+- Cached-input modeling (`cached_input` rates + per-model `cached_fraction`).
+- Batch discount (50%) for offline benchmark costing.
+- Reasoning-token output multiplier per reasoning model.
+
+### B4. Shared override parser (small DRY)
+`pkdealer_costsim::app::parse_price_as` (CLI) and the service's `parse_price_as`
+(env) both parse `a=b,c=d` into a map — lift one copy into `pkdealer_pricing`.
 
 ---
 

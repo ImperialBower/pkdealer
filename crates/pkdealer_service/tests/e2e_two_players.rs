@@ -445,6 +445,7 @@ async fn e2e_agent_fidelity_recorded_in_hand_history() -> Result<(), Box<dyn std
                 input_tokens: Some(1234),
                 output_tokens: Some(7),
                 model: Some("claude-e2e".to_string()),
+                prompt: Some("e2e prompt".to_string()),
             };
             actor
                 .act_with_agent(ActionType::Call, agent)

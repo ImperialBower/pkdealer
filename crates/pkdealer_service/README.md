@@ -63,6 +63,8 @@ Configuration options will be loaded from:
 - `PKDEALER_HANDS_PER_LEVEL` - Hands per blind level when the schedule is enabled (default: 20)
 - `PKDEALER_RECORD_DIR` - When set, every completed hand is recorded and the full session is rewritten to `<dir>/session-<unix_ts>.yaml` after each hand, ready for `audit` / `pkcore` replay. Recording is always on in memory regardless; this only adds disk durability (default: in-memory only)
 - `PKDEALER_RECORD_MAX_HANDS` - Caps the in-memory recorder, dropping the oldest hands once the buffer exceeds the limit. Combined with `PKDEALER_RECORD_DIR`, the on-disk file reflects the capped window, so leave this unset if you need the full session on disk (default: unbounded)
+- `PKDEALER_PRICING` - Path to a `pricing.toml` (per-million-token USD rates, keyed by model id) used to compute each seat's notional cost on `SeatInfo.cost_micro_usd` (EPIC-44 Phase 2). A missing/unreadable/invalid file logs a warning and prices everything at 0 — startup never fails on it (default: unset → no costs)
+- `PKDEALER_PRICE_AS` - Comma-separated `actual=notional` model overrides, e.g. `gemma=claude-opus-4-8,llama=deepseek-v3.2`, so local Ollama model ids can be priced as a commercial model. Malformed entries are skipped with a warning (default: unset → price at the recorded model)
 
 ### Session recording & export (EPIC-25)
 

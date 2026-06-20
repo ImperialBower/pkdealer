@@ -1,0 +1,25 @@
+[package]
+name = "pkdealer_costsim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Offline token-accounting and notional-cost analysis over recorded pkdealer arena sessions (EPIC-44 Phase 0)"
+keywords = ["poker", "llm", "tokens", "cost", "analysis"]
+categories = ["games", "command-line-utilities"]
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "pkdealer_costsim"
+path = "src/main.rs"
+
+[dependencies]
+pkcore = "0.1.7"
+pkdealer_pricing = { version = "0.1.16", path = "../pkdealer_pricing" }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+tiktoken-rs = "0.12"
