@@ -8,9 +8,10 @@
 | `AgentFidelity` carries `input_tokens`/`output_tokens`/`model` | ✅ Done (EPIC-25 P4) |
 | Per-action persistence into `HandCollection` (`proto_agent_to_pkcore` → `write_collection_yaml`) | ✅ Done (EPIC-25) |
 | Post-hoc cost analysis pass over `HandCollection` | ✅ Done — Phase 0 (`crates/pkdealer_costsim`) |
-| Per-seat live token accumulator on `SessionState` | 📋 Planned — Phase 1 |
-| `SeatInfo` token fields + `build_table_status` wiring | 📋 Planned — Phase 1 |
-| Live token column (pkspectator / pktui render) | 📋 Planned — Phase 1 |
+| Per-seat live token accumulator on `TableState` (`session_tokens`) | ✅ Done — Phase 1 |
+| `SeatInfo` token fields (`input_tokens`/`output_tokens`) + `build_table_status` wiring | ✅ Done — Phase 1 |
+| OTel gauges (`pkdealer.player.tokens_in`/`tokens_out`) + hand-end token debug log | ✅ Done — Phase 1 |
+| Live token column (pkspectator / pktui render) | 📋 Planned — Phase 1 (external pktui repo) |
 | `pricing.toml` + notional cost computation | 📋 Planned — Phase 2 |
 | Live cost column (notional USD) | 📋 Planned — Phase 2 |
 | Tokenizer-variance correction (reconstruct via `build_prompt`, re-tokenize) | 📋 Planned — Phase 3 |
