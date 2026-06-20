@@ -284,6 +284,9 @@ struct TableState {
     /// cumulative profit/loss zero-sum across cycles. A seat's entry is cleared
     /// when the seat is vacated so a later occupant starts clean.
     banked_profit: std::collections::HashMap<u8, i64>,
+    /// Per-seat cumulative LLM token usage (input, output) over the session.
+    /// Mirrors `banked_profit`; bots never increment it. Surfaced on `SeatInfo`.
+    session_tokens: std::collections::HashMap<u8, (u64, u64)>,
     /// Monotonically increasing count of completed rounds. Starts at 1 (the
     /// first round begins at 1 and increments to 2 after the first reset).
     /// Only advances when `round_reset_enabled` triggers a round reset.
@@ -336,6 +339,10 @@ struct Metrics {
     /// Per-seat cumulative profit/loss recorded after every completed hand.
     /// Labels: `seat`, `handle`.
     player_profit_loss: Gauge<i64>,
+    /// Per-seat cumulative prompt/completion tokens, recorded after each accepted
+    /// LLM action. Labels: `seat`.
+    player_tokens_in: Gauge<u64>,
+    player_tokens_out: Gauge<u64>,
 }
 
 impl Metrics {
@@ -368,6 +375,16 @@ impl Metrics {
                 .i64_gauge("pkdealer.player.profit_loss")
                 .with_description("Per-seat cumulative profit/loss in chips")
                 .with_unit("chips")
+                .build(),
+            player_tokens_in: meter
+                .u64_gauge("pkdealer.player.tokens_in")
+                .with_description("Per-seat cumulative prompt tokens this session")
+                .with_unit("tokens")
+                .build(),
+            player_tokens_out: meter
+                .u64_gauge("pkdealer.player.tokens_out")
+                .with_description("Per-seat cumulative completion tokens this session")
+                .with_unit("tokens")
                 .build(),
         }
     }
@@ -424,6 +441,7 @@ impl DealerService {
             last_prompt_at: None,
             hands_completed: 0,
             banked_profit: std::collections::HashMap::new(),
+            session_tokens: std::collections::HashMap::new(),
             round_number: 1,
             recorder: pkcore::hand_history::HandCollection::new(),
             hand_starting_stacks: Vec::new(),
@@ -462,6 +480,7 @@ impl DealerService {
     fn build_table_status(
         session: &PokerSession,
         banked: &std::collections::HashMap<u8, i64>,
+        session_tokens: &std::collections::HashMap<u8, (u64, u64)>,
         visibility: CardVisibility,
         round_number: u64,
     ) -> TableStatus {
@@ -490,6 +509,8 @@ impl DealerService {
                         banked.get(&i).copied().unwrap_or(0),
                     ),
                     bet: seat.player.bet as u32,
+                    input_tokens: session_tokens.get(&i).map_or(0, |t| t.0),
+                    output_tokens: session_tokens.get(&i).map_or(0, |t| t.1),
                 });
             }
         }
@@ -598,6 +619,7 @@ impl DealerService {
         let status = Self::build_table_status(
             &state.session,
             &state.banked_profit,
+            &state.session_tokens,
             CardVisibility::Spectator,
             state.round_number,
         );
@@ -773,6 +795,7 @@ impl DealerService {
         let status = Self::build_table_status(
             &state.session,
             &state.banked_profit,
+            &state.session_tokens,
             CardVisibility::Spectator,
             state.round_number,
         );
@@ -861,6 +884,7 @@ impl DealerService {
         let status = Self::build_table_status(
             &state.session,
             &state.banked_profit,
+            &state.session_tokens,
             CardVisibility::Spectator,
             state.round_number,
         );
@@ -1051,6 +1075,24 @@ fn compute_profit_loss(player: &PlayerNoCell, banked: i64) -> i32 {
     i32::try_from(pl).unwrap_or(if pl < 0 { i32::MIN } else { i32::MAX })
 }
 
+/// Adds one accepted action's LLM token counts to a seat's running total.
+///
+/// Increments `acc[seat]` by `(input, output)` only when **both** counts are
+/// present; a missing count (bot action, or partial fidelity) is a no-op so bots
+/// never appear in the map. Mirrors the `banked_profit` accumulator shape.
+fn accumulate_session_tokens(
+    acc: &mut std::collections::HashMap<u8, (u64, u64)>,
+    seat: u8,
+    input: Option<u32>,
+    output: Option<u32>,
+) {
+    if let (Some(i), Some(o)) = (input, output) {
+        let entry = acc.entry(seat).or_default();
+        entry.0 += u64::from(i);
+        entry.1 += u64::from(o);
+    }
+}
+
 /// Records the chips removed by [`cap_stacks_to`] into the per-seat `banked`
 /// ledger so [`compute_profit_loss`] can credit them back, keeping cumulative
 /// profit/loss intact across blind-cycle resets.
@@ -1178,6 +1220,7 @@ impl DealerServiceTrait for DealerService {
                         let status = Self::build_table_status(
                             &guard.session,
                             &guard.banked_profit,
+                            &guard.session_tokens,
                             CardVisibility::Spectator,
                             guard.round_number,
                         );
@@ -1335,6 +1378,7 @@ impl DealerServiceTrait for DealerService {
             // Drop any banked profit for this seat so a later occupant starts
             // with a clean cumulative profit/loss.
             guard.banked_profit.remove(&seat);
+            guard.session_tokens.remove(&seat);
             if let Some(uuid) = guard.seat_to_token.remove(&seat) {
                 guard.token_to_seat.remove(&uuid);
                 guard.secret_to_token.retain(|_, t| *t != uuid);
@@ -1343,6 +1387,7 @@ impl DealerServiceTrait for DealerService {
             let status = Self::build_table_status(
                 &guard.session,
                 &guard.banked_profit,
+                &guard.session_tokens,
                 CardVisibility::Spectator,
                 guard.round_number,
             );
@@ -1459,6 +1504,7 @@ impl DealerServiceTrait for DealerService {
                     let event_status = Self::build_table_status(
                         &guard.session,
                         &guard.banked_profit,
+                        &guard.session_tokens,
                         CardVisibility::Spectator,
                         guard.round_number,
                     );
@@ -1673,6 +1719,19 @@ impl DealerServiceTrait for DealerService {
 
         match guard.session.apply_action(seat, player_action) {
             Ok(()) => {
+                // EPIC-44 Phase 1: accumulate per-seat token usage on the accepted
+                // path (read before agent_fidelity is moved into the buffer below).
+                accumulate_session_tokens(
+                    &mut guard.session_tokens,
+                    seat,
+                    agent_fidelity.input_tokens,
+                    agent_fidelity.output_tokens,
+                );
+                if let Some(&(in_tok, out_tok)) = guard.session_tokens.get(&seat) {
+                    let attrs = [KeyValue::new("seat", i64::from(seat))];
+                    self.metrics.player_tokens_in.record(in_tok, &attrs);
+                    self.metrics.player_tokens_out.record(out_tok, &attrs);
+                }
                 // EPIC-25 Phase 4: the action is now part of the hand's voluntary
                 // sequence; buffer its agent-fidelity in arrival order so the
                 // hand-end hook can zip it onto the recorded HandHistory.
@@ -1693,6 +1752,7 @@ impl DealerServiceTrait for DealerService {
                 let status = Self::build_table_status(
                     &guard.session,
                     &guard.banked_profit,
+                    &guard.session_tokens,
                     CardVisibility::Spectator,
                     guard.round_number,
                 );
@@ -1746,6 +1806,7 @@ impl DealerServiceTrait for DealerService {
                             let status = Self::build_table_status(
                                 &guard.session,
                                 &guard.banked_profit,
+                                &guard.session_tokens,
                                 CardVisibility::Spectator,
                                 guard.round_number,
                             );
@@ -1900,6 +1961,16 @@ impl DealerServiceTrait for DealerService {
 
                                         guard.recorder.push(hh);
 
+                                        // EPIC-44 Phase 1: surface running token totals per seat for offline verification.
+                                        for (seat, (in_tok, out_tok)) in &guard.session_tokens {
+                                            tracing::debug!(
+                                                seat = *seat,
+                                                input_tokens = *in_tok,
+                                                output_tokens = *out_tok,
+                                                "session token totals",
+                                            );
+                                        }
+
                                         // EPIC-25 Phase 2: flush the whole
                                         // collection to disk (best-effort — a
                                         // failure logs and never aborts the hand).
@@ -1932,6 +2003,7 @@ impl DealerServiceTrait for DealerService {
                                     let status = Self::build_table_status(
                                         &guard.session,
                                         &guard.banked_profit,
+                                        &guard.session_tokens,
                                         CardVisibility::Spectator,
                                         guard.round_number,
                                     );
@@ -2075,6 +2147,7 @@ impl DealerServiceTrait for DealerService {
         let status = Self::build_table_status(
             &guard.session,
             &guard.banked_profit,
+            &guard.session_tokens,
             visibility,
             guard.round_number,
         );
@@ -2376,6 +2449,7 @@ impl DealerServiceTrait for DealerService {
             let status = Self::build_table_status(
                 &guard.session,
                 &guard.banked_profit,
+                &guard.session_tokens,
                 CardVisibility::Spectator,
                 guard.round_number,
             );
@@ -2841,6 +2915,32 @@ mod tests {
             session.table.seats.get_seat(2).unwrap().player.chips,
             10_000
         );
+    }
+
+    #[test]
+    fn accumulate_session_tokens_sums_per_seat() {
+        let mut acc = std::collections::HashMap::new();
+        accumulate_session_tokens(&mut acc, 2, Some(1200), Some(8));
+        accumulate_session_tokens(&mut acc, 2, Some(300), Some(5));
+        assert_eq!(acc.get(&2).copied(), Some((1500, 13)));
+    }
+
+    #[test]
+    fn accumulate_session_tokens_ignores_missing_counts() {
+        let mut acc = std::collections::HashMap::new();
+        accumulate_session_tokens(&mut acc, 0, None, None);
+        accumulate_session_tokens(&mut acc, 0, Some(10), None);
+        accumulate_session_tokens(&mut acc, 0, None, Some(10));
+        assert!(!acc.contains_key(&0));
+    }
+
+    #[test]
+    fn accumulate_session_tokens_separate_seats() {
+        let mut acc = std::collections::HashMap::new();
+        accumulate_session_tokens(&mut acc, 0, Some(100), Some(2));
+        accumulate_session_tokens(&mut acc, 1, Some(200), Some(4));
+        assert_eq!(acc.get(&0).copied(), Some((100, 2)));
+        assert_eq!(acc.get(&1).copied(), Some((200, 4)));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
