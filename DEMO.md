@@ -83,6 +83,47 @@ the override without starting anything. Notes:
 - **`gwen`** (Gemini) is **not yet available** — its agent crate is EPIC-42
   Phase 3, deferred. Selecting it is rejected with a clear message.
 
+## Token & cost simulation + PokerBench models (EPIC-44 / EPIC-43)
+
+LLM seats record their token usage per decision; the service prices it against
+`pricing.toml` and surfaces per-seat `input_tokens` / `output_tokens` /
+`cost_micro_usd` on `SeatInfo`. The pricing is wired into the demo service in
+`docker-compose.yml` (`PKDEALER_PRICING` + `PKDEALER_PRICE_AS`), so any arena run
+with an LLM seat shows live **Tokens** and **Cost$** columns in pktui:
+
+```bash
+# bring up a table with an LLM seat (cost shows for LLM seats; bots stay blank):
+./bin/arena gto lag gemma
+# watch it live — Tokens + Cost$ columns update each decision:
+cd ../pktui && cargo run -- spectate --endpoint http://127.0.0.1:50051
+```
+
+Local Ollama model ids are priced *as* a commercial model via `PKDEALER_PRICE_AS`
+(default maps `gemma2→claude-opus-4-8`, `llama3.1→gpt-4.1`, `mistral→claude-haiku-4-5`).
+Override per run, e.g. `PKDEALER_PRICE_AS="gemma2=gpt-4.1-nano" ./bin/arena gto gemma`.
+
+**PokerBench-guided models.** `make pokerbench-models` bakes sampled
+solver-optimal PokerBench decisions into each base model's system prompt and
+runs `ollama create`, producing `pkpoker-gemma` / `pkpoker-llama` /
+`pkpoker-mistral` (seated as `pkgemma` / `pkllama` / `pkmistral`). It runs
+entirely on local Ollama — no GPU, no cloud — and auto-downloads the dataset:
+
+```bash
+ollama serve && ollama pull gemma2 llama3.1 mistral   # one-time prereqs
+make pokerbench-models                                 # downloads data + creates models
+./bin/arena pkgemma gto lag                            # seat the guided model
+```
+
+The few-shot system prompt adds ~1.5–2k input tokens per decision, so the
+`pkpoker-*` seats show visibly higher Tokens/Cost than the bare `gemma` seat —
+the price of in-context knowledge, shown live. Tune the example count with
+`POKERBENCH_EXAMPLES=N`; inspect Modelfiles without creating via
+`make pokerbench-models ARGS="--dry-run"`.
+
+> Note: this is in-context guidance, not weight-level fine-tuning (a 16GB Mac
+> can't train 8–9B models). Real fine-tuning would run on HuggingFace Jobs
+> (cloud, paid); `make pokerbench-data` already produces the train sets it needs.
+
 ## What to show
 
 Arrange three browser tabs side-by-side:

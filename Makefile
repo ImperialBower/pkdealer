@@ -273,10 +273,11 @@ pokerbench-data:
 
 # Build PokerBench-guided Ollama models (pkpoker-gemma / pkpoker-llama /
 # pkpoker-mistral) by baking sampled solver-optimal decisions into each base
-# model's system prompt. Requires `make pokerbench-data` and a running ollama
-# with the base models pulled (gemma2, llama3.1, mistral). 16GB-Mac friendly:
-# no weight training, runs entirely on local ollama. Override example count with
-# POKERBENCH_EXAMPLES; use ARGS="--dry-run" to inspect Modelfiles without creating.
-pokerbench-models:
+# model's system prompt. Depends on `pokerbench-data` (idempotent — skips files
+# already downloaded), and needs a running ollama with the base models pulled
+# (gemma2, llama3.1, mistral). 16GB-Mac friendly: no weight training, runs
+# entirely on local ollama. Override example count with POKERBENCH_EXAMPLES; use
+# ARGS="--dry-run" to inspect Modelfiles without creating.
+pokerbench-models: pokerbench-data
 	uv run scripts/pokerbench_models.py --examples $(POKERBENCH_EXAMPLES) $(ARGS)
 
