@@ -1,9 +1,15 @@
-//! Notional per-model pricing and cost computation.
+//! Notional per-model token pricing and cost computation.
 //!
 //! Local Ollama inference has no dollar cost, so "spend" in pkdealer is a token
-//! *count*. This module turns a recorded token count into a *notional* USD
+//! *count*. This crate turns a recorded token count into a *notional* USD
 //! figure — what the same play would have cost on a commercial API — by joining
 //! a model id against a [`Pricing`] table of per-million-token rates.
+//!
+//! It is a small, dependency-light leaf (only `serde` + `toml`) so it can be
+//! shared by both the offline analysis tool (`pkdealer_costsim`) and the live
+//! `pkdealer_service` without dragging CLI/analysis dependencies into the
+//! service. Cost is a pure function of `(model, input_tokens, output_tokens)`,
+//! so the same figures can be computed live or post-hoc and agree exactly.
 
 use std::collections::HashMap;
 
@@ -17,7 +23,7 @@ use serde::Deserialize;
 /// # Examples
 ///
 /// ```
-/// use pkdealer_costsim::pricing::Price;
+/// use pkdealer_pricing::Price;
 ///
 /// let opus = Price { input: 5.00, output: 25.00 };
 /// assert_eq!(opus.input, 5.00);
@@ -39,7 +45,7 @@ pub struct Price {
 /// # Examples
 ///
 /// ```
-/// use pkdealer_costsim::pricing::{cost_usd, Price};
+/// use pkdealer_pricing::{cost_usd, Price};
 ///
 /// // 1M input + 1M output at $5 / $25 per million.
 /// let price = Price { input: 5.00, output: 25.00 };
@@ -53,7 +59,7 @@ pub fn cost_usd(price: &Price, input_tokens: u64, output_tokens: u64) -> f64 {
 
 /// A notional pricing table keyed by model id.
 ///
-/// The id space matches `arena.toml` / [`pkcore::hand_history::AgentFidelity`]
+/// The id space matches `arena.toml` / `pkcore::hand_history::AgentFidelity`
 /// `model`, so a model recorded in a session can be looked up directly.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Pricing {
@@ -73,7 +79,7 @@ impl Pricing {
     /// # Examples
     ///
     /// ```
-    /// use pkdealer_costsim::pricing::Pricing;
+    /// use pkdealer_pricing::Pricing;
     ///
     /// let toml = r#"
     /// [models."claude-haiku-4-5"]
@@ -92,7 +98,7 @@ impl Pricing {
     /// # Examples
     ///
     /// ```
-    /// use pkdealer_costsim::pricing::Pricing;
+    /// use pkdealer_pricing::Pricing;
     ///
     /// let pricing = Pricing::default();
     /// assert!(pricing.price("missing-model").is_none());

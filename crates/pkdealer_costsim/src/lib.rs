@@ -13,5 +13,8 @@
 //! under several pricing scenarios without replaying a hand.
 
 pub mod app;
-pub mod pricing;
+/// Notional pricing and cost computation, re-exported from the shared
+/// [`pkdealer_pricing`] crate so existing `pkdealer_costsim::pricing::…` paths
+/// keep working after the extraction (EPIC-44).
+pub use pkdealer_pricing as pricing;
 pub mod report;

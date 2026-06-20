@@ -1,0 +1,18 @@
+[package]
+name = "pkdealer_pricing"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Notional per-model token pricing and cost computation, shared by the pkdealer service and offline cost analysis (EPIC-44)"
+keywords = ["poker", "llm", "tokens", "cost", "pricing"]
+categories = ["games"]
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
