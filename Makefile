@@ -14,7 +14,11 @@ PLAYERS ?= gto lag tag llama mistral gemma
 # if you launched with a custom COMPOSE_PROJECT_NAME.
 PROJECT ?= pkdealer
 
-.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve ddown arena-down demo demo-audit arena
+# Few-shot examples baked into each PokerBench-guided Ollama model.
+# Example: make pokerbench-models POKERBENCH_EXAMPLES=20
+POKERBENCH_EXAMPLES ?= 12
+
+.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve ddown arena-down demo demo-audit arena pokerbench-data pokerbench-models
 
 # Default target
 default: ayce
@@ -56,6 +60,11 @@ help:
 	@echo ""
 	@echo "Tools:"
 	@echo "  make install-tools  - Install cargo-deny, cargo-udeps, etc."
+	@echo ""
+	@echo "PokerBench (EPIC-43):"
+	@echo "  make pokerbench-data   - Download the PokerBench dataset (HuggingFace, ~720MB)"
+	@echo "  make pokerbench-models - Build pkpoker-{gemma,llama,mistral} Ollama models"
+	@echo "                           with PokerBench few-shot guidance (needs ollama + data)"
 	@echo ""
 
 # Run the 9-player client demo (requires the service to already be running)
@@ -235,4 +244,39 @@ watch:
 # Install cargo-watch
 install-watch:
 	cargo install cargo-watch
+
+# Download the PokerBench dataset (EPIC-43) from HuggingFace into
+# data/pokerbench (~720MB). Idempotent: existing files are skipped. Override the
+# destination with POKERBENCH_DATA_DIR. Mirrors pkcore's `make pokerbench-data`.
+pokerbench-data:
+	@dir="$${POKERBENCH_DATA_DIR:-data/pokerbench}"; \
+	base="https://huggingface.co/datasets/RZ412/PokerBench/resolve/main"; \
+	mkdir -p "$$dir"; \
+	for f in \
+		preflop_1k_test_set_game_scenario_information.csv \
+		preflop_1k_test_set_prompt_and_label.json \
+		preflop_60k_train_set_game_scenario_information.csv \
+		preflop_60k_train_set_prompt_and_label.json \
+		postflop_10k_test_set_game_scenario_information.csv \
+		postflop_10k_test_set_prompt_and_label.json \
+		postflop_500k_train_set_game_scenario_information.csv \
+		postflop_500k_train_set_prompt_and_label.json ; do \
+		if [ -f "$$dir/$$f" ]; then \
+			echo "exists, skipping: $$f"; \
+		else \
+			echo "downloading:    $$f"; \
+			curl -fL --progress-bar -o "$$dir/$$f" "$$base/$$f" \
+				|| { echo "FAILED: $$f"; rm -f "$$dir/$$f"; exit 1; }; \
+		fi; \
+	done; \
+	echo "PokerBench dataset ready in $$dir"
+
+# Build PokerBench-guided Ollama models (pkpoker-gemma / pkpoker-llama /
+# pkpoker-mistral) by baking sampled solver-optimal decisions into each base
+# model's system prompt. Requires `make pokerbench-data` and a running ollama
+# with the base models pulled (gemma2, llama3.1, mistral). 16GB-Mac friendly:
+# no weight training, runs entirely on local ollama. Override example count with
+# POKERBENCH_EXAMPLES; use ARGS="--dry-run" to inspect Modelfiles without creating.
+pokerbench-models:
+	uv run scripts/pokerbench_models.py --examples $(POKERBENCH_EXAMPLES) $(ARGS)
 

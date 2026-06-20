@@ -11,3 +11,9 @@ Cargo.lock
 /generated/
 
 /.superpowers/
+
+# PokerBench dataset downloaded by `make pokerbench-data` (~720MB, EPIC-43)
+/data/pokerbench/
+
+# Generated Modelfiles from `make pokerbench-models`
+/build/pokerbench-models/

@@ -78,3 +78,19 @@ model = "claude-sonnet-4-6"
 [players.gwen]
 type  = "gemini"
 model = "gemini-2.0-flash"
+
+# PokerBench-guided variants (EPIC-43/44). Built by `make pokerbench-models`,
+# which bakes sampled solver-optimal decisions into each base model's system
+# prompt via `ollama create`. Seat them like any ollama player, e.g.
+#   ./bin/arena pkgemma gto lag
+[players.pkgemma]
+type  = "ollama"
+model = "pkpoker-gemma"
+
+[players.pkllama]
+type  = "ollama"
+model = "pkpoker-llama"
+
+[players.pkmistral]
+type  = "ollama"
+model = "pkpoker-mistral"
