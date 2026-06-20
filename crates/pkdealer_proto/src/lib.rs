@@ -58,4 +58,25 @@ mod tests {
         let request = new_ping_request("");
         assert!(request.client_id.is_empty());
     }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn seat_info_round_trips_token_fields() {
+        use crate::dealer::SeatInfo;
+        use prost::Message;
+
+        let seat = SeatInfo {
+            seat_number: 2,
+            player_name: "gto".to_owned(),
+            input_tokens: 1200,
+            output_tokens: 8,
+            ..Default::default()
+        };
+
+        let bytes = seat.encode_to_vec();
+        let decoded = SeatInfo::decode(bytes.as_slice()).expect("decode SeatInfo");
+
+        assert_eq!(decoded.input_tokens, 1200);
+        assert_eq!(decoded.output_tokens, 8);
+    }
 }

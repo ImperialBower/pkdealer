@@ -277,6 +277,10 @@ message SeatInfo {
   // Chips wagered on the current betting round only; reset to 0 when the street
   // advances. Use this (not chips_in_play) for a per-street "bet" display.
   uint32      bet           = 9;
+  // Cumulative prompt tokens this session (LLM seats; 0 for bots).
+  uint64 input_tokens  = 10;
+  // Cumulative completion tokens this session (LLM seats; 0 for bots).
+  uint64 output_tokens = 11;
 }
 
 message GetNextToActRequest {}
