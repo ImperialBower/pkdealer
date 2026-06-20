@@ -79,4 +79,22 @@ mod tests {
         assert_eq!(decoded.input_tokens, 1200);
         assert_eq!(decoded.output_tokens, 8);
     }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn seat_info_round_trips_cost_micro_usd() {
+        use crate::dealer::SeatInfo;
+        use prost::Message;
+
+        let seat = SeatInfo {
+            seat_number: 3,
+            cost_micro_usd: 1_800_000,
+            ..Default::default()
+        };
+
+        let bytes = seat.encode_to_vec();
+        let decoded = SeatInfo::decode(bytes.as_slice()).expect("decode SeatInfo");
+
+        assert_eq!(decoded.cost_micro_usd, 1_800_000);
+    }
 }

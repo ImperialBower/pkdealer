@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use pkcore::hand_history::{Action, HandCollection, HandHistory};
 
-use crate::pricing::{Pricing, cost_usd};
+use crate::pricing::{Pricing, cost_usd, resolve_price};
 
 /// Cumulative LLM token usage for one seat across an entire session.
 ///
@@ -201,18 +201,18 @@ pub fn cost_seats(
         .iter()
         .map(|usage| {
             // Resolve the notional model: the recorded model, remapped through
-            // any --price-as override. A bot (no model) stays `None`.
+            // any --price-as override. A bot (no model) stays `None`. This string
+            // is for display; the cost itself goes through the shared
+            // `resolve_price` path (EPIC-44 Phase 2) so live and post-hoc agree.
             let notional_model = usage.model.as_ref().map(|actual| {
                 overrides
                     .get(actual)
                     .cloned()
                     .unwrap_or_else(|| actual.clone())
             });
-            // Cost only when the notional model has a price; otherwise `None`
+            // Cost only when the resolved model has a price; otherwise `None`
             // (tokens are still preserved in `usage`).
-            let cost_usd = notional_model
-                .as_deref()
-                .and_then(|model| pricing.price(model))
+            let cost_usd = resolve_price(pricing, overrides, usage.model.as_deref())
                 .map(|price| cost_usd(price, usage.input_tokens, usage.output_tokens));
             SeatCost {
                 usage: usage.clone(),

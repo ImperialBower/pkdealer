@@ -12,8 +12,9 @@
 | `SeatInfo` token fields (`input_tokens`/`output_tokens`) + `build_table_status` wiring | ✅ Done — Phase 1 |
 | OTel gauges (`pkdealer.player.tokens_in`/`tokens_out`) + hand-end token debug log | ✅ Done — Phase 1 |
 | Live token column (pkspectator / pktui render) | 📋 Planned — Phase 1 (external pktui repo) |
-| `pricing.toml` + notional cost computation | 📋 Planned — Phase 2 |
-| Live cost column (notional USD) | 📋 Planned — Phase 2 |
+| `pricing.toml` + notional cost computation (shared `pkdealer_pricing` crate) | ✅ Done — Phase 2 |
+| Live `cost_micro_usd` on `SeatInfo` + `PKDEALER_PRICING`/`PKDEALER_PRICE_AS` config | ✅ Done — Phase 2 |
+| Cost column render (notional USD) | 📋 Planned — Phase 2 (external pktui repo) |
 | Tokenizer-variance correction (reconstruct via `build_prompt`, re-tokenize) | 📋 Planned — Phase 3 |
 | Cached-input / batch / reasoning-token modeling | ⏸ Stretch — Phase 4 |
 
