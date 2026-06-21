@@ -26,6 +26,11 @@
 - **B3** — Phase 4 pricing realism: cached-input modeling, batch (50%) discount, reasoning-token multiplier.
 - **B4** — DRY the duplicated `parse_price_as` into `pkdealer_pricing` (see tech debt).
 
+### EPIC-45 — 6-Max NLHE Bot-Evaluation Format · **Not started** (headless, in-process)
+`docs/EPIC-45_Bot_Evaluation_Format.md`
+- Headless `pkdealer_arena` crate + `bin/arena_eval`: mirror (duplicate) poker, position-equalized, cash + tournament modes; leaderboard+CI, behavioral profile, H2H matrix, corpus export; LLM cost budget.
+- Phase 0 shares the `pkcore` `set_next_deck` deck-replay primitive with EPIC-41.
+
 ### External render (separate repos)
 - EPIC-44 token + cost columns: the data (`SeatInfo.input_tokens/output_tokens/cost_micro_usd`) ships from this repo; the **rendered columns live in `pkspectator` / pktui** (external).
 
