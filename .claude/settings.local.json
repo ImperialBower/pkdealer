@@ -32,7 +32,13 @@
       "Bash(sed -n '/pub struct Streets {/,/^}/p' src/hand_history.rs)",
       "Bash(sed -n '/pub struct Street {/,/^}/p' src/hand_history.rs)",
       "Bash(mkdir -p .claude)",
-      "Bash(touch .claude/dog-mode)"
+      "Bash(touch .claude/dog-mode)",
+      "Bash(git -C /Users/christoph/src/github.com/ImperialBower/pkcore rev-parse --abbrev-ref HEAD)",
+      "Bash(git -C /Users/christoph/src/github.com/ImperialBower/pkcore status --short)",
+      "Bash(git -C /Users/christoph/src/github.com/ImperialBower/pktui rev-parse --abbrev-ref HEAD)",
+      "Bash(git -C /Users/christoph/src/github.com/ImperialBower/pktui status --short)",
+      "Read(//Users/christoph/.claude/plugins/cache/claude-plugins-official/superpowers/6.0.3/skills/subagent-driven-development/scripts/**)",
+      "Bash(bash /Users/christoph/.claude/plugins/cache/claude-plugins-official/superpowers/6.0.3/skills/subagent-driven-development/scripts/task-brief /Users/christoph/src/github.com/ImperialBower/pktui/docs/superpowers/plans/2026-06-20-street-odds-display.md 1)"
     ]
   }
 }

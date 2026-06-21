@@ -42,3 +42,12 @@ output = 12.00
 [models."deepseek-v3.2"]
 input = 0.14
 output = 0.28
+
+# Synthetic ultra-premium tier — not a real provider. Use via PKDEALER_PRICE_AS
+# to overlay a deliberately expensive cost on a local model, e.g.:
+#   PKDEALER_PRICE_AS=pkpoker-qwen=premium-sim
+# Rates are intentionally higher than any shipping model to make notional cost
+# vivid in demos.
+[models."premium-sim"]
+input = 15.00
+output = 75.00

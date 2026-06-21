@@ -33,7 +33,7 @@ services:
       # commercial model via PKDEALER_PRICE_AS, so the spectator's Cost$ column
       # lights up for LLM seats. Override the map from the host shell as needed.
       PKDEALER_PRICING: /pricing.toml
-      PKDEALER_PRICE_AS: ${PKDEALER_PRICE_AS:-gemma2=claude-opus-4-8,llama3.1=gpt-4.1,mistral=claude-haiku-4-5,pkpoker-gemma=claude-opus-4-8,pkpoker-llama=gpt-4.1,pkpoker-mistral=claude-haiku-4-5}
+      PKDEALER_PRICE_AS: ${PKDEALER_PRICE_AS:-gemma2=claude-opus-4-8,llama3.1=gpt-4.1,mistral=claude-haiku-4-5,pkpoker-gemma=claude-opus-4-8,pkpoker-llama=gpt-4.1,pkpoker-mistral=claude-haiku-4-5,pkpoker-qwen=premium-sim}
     ports: ["50051:50051"]
     volumes:
       - ./pricing.toml:/pricing.toml:ro
