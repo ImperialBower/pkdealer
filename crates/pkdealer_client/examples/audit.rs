@@ -2,7 +2,7 @@
 //! against pkcore's replay engine.
 //!
 //! For every hand, [`HandHistory::replay`] reconstructs a fresh
-//! [`TableNoCell`](pkcore::casino::table_no_cell::TableNoCell), drives it
+//! [`Table`](pkcore::casino::table::Table), drives it
 //! through every recorded action, calls `end_hand()`, and compares the
 //! resulting chip counts against the `net` P&L stored in `results`.
 //!

@@ -23,7 +23,7 @@ use pkcore::card::Card;
 use pkcore::casino::action::PlayerAction;
 use pkcore::casino::game::ForcedBets;
 use pkcore::casino::session::{PokerSession, SessionStep};
-use pkcore::casino::table_no_cell::{PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell};
+use pkcore::casino::table::{Player, Seat, Seats, Table};
 use pkcore::hand_history::{HandCollection, HandHistory};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
@@ -48,13 +48,13 @@ fn main() {
     }
 
     // ── Seat all bots ─────────────────────────────────────────────────────────
-    let seats_vec: Vec<SeatNoCell> = bots
+    let seats_vec: Vec<Seat> = bots
         .iter()
-        .map(|b| SeatNoCell::new(PlayerNoCell::new_with_chips(b.name.clone(), STARTING_CHIPS)))
+        .map(|b| Seat::new(Player::new_with_chips(b.name.clone(), STARTING_CHIPS)))
         .collect();
 
-    let table = TableNoCell::nlh_from_seats(
-        SeatsNoCell::new(seats_vec),
+    let table = Table::nlh_from_seats(
+        Seats::new(seats_vec),
         ForcedBets::new(SMALL_BLIND, BIG_BLIND),
     );
     let mut session = PokerSession::new(table);

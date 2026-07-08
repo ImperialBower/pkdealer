@@ -58,14 +58,14 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
 use opentelemetry::trace::TraceContextExt;
 use pkcore::analysis::name::HandRankName;
 use pkcore::card::Card;
-use pkcore::casino::table::seats::seatbit::Seatbit;
-use pkcore::casino::table::winnings::Winnings;
+use pkcore::casino::equity::seatbit::Seatbit;
+use pkcore::casino::winnings::Winnings;
 use pkcore::casino::{
     action::PlayerAction,
     game::ForcedBets,
     session::{PokerSession, SessionStep},
     state::PlayerState,
-    table_no_cell::{PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell},
+    table::{Player, Seat, Seats, Table},
 };
 use pkdealer_proto::dealer::{
     ActRequest, ActResponse, ActionResult, ActionType, EventType, ExportSessionRequest,
@@ -344,7 +344,7 @@ struct PricingCtx<'a> {
 
 /// Wraps [`PokerSession`] and the player auth token maps for use behind an `Arc<Mutex<_>>`.
 ///
-/// [`PokerSession`] wraps [`TableNoCell`], which has no `Cell`/`RefCell` interior
+/// [`PokerSession`] wraps [`Table`], which has no `Cell`/`RefCell` interior
 /// mutability, so it is `Send + Sync` without any unsafe code.
 #[allow(dead_code)]
 struct TableState {
@@ -507,12 +507,8 @@ impl DealerService {
     /// Creates a fresh table with explicit [`DealerConfig`]. Tests use this
     /// to avoid env-var races between parallel test cases.
     fn new_with_config(config: DealerConfig) -> Self {
-        let seats = SeatsNoCell::new(
-            (0..DEFAULT_SEAT_COUNT)
-                .map(|_| SeatNoCell::default())
-                .collect(),
-        );
-        let table = TableNoCell::nlh_from_seats(
+        let seats = Seats::new((0..DEFAULT_SEAT_COUNT).map(|_| Seat::default()).collect());
+        let table = Table::nlh_from_seats(
             seats,
             ForcedBets::new(DEFAULT_SMALL_BLIND, DEFAULT_BIG_BLIND),
         );
@@ -715,7 +711,7 @@ impl DealerService {
             .table
             .seats
             .get_seat(requested_seat)
-            .is_some_and(SeatNoCell::is_empty);
+            .is_some_and(Seat::is_empty);
         if !is_available {
             let msg = format!("seat {requested_seat} is occupied or does not exist");
             return (
@@ -726,7 +722,7 @@ impl DealerService {
             );
         }
         if let Some(s) = state.session.table.seats.get_seat_mut(requested_seat) {
-            s.player = PlayerNoCell::new_with_chips(name.to_owned(), chips);
+            s.player = Player::new_with_chips(name.to_owned(), chips);
         }
         let token = Uuid::new_v4();
         state.token_to_seat.insert(token, requested_seat);
@@ -773,8 +769,8 @@ impl DealerService {
         }
     }
 
-    /// Maps the current game phase from [`TableNoCell`] to a proto [`Street`].
-    fn map_game_phase_to_street(table: &TableNoCell) -> Street {
+    /// Maps the current game phase from [`Table`] to a proto [`Street`].
+    fn map_game_phase_to_street(table: &Table) -> Street {
         if table.is_preflop() {
             Street::Preflop
         } else if table.is_flop() {
@@ -945,7 +941,7 @@ impl DealerService {
     ///
     /// The winner's excess over `round_size` is passed through [`bank_caps`] so
     /// [`compute_profit_loss`] credits it back — keeping cumulative P&L
-    /// zero-sum across rounds. Bust players get [`PlayerNoCell::reload`] which
+    /// zero-sum across rounds. Bust players get [`Player::reload`] which
     /// increments `withdrawn`, preserving their running loss.
     ///
     /// # Examples
@@ -1076,7 +1072,7 @@ impl DealerService {
 /// // A seat dealt As/Kd renders as Some("As Kd");
 /// // an unseated or undealt seat renders as None.
 /// ```
-fn hole_cards_string(seat: &SeatNoCell) -> Option<String> {
+fn hole_cards_string(seat: &Seat) -> Option<String> {
     let cards: Vec<String> = seat
         .cards
         .as_slice()
@@ -1191,7 +1187,7 @@ fn cap_stacks_to(session: &mut PokerSession, cap: usize) -> Vec<(u8, String, usi
 /// zero-sum across cycles. Pass `0` when no cap has occurred for the seat.
 /// Values outside the `i32` range saturate at `i32::MIN` / `i32::MAX` rather
 /// than panicking — `unwrap()` is forbidden by the project lint set.
-fn compute_profit_loss(player: &PlayerNoCell, banked: i64) -> i32 {
+fn compute_profit_loss(player: &Player, banked: i64) -> i32 {
     let pl = i64::try_from(player.chips).unwrap_or(i64::MAX)
         + i64::try_from(player.chips_in_play).unwrap_or(i64::MAX)
         - i64::try_from(player.withdrawn).unwrap_or(i64::MAX)
@@ -1332,12 +1328,12 @@ impl DealerServiceTrait for DealerService {
                         .table
                         .seats
                         .get_seat(i)
-                        .is_some_and(SeatNoCell::is_empty)
+                        .is_some_and(Seat::is_empty)
                 });
                 match seat_num {
                     Some(i) => {
                         if let Some(s) = guard.session.table.seats.get_seat_mut(i) {
-                            s.player = PlayerNoCell::new_with_chips(req.name.clone(), chips);
+                            s.player = Player::new_with_chips(req.name.clone(), chips);
                         }
                         let token = Uuid::new_v4();
                         guard.token_to_seat.insert(token, i);
@@ -1489,7 +1485,7 @@ impl DealerServiceTrait for DealerService {
                 .table
                 .seats
                 .get_seat(seat)
-                .is_none_or(SeatNoCell::is_empty);
+                .is_none_or(Seat::is_empty);
             if is_empty {
                 let msg = format!("seat {seat} is empty or does not exist");
                 return Ok(Response::new(RemovePlayerResponse {
@@ -1504,7 +1500,7 @@ impl DealerServiceTrait for DealerService {
                 .get_seat_mut(seat)
                 .map(|s| {
                     let n = s.player.handle.clone();
-                    s.player = PlayerNoCell::default();
+                    s.player = Player::default();
                     n
                 })
                 .unwrap_or_default();
@@ -1957,7 +1953,7 @@ impl DealerServiceTrait for DealerService {
                             );
                         }
                         SessionStep::HandComplete => {
-                            // `end_hand()` calls `TableNoCell::reset()` which zeroes
+                            // `end_hand()` calls `Table::reset()` which zeroes
                             // `table.pot` before returning. Snapshot pot + duration
                             // BEFORE the call so the metric and span attribute see
                             // the real final values.
@@ -2988,17 +2984,17 @@ mod tests {
 
     #[test]
     fn bank_caps_keeps_profit_loss_zero_sum() {
-        use pkcore::casino::table_no_cell::PlayerNoCell;
+        use pkcore::casino::table::Player;
         use std::collections::HashMap;
 
         // Three players each bought in for 10k (withdrawn = 10k). Chips have
         // since moved so seat 0 is up to 24k and seats 1,2 are down to 3k each
         // — still zero-sum (+14k, -7k, -7k). `chips`/`withdrawn` are pub fields.
-        let mut win = PlayerNoCell::new_with_chips("win".to_string(), 10_000);
+        let mut win = Player::new_with_chips("win".to_string(), 10_000);
         win.chips = 24_000;
-        let mut lose1 = PlayerNoCell::new_with_chips("lose1".to_string(), 10_000);
+        let mut lose1 = Player::new_with_chips("lose1".to_string(), 10_000);
         lose1.chips = 3_000;
-        let mut lose2 = PlayerNoCell::new_with_chips("lose2".to_string(), 10_000);
+        let mut lose2 = Player::new_with_chips("lose2".to_string(), 10_000);
         lose2.chips = 3_000;
 
         // Cycle-wrap cap fires: only the winner exceeds the 10k cap. Mirror
@@ -3035,15 +3031,14 @@ mod tests {
     fn cap_stacks_to_reduces_only_oversized_stacks() {
         use pkcore::casino::game::ForcedBets;
         use pkcore::casino::session::PokerSession;
-        use pkcore::casino::table_no_cell::{PlayerNoCell, SeatNoCell, SeatsNoCell, TableNoCell};
+        use pkcore::casino::table::{Player, Seat, Seats, Table};
 
-        let seats = SeatsNoCell::new(vec![
-            SeatNoCell::new(PlayerNoCell::new_with_chips("rich".to_string(), 300_000)),
-            SeatNoCell::new(PlayerNoCell::new_with_chips("poor".to_string(), 1_000)),
-            SeatNoCell::new(PlayerNoCell::new_with_chips("exact".to_string(), 10_000)),
+        let seats = Seats::new(vec![
+            Seat::new(Player::new_with_chips("rich".to_string(), 300_000)),
+            Seat::new(Player::new_with_chips("poor".to_string(), 1_000)),
+            Seat::new(Player::new_with_chips("exact".to_string(), 10_000)),
         ]);
-        let mut session =
-            PokerSession::new(TableNoCell::nlh_from_seats(seats, ForcedBets::new(50, 100)));
+        let mut session = PokerSession::new(Table::nlh_from_seats(seats, ForcedBets::new(50, 100)));
 
         let capped = cap_stacks_to(&mut session, 10_000);
 
@@ -4995,7 +4990,7 @@ mod tests {
 
     #[test]
     fn hole_cards_string_undealt_seat_is_none() {
-        let seat = SeatNoCell::new(PlayerNoCell::new_with_chips("Nobody".to_owned(), 1_000));
+        let seat = Seat::new(Player::new_with_chips("Nobody".to_owned(), 1_000));
         assert_eq!(hole_cards_string(&seat), None);
     }
 

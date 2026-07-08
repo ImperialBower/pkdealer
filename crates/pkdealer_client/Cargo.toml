@@ -28,6 +28,6 @@ name = "audit"
 path = "examples/audit.rs"
 
 [dev-dependencies]
-pkcore = "0.1.7"
+pkcore = "0.2.0"
 rand = "0.9"
 tokio-stream = { version = "0.1", features = ["net"] }
