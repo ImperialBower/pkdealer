@@ -49,6 +49,7 @@ use crate::prompt::{build_prompt, pot_odds};
 ///     seat: 0, hole_cards: "2c 7d".into(), board: String::new(),
 ///     pot: 100, to_call: 50, my_chips: 9_950, stacks: vec![],
 ///     big_blind: 100, street: "preflop".into(), action_history: vec![],
+///     button_seat: None,
 /// };
 /// assert_eq!(agent.decide(&state).await, Decision::Fold);
 /// # }
@@ -233,6 +234,7 @@ mod tests {
             big_blind: 100,
             street: "preflop".to_string(),
             action_history: vec![],
+            button_seat: None,
         }
     }
 

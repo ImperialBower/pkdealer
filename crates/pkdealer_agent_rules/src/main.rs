@@ -271,10 +271,37 @@ impl PokerAgent for RulesAgent {
     }
 }
 
+/// Returns the logical position (0-based index) of `seat` within the sorted
+/// list of occupied `seats`, or `None` when `seat` is not occupied.
+///
+/// pkcore's [`TableSnapshot::position`] expresses `dealer_button` and
+/// `logical_seat` as indices into the sorted occupied-seat list (`0` = earliest
+/// occupied seat), *not* as raw seat numbers, so raw seat numbers must be
+/// projected through this before they are stored on the snapshot.
+fn logical_index(sorted_seats: &[u8], seat: u8) -> Option<u8> {
+    sorted_seats
+        .iter()
+        .position(|&s| s == seat)
+        .and_then(|i| u8::try_from(i).ok())
+}
+
 /// Converts a [`HandState`] into a pkcore [`TableSnapshot`].
 ///
 /// `current_bet` is approximated as `to_call` and `min_raise` as `big_blind`;
 /// the runner's floor-raise correction handles any undersized raise amounts.
+///
+/// Each seat's `bet` and `is_active` flags are carried straight through from the
+/// [`HandState`]. `is_active` matters for the equity path: pkcore counts *live*
+/// opponents (folded / busted seats excluded) when it estimates multi-way
+/// equity, so passing the real flag keeps `--equity fast|exact` from
+/// systematically understating the hero's equity.
+///
+/// `dealer_button` and `logical_seat` are derived from `state.button_seat` and
+/// `state.seat` by projecting both raw seat numbers into logical positions over
+/// the sorted occupied-seat list (see [`logical_index`]). This makes
+/// `TableSnapshot::position` resolve, which is what `ranges: position_aware`
+/// consults. When `button_seat` is `None` (no button known), `dealer_button`
+/// stays `None` and the decider falls back to the flat range.
 ///
 /// `hole_cards` and `board` are parsed from their space-separated index
 /// notation (e.g. `"Ah Kd"`) so that [`RuleBasedDecider`] runs its
@@ -286,14 +313,15 @@ fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot<'static> {
     let stacks: Vec<SeatInfo> = state
         .stacks
         .iter()
-        .map(|(seat, name, chips)| SeatInfo {
+        .map(|s| SeatInfo {
             id: Uuid::new_v4(),
-            seat: *seat,
-            name: name.clone(),
+            seat: s.seat,
+            name: s.name.clone(),
             #[allow(clippy::cast_possible_truncation)]
-            chips: *chips as usize,
-            bet: 0,
-            is_active: true,
+            chips: s.chips as usize,
+            #[allow(clippy::cast_possible_truncation)]
+            bet: s.bet as usize,
+            is_active: s.is_active,
         })
         .collect();
 
@@ -305,6 +333,15 @@ fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot<'static> {
     };
 
     let seat_count = u8::try_from(stacks.len()).unwrap_or(u8::MAX);
+
+    // Logical positions index into the sorted list of occupied seats, which is
+    // what `TableSnapshot::position()` expects — not raw seat numbers.
+    let mut occupied: Vec<u8> = state.stacks.iter().map(|s| s.seat).collect();
+    occupied.sort_unstable();
+    let logical_seat = logical_index(&occupied, state.seat);
+    let dealer_button = state
+        .button_seat
+        .and_then(|button| logical_index(&occupied, button));
 
     #[allow(clippy::cast_possible_truncation)]
     TableSnapshot {
@@ -322,9 +359,9 @@ fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot<'static> {
         betting_structure: BettingStructure::default(),
         bet_tier: BetTier::default(),
         checked_this_street: false,
-        dealer_button: None,
+        dealer_button,
         seat_count,
-        logical_seat: None,
+        logical_seat,
         opponent_stats: None,
     }
 }
@@ -429,6 +466,7 @@ async fn main() {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use pkdealer_agent_core::SeatSnapshot;
 
     fn sample_state() -> HandState {
         HandState {
@@ -439,17 +477,30 @@ mod tests {
             to_call: 100,
             my_chips: 9_900,
             stacks: vec![
-                (0, "alice".to_string(), 9_900),
-                (1, "bob".to_string(), 10_000),
+                SeatSnapshot {
+                    seat: 0,
+                    name: "alice".to_string(),
+                    chips: 9_900,
+                    bet: 100,
+                    is_active: true,
+                },
+                SeatSnapshot {
+                    seat: 1,
+                    name: "bob".to_string(),
+                    chips: 10_000,
+                    bet: 0,
+                    is_active: true,
+                },
             ],
             big_blind: 100,
             street: "preflop".to_string(),
             action_history: vec![],
+            button_seat: Some(0),
         }
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_numeric_fields() {
+    fn hand_state_to_snapshot_numeric_fields() {
         let state = sample_state();
         let snap = hand_state_to_snapshot(&state);
         assert_eq!(snap.seat, 0);
@@ -461,7 +512,88 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_stacks() {
+    fn logical_index_found_and_missing() {
+        let occupied = [2u8, 4, 5, 7];
+        assert_eq!(logical_index(&occupied, 2), Some(0));
+        assert_eq!(logical_index(&occupied, 5), Some(2));
+        assert_eq!(logical_index(&occupied, 7), Some(3));
+        assert_eq!(logical_index(&occupied, 3), None);
+    }
+
+    #[test]
+    fn hand_state_to_snapshot_threads_bet_and_active() {
+        // Seat 1 has folded; seat 0 has 100 in the pot this street.
+        let state = HandState {
+            stacks: vec![
+                SeatSnapshot {
+                    seat: 0,
+                    name: "alice".to_string(),
+                    chips: 9_900,
+                    bet: 100,
+                    is_active: true,
+                },
+                SeatSnapshot {
+                    seat: 1,
+                    name: "bob".to_string(),
+                    chips: 10_000,
+                    bet: 0,
+                    is_active: false,
+                },
+            ],
+            ..sample_state()
+        };
+        let snap = hand_state_to_snapshot(&state);
+        assert_eq!(snap.stacks[0].bet, 100);
+        assert!(snap.stacks[0].is_active);
+        assert_eq!(snap.stacks[1].bet, 0);
+        assert!(!snap.stacks[1].is_active, "folded seat must not be active");
+    }
+
+    #[test]
+    fn hand_state_to_snapshot_derives_logical_positions() {
+        // Non-contiguous occupied seats: 3 (hero) and 6 (button).
+        let state = HandState {
+            seat: 3,
+            button_seat: Some(6),
+            stacks: vec![
+                SeatSnapshot {
+                    seat: 3,
+                    name: "hero".to_string(),
+                    chips: 9_000,
+                    bet: 0,
+                    is_active: true,
+                },
+                SeatSnapshot {
+                    seat: 6,
+                    name: "villain".to_string(),
+                    chips: 9_000,
+                    bet: 0,
+                    is_active: true,
+                },
+            ],
+            ..sample_state()
+        };
+        let snap = hand_state_to_snapshot(&state);
+        // Sorted occupied = [3, 6]: hero is logical 0, button is logical 1.
+        assert_eq!(snap.logical_seat, Some(0));
+        assert_eq!(snap.dealer_button, Some(1));
+        // With both set, position() resolves (enables position_aware ranges).
+        assert!(snap.position().is_some());
+    }
+
+    #[test]
+    fn hand_state_to_snapshot_no_button_leaves_position_unresolved() {
+        let state = HandState {
+            button_seat: None,
+            ..sample_state()
+        };
+        let snap = hand_state_to_snapshot(&state);
+        assert_eq!(snap.dealer_button, None);
+        assert!(snap.position().is_none());
+    }
+
+    #[test]
+    fn hand_state_to_snapshot_stacks() {
         let state = sample_state();
         let snap = hand_state_to_snapshot(&state);
         assert_eq!(snap.stacks.len(), 2);
@@ -470,13 +602,13 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_phase_preflop() {
+    fn hand_state_to_snapshot_phase_preflop() {
         let snap = hand_state_to_snapshot(&sample_state());
         assert_eq!(snap.phase, GamePhase::BettingPreFlop);
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_phase_flop() {
+    fn hand_state_to_snapshot_phase_flop() {
         let state = HandState {
             street: "flop".to_string(),
             ..sample_state()
@@ -485,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_phase_turn() {
+    fn hand_state_to_snapshot_phase_turn() {
         let state = HandState {
             street: "turn".to_string(),
             ..sample_state()
@@ -494,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_phase_river() {
+    fn hand_state_to_snapshot_phase_river() {
         let state = HandState {
             street: "river".to_string(),
             ..sample_state()
@@ -506,13 +638,13 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_empty_board_is_default_cards() {
+    fn hand_state_to_snapshot_empty_board_is_default_cards() {
         let snap = hand_state_to_snapshot(&sample_state());
         assert!(snap.board.is_empty());
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_parses_hole_cards() {
+    fn hand_state_to_snapshot_parses_hole_cards() {
         // sample_state() has hole_cards "Ah Kd"; the snapshot must carry both
         // cards so RuleBasedDecider runs its equity path rather than the
         // card-blind fallback path.
@@ -521,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_parses_board() {
+    fn hand_state_to_snapshot_parses_board() {
         let state = HandState {
             board: "Ts 9s 8c".to_string(),
             street: "flop".to_string(),
@@ -532,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_empty_board_stays_empty() {
+    fn hand_state_to_snapshot_empty_board_stays_empty() {
         let state = HandState {
             board: String::new(),
             street: "preflop".to_string(),
@@ -543,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_fold() {
+    fn pkcore_action_to_decision_fold() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::Fold),
             Decision::Fold
@@ -551,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_check() {
+    fn pkcore_action_to_decision_check() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::Check),
             Decision::Check
@@ -559,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_call() {
+    fn pkcore_action_to_decision_call() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::Call),
             Decision::Call
@@ -567,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_bet() {
+    fn pkcore_action_to_decision_bet() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::Bet(200)),
             Decision::Bet(200)
@@ -575,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_raise() {
+    fn pkcore_action_to_decision_raise() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::Raise(400)),
             Decision::Raise(400)
@@ -583,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_all_in() {
+    fn pkcore_action_to_decision_all_in() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::AllIn),
             Decision::AllIn
@@ -591,13 +723,13 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_builtin_gto() {
+    fn load_profile_builtin_gto() {
         let p = load_profile("gto").expect("gto should load");
         assert_eq!(p.name, "gto");
     }
 
     #[test]
-    fn test_load_profile_builtin_abbreviations() {
+    fn load_profile_builtin_abbreviations() {
         assert_eq!(load_profile("tp").expect("tp").name, "tight_passive");
         assert_eq!(load_profile("lag").expect("lag").name, "loose_aggressive");
         assert_eq!(load_profile("tag").expect("tag").name, "tight_aggressive");
@@ -606,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_all_builtins() {
+    fn load_profile_all_builtins() {
         for name in [
             "gto",
             "tight_passive",
@@ -626,13 +758,13 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_unknown_path_returns_error() {
+    fn load_profile_unknown_path_returns_error() {
         let result = load_profile("nonexistent_profile_xyz.yaml");
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_load_profile_strong_all_on_has_decision_knobs_on() {
+    fn load_profile_strong_all_on_has_decision_knobs_on() {
         let p = load_profile("strong_all_on").expect("strong_all_on should load");
         assert_eq!(p.name, "strong_all_on");
         assert_eq!(p.decision.ranges, RangeMode::PositionAware);
@@ -641,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_weak_all_off_has_default_decision() {
+    fn load_profile_weak_all_off_has_default_decision() {
         let p = load_profile("weak_all_off").expect("weak_all_off should load");
         assert_eq!(p.name, "weak_all_off");
         assert_eq!(p.decision.equity, EquityMode::Off);
@@ -650,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_strong_weak_aliases() {
+    fn load_profile_strong_weak_aliases() {
         assert_eq!(
             load_profile("strong").expect("strong").name,
             "strong_all_on"
@@ -664,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_none_leaves_profile_unchanged() {
+    fn apply_decision_overrides_none_leaves_profile_unchanged() {
         let mut profile = BotProfile::gto();
         let before = profile.decision.clone();
         let args = args_from(["pkdealer_agent_rules"].as_slice());
@@ -673,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_equity_fast_uses_samples() {
+    fn apply_decision_overrides_equity_fast_uses_samples() {
         let mut profile = BotProfile::gto();
         let args = args_from(&[
             "pkdealer_agent_rules",
@@ -687,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_ranges_position_aware() {
+    fn apply_decision_overrides_ranges_position_aware() {
         let mut profile = BotProfile::gto();
         let args = args_from(&["pkdealer_agent_rules", "--ranges", "position-aware"]);
         assert!(apply_decision_overrides(&mut profile, &args));
@@ -695,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_pot_odds_clamped() {
+    fn apply_decision_overrides_pot_odds_clamped() {
         let mut profile = BotProfile::gto();
         let args = args_from(&["pkdealer_agent_rules", "--pot-odds-discipline", "5.0"]);
         assert!(apply_decision_overrides(&mut profile, &args));
@@ -703,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_all_knobs() {
+    fn apply_decision_overrides_all_knobs() {
         let mut profile = BotProfile::gto();
         let args = args_from(&[
             "pkdealer_agent_rules",
@@ -730,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_can_disable_profile_knobs() {
+    fn apply_decision_overrides_can_disable_profile_knobs() {
         // strong_all_on ships with position-aware ranges + Monte-Carlo equity;
         // overrides must be able to force them back off.
         let mut profile = load_profile("strong_all_on").expect("strong_all_on");
@@ -747,7 +879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rules_agent_legal_action_with_to_call() {
+    async fn rules_agent_legal_action_with_to_call() {
         let agent = RulesAgent {
             profile: BotProfile::gto(),
         };
@@ -763,7 +895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rules_agent_legal_action_without_to_call() {
+    async fn rules_agent_legal_action_without_to_call() {
         let agent = RulesAgent {
             profile: BotProfile::gto(),
         };
@@ -779,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rules_agent_zero_chips_checks() {
+    async fn rules_agent_zero_chips_checks() {
         let agent = RulesAgent {
             profile: BotProfile::gto(),
         };
@@ -793,7 +925,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rules_agent_all_profiles_produce_actions() {
+    async fn rules_agent_all_profiles_produce_actions() {
         for profile in BotProfile::default_profiles() {
             let agent = RulesAgent { profile };
             let _ = agent.decide(&sample_state()).await;
@@ -801,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn test_args_defaults() {
+    fn args_defaults() {
         let args =
             Args::try_parse_from(["pkdealer_agent_rules"]).expect("default args should parse");
         assert_eq!(args.endpoint, "http://127.0.0.1:50051");
@@ -821,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn test_args_parse_decision_knobs() {
+    fn args_parse_decision_knobs() {
         let args = Args::try_parse_from([
             "pkdealer_agent_rules",
             "--equity",
@@ -841,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn test_args_with_profile_name() {
+    fn args_with_profile_name() {
         let args = Args::try_parse_from([
             "pkdealer_agent_rules",
             "--name",
@@ -855,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn test_args_with_seat_and_chips() {
+    fn args_with_seat_and_chips() {
         let args = Args::try_parse_from(["pkdealer_agent_rules", "--seat", "2", "--chips", "5000"])
             .expect("seat/chips args should parse");
         assert_eq!(args.seat, Some(2));
