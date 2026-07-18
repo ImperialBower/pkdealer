@@ -167,7 +167,16 @@ docker compose down -v
 - **Different rules profiles.** Mount `./data/bots` into the agent
   container and pass `--profile /data/bots/<file>.yaml`. Built-in
   profile names (`gto`, `loose_aggressive`, `tight_aggressive`, etc.)
-  are resolved without a mount.
+  are resolved without a mount, including the pkcore 0.3.0 (EPIC-36)
+  reference pair `strong_all_on` (`strong`) and `weak_all_off` (`weak`).
+- **Graded decision capabilities (EPIC-36).** Dial any pkcore
+  decision knob on top of a profile without editing YAML:
+  `--equity <off|fast|exact>` (`--equity-samples N` for `fast`),
+  `--ranges <flat|position-aware>`, `--pot-odds-discipline 0.0..1.0`,
+  `--outs <off|on>`, `--exploit <off|light|heavy>`, and
+  `--preflop-charts <off|hup|solver>`. Each flag overrides just that
+  knob; omitted flags keep the profile's own setting. Example:
+  `pkdealer_agent_rules --profile gto --equity fast --ranges position-aware --outs on`.
 - **Table pacing.** Agents pause so the action is watchable:
   `PKDEALER_ACTION_DELAY_SECS` (default `1`) before each action and
   `PKDEALER_HAND_END_DELAY_SECS` (default `5`) after every hand ends. Override

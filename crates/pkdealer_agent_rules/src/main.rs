@@ -14,13 +14,42 @@
 //!
 //! # YAML file on disk
 //! cargo run --bin pkdealer_agent_rules -- --name bob --profile data/bots/loose_aggressive.yaml
+//!
+//! # Override individual pkcore 0.3.0 (EPIC-36) decision-capability knobs on top
+//! # of any profile — here: Monte-Carlo equity, position-aware ranges, draw outs.
+//! cargo run --bin pkdealer_agent_rules -- --name carol --profile gto \
+//!     --equity fast --equity-samples 4000 --ranges position-aware --outs on
 //! ```
 //!
 //! ## Supported built-in profile names
 //!
 //! `gto`, `tight_passive` (`tp`), `loose_aggressive` (`lag`),
 //! `tight_aggressive` (`tag`), `loose_passive` (`lp`), `maniac`, `abc`,
-//! `short_stack_ninja` (`ssn`), `joker`
+//! `short_stack_ninja` (`ssn`), `joker`, `strong_all_on` (`strong`),
+//! `weak_all_off` (`weak`)
+//!
+//! `strong_all_on` and `weak_all_off` are the EPIC-36 reference profiles: the
+//! same `gto` base with every graded [`pkcore::bot::decision_config::DecisionConfig`]
+//! knob dialed all the way
+//! up (exact-ish equity, position-aware ranges, strict pot odds) versus all the
+//! way down (hand-rank proxy, flat ranges, pot odds ignored).
+//!
+//! ## Decision-capability overrides (EPIC-36)
+//!
+//! Each flag below overrides one knob of the loaded profile's
+//! [`pkcore::bot::decision_config::DecisionConfig`]. Omitting a flag leaves that
+//! knob at whatever the profile specified (its own `decision:` section, or the
+//! historical default).
+//!
+//! | Flag | Values | Knob |
+//! |------|--------|------|
+//! | `--equity` | `off`, `fast`, `exact` | Postflop hand-strength source |
+//! | `--equity-samples` | `u32` (default `2000`) | Monte-Carlo budget for `--equity fast` |
+//! | `--ranges` | `flat`, `position-aware` | Preflop range source |
+//! | `--pot-odds-discipline` | `0.0`–`1.0` | Call-threshold strictness |
+//! | `--outs` | `off`, `on` | Draw/outs equity augmentation |
+//! | `--exploit` | `off`, `light`, `heavy` | Opponent-adjusted exploitation |
+//! | `--preflop-charts` | `off`, `hup`, `solver` | Preflop decision-chart source |
 //!
 //! ## Environment variables
 //!
@@ -31,9 +60,12 @@
 use std::process;
 
 use async_trait::async_trait;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use pkcore::Forgiving;
 use pkcore::bot::decider::{BotDecider, RuleBasedDecider};
+use pkcore::bot::decision_config::{
+    EquityMode, ExploitMode, PotOddsConfig, PreflopCharts, RangeMode, Toggle,
+};
 use pkcore::bot::player_action::PlayerAction as PkcoreAction;
 use pkcore::bot::profile::BotProfile;
 use pkcore::bot::table_snapshot::{SeatInfo, TableSnapshot};
@@ -77,6 +109,152 @@ struct Args {
     /// Profile name (`gto`, `tight_passive`, `lag`, …) or path to a YAML file.
     #[arg(long, default_value = "gto")]
     profile: String,
+
+    /// Override the postflop equity source. Omit to keep the profile's setting.
+    #[arg(long, value_enum)]
+    equity: Option<EquityArg>,
+
+    /// Monte-Carlo sample budget used when `--equity fast` is selected.
+    #[arg(long, default_value_t = 2_000)]
+    equity_samples: u32,
+
+    /// Override the preflop range source. Omit to keep the profile's setting.
+    #[arg(long, value_enum)]
+    ranges: Option<RangesArg>,
+
+    /// Override pot-odds discipline in `[0.0, 1.0]` (1.0 = strict break-even,
+    /// 0.0 = ignore pot odds). Out-of-range values are clamped.
+    #[arg(long)]
+    pot_odds_discipline: Option<f64>,
+
+    /// Override draw/outs equity augmentation. Omit to keep the profile's setting.
+    #[arg(long, value_enum)]
+    outs: Option<ToggleArg>,
+
+    /// Override opponent-adjusted exploitation. Engages only when the table
+    /// snapshot carries opponent stats, so it is a no-op on the current
+    /// pkdealer wire (which supplies none). Omit to keep the profile's setting.
+    #[arg(long, value_enum)]
+    exploit: Option<ExploitArg>,
+
+    /// Override the preflop decision-chart source. Omit to keep the profile's setting.
+    #[arg(long, value_enum)]
+    preflop_charts: Option<PreflopChartsArg>,
+}
+
+/// CLI mirror of [`EquityMode`] (the `samples` budget comes from `--equity-samples`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum EquityArg {
+    /// Hand-rank proxy — the historical behavior.
+    Off,
+    /// Seeded Monte Carlo with the `--equity-samples` budget.
+    Fast,
+    /// Exact enumeration of remaining runouts.
+    Exact,
+}
+
+/// CLI mirror of [`RangeMode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RangesArg {
+    /// Flat `range_strategy.open_raise` lookup — the historical behavior.
+    Flat,
+    /// Position-aware lookup via the profile's playbook.
+    PositionAware,
+}
+
+/// CLI mirror of [`Toggle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ToggleArg {
+    /// Capability disabled — the historical behavior.
+    Off,
+    /// Capability enabled.
+    On,
+}
+
+/// CLI mirror of [`ExploitMode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ExploitArg {
+    /// No opponent adjustment — the historical behavior.
+    Off,
+    /// Light adjustment (higher sample gate before adjusting).
+    Light,
+    /// Heavy adjustment (lower sample gate; adjusts sooner).
+    Heavy,
+}
+
+/// CLI mirror of [`PreflopCharts`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum PreflopChartsArg {
+    /// No chart — the historical range-membership behavior.
+    Off,
+    /// Heads-up precomputed odds table.
+    Hup,
+    /// Offline-generated GTO charts.
+    Solver,
+}
+
+/// Applies any `--equity` / `--ranges` / … CLI overrides onto a loaded
+/// profile's [`pkcore::bot::decision_config::DecisionConfig`], leaving each knob
+/// untouched when its flag was omitted.
+///
+/// Returns `true` when at least one knob was overridden, so the caller can log
+/// the change.
+///
+/// # Examples
+///
+/// ```text
+/// # gto profile, but force Monte-Carlo equity and looser pot-odds discipline:
+/// pkdealer_agent_rules --profile gto --equity fast --pot-odds-discipline 0.5
+/// ```
+fn apply_decision_overrides(profile: &mut BotProfile, args: &Args) -> bool {
+    let mut changed = false;
+    if let Some(equity) = args.equity {
+        profile.decision.equity = match equity {
+            EquityArg::Off => EquityMode::Off,
+            EquityArg::Fast => EquityMode::Fast {
+                samples: args.equity_samples,
+            },
+            EquityArg::Exact => EquityMode::Exact,
+        };
+        changed = true;
+    }
+    if let Some(ranges) = args.ranges {
+        profile.decision.ranges = match ranges {
+            RangesArg::Flat => RangeMode::Flat,
+            RangesArg::PositionAware => RangeMode::PositionAware,
+        };
+        changed = true;
+    }
+    if let Some(discipline) = args.pot_odds_discipline {
+        profile.decision.pot_odds = PotOddsConfig {
+            discipline: discipline.clamp(0.0, 1.0),
+        };
+        changed = true;
+    }
+    if let Some(outs) = args.outs {
+        profile.decision.outs = match outs {
+            ToggleArg::Off => Toggle::Off,
+            ToggleArg::On => Toggle::On,
+        };
+        changed = true;
+    }
+    if let Some(exploit) = args.exploit {
+        profile.decision.exploit = match exploit {
+            ExploitArg::Off => ExploitMode::Off,
+            ExploitArg::Light => ExploitMode::Light,
+            ExploitArg::Heavy => ExploitMode::Heavy,
+        };
+        changed = true;
+    }
+    if let Some(charts) = args.preflop_charts {
+        profile.decision.preflop_charts = match charts {
+            PreflopChartsArg::Off => PreflopCharts::Off,
+            PreflopChartsArg::Hup => PreflopCharts::Hup,
+            PreflopChartsArg::Solver => PreflopCharts::Solver,
+        };
+        changed = true;
+    }
+    changed
 }
 
 struct RulesAgent {
@@ -172,13 +350,17 @@ fn pkcore_action_to_decision(action: PkcoreAction) -> Decision {
 ///
 /// Recognized short names: `gto`, `tight_passive` / `tp`, `loose_aggressive` /
 /// `lag`, `tight_aggressive` / `tag`, `loose_passive` / `lp`, `maniac`, `abc`,
-/// `short_stack_ninja` / `ssn`, `joker`. Any other value is treated as a path
-/// to a YAML file.
+/// `short_stack_ninja` / `ssn`, `joker`, `strong_all_on` / `strong`,
+/// `weak_all_off` / `weak`. Any other value is treated as a path to a YAML file.
+///
+/// The `strong_all_on` / `weak_all_off` reference profiles are embedded into the
+/// binary via [`include_str!`], so they resolve regardless of the working
+/// directory (unlike a bare file path).
 ///
 /// # Errors
 ///
 /// Returns an error when the spec is not a known name and the file cannot be
-/// read or parsed.
+/// read or parsed, or when an embedded reference profile fails to deserialize.
 ///
 /// # Examples
 ///
@@ -196,6 +378,12 @@ fn load_profile(spec: &str) -> Result<BotProfile, Box<dyn std::error::Error>> {
         "abc" => Some(BotProfile::abc()),
         "short_stack_ninja" | "ssn" => Some(BotProfile::short_stack_ninja()),
         "joker" => Some(BotProfile::joker()),
+        "strong_all_on" | "strong" => Some(BotProfile::from_yaml_str(include_str!(
+            "../../../data/bots/strong_all_on.yaml"
+        ))?),
+        "weak_all_off" | "weak" => Some(BotProfile::from_yaml_str(include_str!(
+            "../../../data/bots/weak_all_off.yaml"
+        ))?),
         _ => None,
     };
     if let Some(p) = built_in {
@@ -208,13 +396,19 @@ fn load_profile(spec: &str) -> Result<BotProfile, Box<dyn std::error::Error>> {
 async fn main() {
     let args = Args::parse();
 
-    let profile = match load_profile(&args.profile) {
+    let mut profile = match load_profile(&args.profile) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to load profile {:?}: {e}", args.profile);
             process::exit(1);
         }
     };
+    if apply_decision_overrides(&mut profile, &args) {
+        eprintln!(
+            "[{}] decision overrides applied: {:?}",
+            args.name, profile.decision
+        );
+    }
     eprintln!("[{}] profile: {profile}", args.name);
 
     let config = AgentConfig {
@@ -423,6 +617,8 @@ mod tests {
             "abc",
             "short_stack_ninja",
             "joker",
+            "strong_all_on",
+            "weak_all_off",
         ] {
             let p = load_profile(name).unwrap_or_else(|e| panic!("failed to load {name}: {e}"));
             assert!(!p.name.is_empty(), "{name} profile has empty name");
@@ -433,6 +629,121 @@ mod tests {
     fn test_load_profile_unknown_path_returns_error() {
         let result = load_profile("nonexistent_profile_xyz.yaml");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_profile_strong_all_on_has_decision_knobs_on() {
+        let p = load_profile("strong_all_on").expect("strong_all_on should load");
+        assert_eq!(p.name, "strong_all_on");
+        assert_eq!(p.decision.ranges, RangeMode::PositionAware);
+        assert!(matches!(p.decision.equity, EquityMode::Fast { .. }));
+        assert!(!p.decision.is_default());
+    }
+
+    #[test]
+    fn test_load_profile_weak_all_off_has_default_decision() {
+        let p = load_profile("weak_all_off").expect("weak_all_off should load");
+        assert_eq!(p.name, "weak_all_off");
+        assert_eq!(p.decision.equity, EquityMode::Off);
+        assert_eq!(p.decision.ranges, RangeMode::Flat);
+        assert!((p.decision.pot_odds.discipline - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_load_profile_strong_weak_aliases() {
+        assert_eq!(
+            load_profile("strong").expect("strong").name,
+            "strong_all_on"
+        );
+        assert_eq!(load_profile("weak").expect("weak").name, "weak_all_off");
+    }
+
+    /// Builds an `Args` from a bare arg list; panics on parse failure.
+    fn args_from(argv: &[&str]) -> Args {
+        Args::try_parse_from(argv).expect("args should parse")
+    }
+
+    #[test]
+    fn test_apply_decision_overrides_none_leaves_profile_unchanged() {
+        let mut profile = BotProfile::gto();
+        let before = profile.decision.clone();
+        let args = args_from(["pkdealer_agent_rules"].as_slice());
+        assert!(!apply_decision_overrides(&mut profile, &args));
+        assert_eq!(profile.decision, before);
+    }
+
+    #[test]
+    fn test_apply_decision_overrides_equity_fast_uses_samples() {
+        let mut profile = BotProfile::gto();
+        let args = args_from(&[
+            "pkdealer_agent_rules",
+            "--equity",
+            "fast",
+            "--equity-samples",
+            "4000",
+        ]);
+        assert!(apply_decision_overrides(&mut profile, &args));
+        assert_eq!(profile.decision.equity, EquityMode::Fast { samples: 4_000 });
+    }
+
+    #[test]
+    fn test_apply_decision_overrides_ranges_position_aware() {
+        let mut profile = BotProfile::gto();
+        let args = args_from(&["pkdealer_agent_rules", "--ranges", "position-aware"]);
+        assert!(apply_decision_overrides(&mut profile, &args));
+        assert_eq!(profile.decision.ranges, RangeMode::PositionAware);
+    }
+
+    #[test]
+    fn test_apply_decision_overrides_pot_odds_clamped() {
+        let mut profile = BotProfile::gto();
+        let args = args_from(&["pkdealer_agent_rules", "--pot-odds-discipline", "5.0"]);
+        assert!(apply_decision_overrides(&mut profile, &args));
+        assert!((profile.decision.pot_odds.discipline - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_apply_decision_overrides_all_knobs() {
+        let mut profile = BotProfile::gto();
+        let args = args_from(&[
+            "pkdealer_agent_rules",
+            "--equity",
+            "exact",
+            "--ranges",
+            "position-aware",
+            "--pot-odds-discipline",
+            "0.25",
+            "--outs",
+            "on",
+            "--exploit",
+            "heavy",
+            "--preflop-charts",
+            "hup",
+        ]);
+        assert!(apply_decision_overrides(&mut profile, &args));
+        assert_eq!(profile.decision.equity, EquityMode::Exact);
+        assert_eq!(profile.decision.ranges, RangeMode::PositionAware);
+        assert!((profile.decision.pot_odds.discipline - 0.25).abs() < f64::EPSILON);
+        assert_eq!(profile.decision.outs, Toggle::On);
+        assert_eq!(profile.decision.exploit, ExploitMode::Heavy);
+        assert_eq!(profile.decision.preflop_charts, PreflopCharts::Hup);
+    }
+
+    #[test]
+    fn test_apply_decision_overrides_can_disable_profile_knobs() {
+        // strong_all_on ships with position-aware ranges + Monte-Carlo equity;
+        // overrides must be able to force them back off.
+        let mut profile = load_profile("strong_all_on").expect("strong_all_on");
+        let args = args_from(&[
+            "pkdealer_agent_rules",
+            "--equity",
+            "off",
+            "--ranges",
+            "flat",
+        ]);
+        assert!(apply_decision_overrides(&mut profile, &args));
+        assert_eq!(profile.decision.equity, EquityMode::Off);
+        assert_eq!(profile.decision.ranges, RangeMode::Flat);
     }
 
     #[tokio::test]
@@ -499,6 +810,34 @@ mod tests {
         assert_eq!(args.chips, 10_000);
         assert_eq!(args.profile, "gto");
         assert!(args.client_secret.is_empty());
+        // EPIC-36 override knobs default to "leave the profile alone".
+        assert!(args.equity.is_none());
+        assert_eq!(args.equity_samples, 2_000);
+        assert!(args.ranges.is_none());
+        assert!(args.pot_odds_discipline.is_none());
+        assert!(args.outs.is_none());
+        assert!(args.exploit.is_none());
+        assert!(args.preflop_charts.is_none());
+    }
+
+    #[test]
+    fn test_args_parse_decision_knobs() {
+        let args = Args::try_parse_from([
+            "pkdealer_agent_rules",
+            "--equity",
+            "fast",
+            "--ranges",
+            "position-aware",
+            "--exploit",
+            "light",
+            "--preflop-charts",
+            "solver",
+        ])
+        .expect("decision-knob args should parse");
+        assert_eq!(args.equity, Some(EquityArg::Fast));
+        assert_eq!(args.ranges, Some(RangesArg::PositionAware));
+        assert_eq!(args.exploit, Some(ExploitArg::Light));
+        assert_eq!(args.preflop_charts, Some(PreflopChartsArg::Solver));
     }
 
     #[test]
