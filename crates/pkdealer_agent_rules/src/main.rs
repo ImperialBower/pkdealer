@@ -388,6 +388,10 @@ impl ExploitPuller {
         state.registry = build_registry(&collection);
         state.seat_ids = seat_ids_from_collection(&collection);
         state.last_hand_count = count;
+        eprintln!(
+            "[exploit] ingested {count} hands → {} players tracked",
+            state.registry.len()
+        );
     }
 }
 
