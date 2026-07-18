@@ -58,5 +58,5 @@ pub mod runner;
 
 pub use agent::{AgentFidelity, Decision, PokerAgent};
 pub use error::AgentError;
-pub use hand_state::HandState;
+pub use hand_state::{HandState, SeatSnapshot, seat_state_is_active};
 pub use runner::{AgentConfig, run_agent};

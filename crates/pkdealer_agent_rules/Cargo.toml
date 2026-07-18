@@ -16,8 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 pkdealer_agent_core = { path = "../pkdealer_agent_core", version = "0.1.11" }
-pkcore = { version = "0.3.0", features = ["bot-profiles"] }
+pkdealer_proto = { path = "../pkdealer_proto", version = "0.1.7" }
+pkcore = { version = "0.3.1", features = ["bot-profiles"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tonic = { version = "0.12", features = ["transport"] }
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
+serde_json = "1"
 uuid = { version = "1.22", features = ["v4"] }

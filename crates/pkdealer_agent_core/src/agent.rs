@@ -141,48 +141,49 @@ mod tests {
             big_blind: 100,
             street: "preflop".to_string(),
             action_history: vec![],
+            button_seat: None,
         }
     }
 
     #[test]
-    fn test_decision_debug_fold() {
+    fn decision_debug_fold() {
         assert_eq!(format!("{:?}", Decision::Fold), "Fold");
     }
 
     #[test]
-    fn test_decision_debug_bet() {
+    fn decision_debug_bet() {
         assert_eq!(format!("{:?}", Decision::Bet(200)), "Bet(200)");
     }
 
     #[test]
-    fn test_decision_debug_raise() {
+    fn decision_debug_raise() {
         assert_eq!(format!("{:?}", Decision::Raise(500)), "Raise(500)");
     }
 
     #[test]
-    fn test_decision_clone_preserves_amount() {
+    fn decision_clone_preserves_amount() {
         let d = Decision::Raise(500);
         assert_eq!(d.clone(), Decision::Raise(500));
     }
 
     #[test]
-    fn test_decision_equality_same_variant() {
+    fn decision_equality_same_variant() {
         assert_eq!(Decision::Check, Decision::Check);
         assert_eq!(Decision::Bet(100), Decision::Bet(100));
     }
 
     #[test]
-    fn test_decision_inequality_different_variant() {
+    fn decision_inequality_different_variant() {
         assert_ne!(Decision::Fold, Decision::Call);
     }
 
     #[test]
-    fn test_decision_inequality_different_amount() {
+    fn decision_inequality_different_amount() {
         assert_ne!(Decision::Bet(100), Decision::Bet(200));
     }
 
     #[tokio::test]
-    async fn test_poker_agent_stub_always_fold() {
+    async fn poker_agent_stub_always_fold() {
         struct AlwaysFold;
 
         #[async_trait::async_trait]
@@ -197,7 +198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_poker_agent_stub_bet_pot() {
+    async fn poker_agent_stub_bet_pot() {
         struct BetPot;
 
         #[async_trait::async_trait]

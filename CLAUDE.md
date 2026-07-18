@@ -8,7 +8,7 @@ These instructions guide Claude to generate code that aligns with our project st
 - **Every public function must have at least one unit test** covering the happy path
 - **Every public struct/enum must have tests** that validate construction, methods, and trait implementations
 - Unit tests should be placed in a `#[cfg(test)]` module at the end of the file or in a `tests/` directory
-- Test names should be descriptive and follow the pattern: `test_<function_or_struct_name>_<scenario>`
+- Test names should be descriptive and follow the pattern: `<function_or_struct_name>_<scenario>`. **Do not prefix test function names with `test_`** — the `#[test]` / `#[tokio::test]` attribute already marks them as tests, so the prefix is redundant noise (e.g. `fn parses_hole_cards`, not `fn test_parses_hole_cards`).
 - Include edge cases, error conditions, and boundary conditions
 - Use `assert!`, `assert_eq!`, and `assert_ne!` macros effectively
 
@@ -176,7 +176,7 @@ cargo test --doc
 cargo test -- --nocapture
 
 # Run specific test
-cargo test test_function_name
+cargo test function_name
 
 # Run tests with specific number of threads
 cargo test -- --test-threads=1

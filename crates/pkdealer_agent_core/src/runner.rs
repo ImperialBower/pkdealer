@@ -5,14 +5,36 @@ use std::time::Duration;
 use pkdealer_proto::dealer::{
     ActRequest, ActionType, AgentFidelity as ProtoAgentFidelity, EventType, GetNextToActRequest,
     GetStatusRequest, GetTableConfigRequest, NextToActInfo, PlayerAction as ProtoAction,
-    SeatPlayerAtRequest, SeatPlayerRequest, StartHandRequest, StreamEventsRequest, Street,
-    TableStatus, act_response, dealer_service_client::DealerServiceClient,
-    get_next_to_act_response, seat_player_at_response, seat_player_response,
+    PlayerState, SeatInfo as ProtoSeatInfo, SeatPlayerAtRequest, SeatPlayerRequest,
+    StartHandRequest, StreamEventsRequest, Street, TableStatus, act_response,
+    dealer_service_client::DealerServiceClient, get_next_to_act_response, seat_player_at_response,
+    seat_player_response,
 };
 
-use crate::{AgentError, AgentFidelity, Decision, HandState, PokerAgent, hand_state::street_name};
+use crate::{
+    AgentError, AgentFidelity, Decision, HandState, PokerAgent, SeatSnapshot,
+    hand_state::{seat_state_is_active, street_name},
+};
 
 const PLAYER_TOKEN_METADATA_KEY: &str = "x-player-token";
+
+/// Projects one protobuf seat view into a [`SeatSnapshot`].
+///
+/// Returns `None` when the seat number does not fit a `u8` (it is then dropped
+/// from the agent's view). The proto `state` enum is decoded to determine
+/// `is_active`; an unrecognized value degrades to inactive
+/// ([`PlayerState::Unspecified`]).
+fn seat_snapshot(s: &ProtoSeatInfo) -> Option<SeatSnapshot> {
+    let seat = u8::try_from(s.seat_number).ok()?;
+    let state = PlayerState::try_from(s.state).unwrap_or(PlayerState::Unspecified);
+    Some(SeatSnapshot {
+        seat,
+        name: s.player_name.clone(),
+        chips: s.chips,
+        bet: s.bet,
+        is_active: seat_state_is_active(state),
+    })
+}
 
 /// Configuration for connecting and seating an agent at a pkdealer table.
 ///
@@ -261,17 +283,13 @@ async fn decide_and_act<A: PokerAgent>(
         .iter()
         .find(|s| s.seat_number == u32::from(my_seat))
         .map_or(0, |s| s.chips);
-    let stacks: Vec<(u8, String, u32)> = status
-        .seats
-        .iter()
-        .filter_map(|s| {
-            u8::try_from(s.seat_number)
-                .ok()
-                .map(|n| (n, s.player_name.clone(), s.chips))
-        })
-        .collect();
+    let stacks: Vec<SeatSnapshot> = status.seats.iter().filter_map(seat_snapshot).collect();
     let street_str =
         street_name(Street::try_from(status.current_street).unwrap_or(Street::Unspecified));
+    // `button_seat` is populated by the service for spectator position tags; a
+    // hand is always in progress on this path (we only act on our turn), so it
+    // reflects the live dealer button.
+    let button_seat = u8::try_from(status.button_seat).ok();
 
     let hand_state = HandState {
         seat: my_seat,
@@ -284,6 +302,7 @@ async fn decide_and_act<A: PokerAgent>(
         big_blind: ctx.big_blind,
         street: street_str.to_string(),
         action_history: action_history.to_vec(),
+        button_seat,
     };
 
     let (intended, mut fidelity) = agent.decide_with_fidelity(&hand_state).await;
@@ -543,8 +562,51 @@ fn decision_to_proto(seat: u8, decision: &Decision, fidelity: &AgentFidelity) ->
 mod tests {
     use super::*;
 
+    fn proto_seat(seat_number: u32, chips: u32, bet: u32, state: PlayerState) -> ProtoSeatInfo {
+        ProtoSeatInfo {
+            seat_number,
+            player_name: format!("p{seat_number}"),
+            chips,
+            cards: String::new(),
+            state: state as i32,
+            withdrawn: 0,
+            chips_in_play: 0,
+            profit_loss: 0,
+            bet,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_micro_usd: 0,
+        }
+    }
+
     #[test]
-    fn test_agent_config_construction_happy_path() {
+    fn seat_snapshot_threads_bet_and_active_state() {
+        // A raised seat is contesting the pot, and its street bet is carried through.
+        assert_eq!(
+            seat_snapshot(&proto_seat(2, 9_500, 250, PlayerState::Raised)),
+            Some(SeatSnapshot {
+                seat: 2,
+                name: "p2".to_string(),
+                chips: 9_500,
+                bet: 250,
+                is_active: true,
+            })
+        );
+    }
+
+    #[test]
+    fn seat_snapshot_folded_is_inactive() {
+        let folded = seat_snapshot(&proto_seat(1, 8_000, 0, PlayerState::Folded));
+        assert_eq!(folded.map(|s| s.is_active), Some(false));
+    }
+
+    #[test]
+    fn seat_snapshot_rejects_out_of_range_seat() {
+        assert!(seat_snapshot(&proto_seat(999, 1, 0, PlayerState::Called)).is_none());
+    }
+
+    #[test]
+    fn agent_config_construction_happy_path() {
         let cfg = AgentConfig {
             endpoint: "http://localhost:50051".to_string(),
             name: "test-agent".to_string(),
@@ -560,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_config_with_specific_seat() {
+    fn agent_config_with_specific_seat() {
         let cfg = AgentConfig {
             endpoint: "http://localhost:50051".to_string(),
             name: "seated".to_string(),
@@ -573,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_config_clone() {
+    fn agent_config_clone() {
         let cfg = AgentConfig {
             endpoint: "http://localhost:50051".to_string(),
             name: "orig".to_string(),
@@ -587,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decision_to_proto_fold() {
+    fn decision_to_proto_fold() {
         let action = decision_to_proto(3, &Decision::Fold, &AgentFidelity::default());
         assert_eq!(action.seat, 3);
         assert_eq!(action.action_type, ActionType::Fold as i32);
@@ -595,21 +657,21 @@ mod tests {
     }
 
     #[test]
-    fn test_decision_to_proto_check() {
+    fn decision_to_proto_check() {
         let action = decision_to_proto(5, &Decision::Check, &AgentFidelity::default());
         assert_eq!(action.action_type, ActionType::Check as i32);
         assert_eq!(action.amount, 0);
     }
 
     #[test]
-    fn test_decision_to_proto_call() {
+    fn decision_to_proto_call() {
         let action = decision_to_proto(2, &Decision::Call, &AgentFidelity::default());
         assert_eq!(action.action_type, ActionType::Call as i32);
         assert_eq!(action.amount, 0);
     }
 
     #[test]
-    fn test_decision_to_proto_bet() {
+    fn decision_to_proto_bet() {
         let action = decision_to_proto(1, &Decision::Bet(250), &AgentFidelity::default());
         assert_eq!(action.seat, 1);
         assert_eq!(action.action_type, ActionType::Bet as i32);
@@ -617,21 +679,21 @@ mod tests {
     }
 
     #[test]
-    fn test_decision_to_proto_raise() {
+    fn decision_to_proto_raise() {
         let action = decision_to_proto(0, &Decision::Raise(400), &AgentFidelity::default());
         assert_eq!(action.action_type, ActionType::Raise as i32);
         assert_eq!(action.amount, 400);
     }
 
     #[test]
-    fn test_decision_to_proto_all_in() {
+    fn decision_to_proto_all_in() {
         let action = decision_to_proto(7, &Decision::AllIn, &AgentFidelity::default());
         assert_eq!(action.action_type, ActionType::AllIn as i32);
         assert_eq!(action.amount, 0);
     }
 
     #[test]
-    fn test_decision_to_proto_seat_encoded() {
+    fn decision_to_proto_seat_encoded() {
         let action = decision_to_proto(8, &Decision::Fold, &AgentFidelity::default());
         assert_eq!(action.seat, 8);
     }

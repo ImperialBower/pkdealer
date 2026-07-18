@@ -36,17 +36,17 @@ are wire-format-safe — but know that they are inert on the current path.
 
 | Knob | Consumed by `RuleBasedDecider`? | Effective over the pkdealer gRPC wire? |
 |---|---|---|
-| `equity` | ✅ yes | ✅ **Yes.** Hole cards + board + active stacks are all supplied, so `fast`/`exact` route through the real equity engine. |
+| `equity` | ✅ yes | ✅ **Yes.** Hole cards + board + *live* stacks are supplied, so `fast`/`exact` route through the real equity engine. The snapshot now marks folded/busted seats inactive, so equity is computed against the true live opponent count. |
 | `pot_odds.discipline` | ✅ yes | ✅ **Yes.** Applied on every equity-based call decision (i.e. when hole cards are known). |
-| `ranges` | ✅ yes | ⚠️ **Not yet.** `position_aware` needs `TableSnapshot::position()`, which needs `dealer_button` + `logical_seat`. pkdealer currently sends both as `None`, so it falls back to `flat`. Also requires the profile to have a `playbook`. |
-| `exploit` | ✅ yes | ⚠️ **Not yet.** Needs `opponent_stats` on the snapshot; pkdealer sends `None`, so any setting no-ops. |
+| `ranges` | ✅ yes | ✅ **Yes.** `position_aware` needs `TableSnapshot::position()` (i.e. `dealer_button` + `logical_seat`); pkdealer now threads the button through and derives both, so a profile with a `playbook` gets position-aware open-raise ranges. All built-in profiles carry playbooks. |
+| `exploit` | ✅ yes | ✅ **Yes, with `--spectator-token`.** When `exploit` is `light`/`heavy`, the agent pulls completed-hand history from the service (`ExportSession`), rebuilds a pkcore `StatsRegistry`, and threads it onto the snapshot with each seat's real `player_id`, so `adjust_profile` engages against live opponents. Inert (falls back to `None`) if the spectator token is missing or no hands have completed yet. |
 | `outs` | ❌ no | ❌ **Inert.** Config-only in 0.3.0; the shipped decider does not read it (EPIC-36 follow-on). |
 | `preflop_charts` | ❌ no | ❌ **Inert.** Config-only in 0.3.0 (`hup`/`solver` are follow-on; see the pkcore EPIC-36 corrigendum). |
 
-> **Bottom line:** over the live docker/gRPC table, `equity` and
-> `pot_odds.discipline` are the two knobs that change how your bot plays right
-> now. The rest round-trip safely and are ready for when the wire is widened —
-> see [Closing the wire gap](#closing-the-wire-gap).
+> **Bottom line:** over the live docker/gRPC table, `equity`,
+> `pot_odds.discipline`, `ranges`, and now `exploit` (given a spectator token)
+> change how your bot plays right now. `outs` / `preflop_charts` wait on the
+> pkcore decider — see [Closing the wire gap](#closing-the-wire-gap).
 
 The `equity` feature is compiled in because `pkdealer_agent_rules` depends on
 pkcore with default features on (`equity` is a default), plus `bot-profiles`.
@@ -108,16 +108,26 @@ value untouched:
 | `--outs` | `off`, `on` |
 | `--exploit` | `off`, `light`, `heavy` |
 | `--preflop-charts` | `off`, `hup`, `solver` |
+| `--spectator-token <s>` | Spectator token for `ExportSession`; only used when `--exploit` is `light`/`heavy`. Env `PKDEALER_SPECTATOR_TOKEN`, default `spectator`. |
 
 ```bash
 # gto personality, but force Monte-Carlo equity + looser calling
 cargo run --bin pkdealer_agent_rules -- \
     --name loosey --profile gto \
     --equity fast --equity-samples 4000 --pot-odds-discipline 0.4
+
+# gto personality, exploiting opponents from their completed-hand history
+# (needs the service's spectator token; matches PKDEALER_SPECTATOR_TOKEN)
+cargo run --bin pkdealer_agent_rules -- \
+    --name shark --profile gto \
+    --exploit heavy --spectator-token spectator
 ```
 
 When any override fires, the agent logs the resulting `decision` config at
-startup so you can confirm what took effect.
+startup so you can confirm what took effect. With `--exploit light|heavy`, the
+agent also logs `exploit enabled: pulling opponent stats via ExportSession` once
+the connection is up (or a warning if the token/connection is missing, in which
+case it plays without opponent stats).
 
 ---
 
@@ -201,9 +211,9 @@ decision:
 ```
 
 > Over the live gRPC wire the measurable gap between these two comes from
-> `equity` and `pot_odds.discipline` (see the matrix above). `strong_all_on`
-> also sets `ranges: position_aware`, which needs the button/logical-seat wire
-> extension to bite — until then it degrades to `flat` for both bots.
+> `equity`, `pot_odds.discipline`, and `ranges` (see the matrix above).
+> `strong_all_on`'s `ranges: position_aware` now engages because the snapshot
+> carries the dealer button; `weak_all_off` stays on `flat`.
 
 ### E. Toggling a profile's knob back off
 
@@ -240,21 +250,35 @@ cargo run --bin pkdealer_agent_rules -- --profile strong_all_on --equity off --r
 
 ## Closing the wire gap
 
-To make `ranges: position_aware` and `exploit` effective over gRPC, widen
-`hand_state_to_snapshot` in `crates/pkdealer_agent_rules/src/main.rs` so the
-`TableSnapshot` it builds carries the data those knobs consult:
-
-- **`ranges: position_aware`** needs `dealer_button` and `logical_seat` (so
-  `TableSnapshot::position()` returns `Some`) plus a `playbook` on the profile.
-  All the built-in profiles (`gto`, `tight_aggressive`, …) already carry
-  playbooks; the missing piece is button/seat info from the `HandState`.
-- **`exploit`** needs `opponent_stats: Some(&StatsRegistry)` — i.e. per-player
-  aggregates threaded through from the service.
-
-Both fields are currently hard-coded to `None`. Nothing in the profile format
-changes when they land: existing `decision:` blocks already name these knobs, so
-a bot configured for them today simply starts honoring them once the wire
-carries the data.
+- **`ranges: position_aware` — done.** `HandState` now carries `button_seat`
+  (from `TableStatus.button_seat`) and each seat's `bet` / `is_active`;
+  `hand_state_to_snapshot` in `crates/pkdealer_agent_rules/src/main.rs` derives
+  `dealer_button` + `logical_seat` from them, so `TableSnapshot::position()`
+  resolves and position-aware ranges engage for any profile with a `playbook`.
+  The same change feeds `equity` the correct *live* opponent count (folded /
+  busted seats are excluded), sharpening `--equity fast|exact`.
+- **`exploit` — done (interim path).** When `exploit` is enabled, `RulesAgent`
+  opens a second gRPC connection and, on a `GetSessionInfo` hand-count throttle,
+  pulls the service's completed-hand `HandCollection` via `ExportSession`
+  (JSON), `ingest_collection`s it into a `StatsRegistry`, and threads it plus a
+  `seat → player_id` map onto the snapshot (`snapshot_with_stats` in
+  `crates/pkdealer_agent_rules/src/main.rs`). `RuleBasedDecider` then runs
+  `exploit::adjust_profile` against the largest active opponent's real stats.
+  Because `ExportSession`'s payload carries every hole card, the service gates it
+  on the spectator token, so this requires `--spectator-token` (env
+  `PKDEALER_SPECTATOR_TOKEN`); absent it, the agent logs a warning and plays with
+  `opponent_stats: None`, exactly as before. Nothing in the profile format
+  changed — existing `decision:` blocks already name the knob.
+  - **Cleaner target (later): pkcore EPIC-26a.** This interim path re-ingests
+    the whole collection on the agent side because pkcore's `StatsRegistry` can
+    only be built by ingesting `HandHistory`. pkcore EPIC-26a
+    (`StatsRegistry_Serialization`) adds `Serialize`/`Deserialize` +
+    reconstruction to the registry; once released, the service can build the
+    registry once and ship it serialized, and the agent deserializes it directly
+    — no full-history transfer, no re-ingest.
+- **`outs` / `preflop_charts` — upstream.** The shipped pkcore `RuleBasedDecider`
+  does not read these yet; they become effective when pkcore wires them into the
+  decider (EPIC-36 follow-on), with no pkdealer change required.
 
 ---
 

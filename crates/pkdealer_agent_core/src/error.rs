@@ -68,39 +68,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_agent_error_seat_display() {
+    fn agent_error_seat_display() {
         let e = AgentError::Seat("all seats taken".to_string());
         assert_eq!(e.to_string(), "seat failed: all seats taken");
     }
 
     #[test]
-    fn test_agent_error_rpc_display() {
+    fn agent_error_rpc_display() {
         let status = tonic::Status::not_found("table not found");
         let e = AgentError::Rpc(status);
         assert!(e.to_string().contains("gRPC error"));
     }
 
     #[test]
-    fn test_agent_error_seat_debug() {
+    fn agent_error_seat_debug() {
         let e = AgentError::Seat("err".to_string());
         assert!(format!("{e:?}").contains("Seat"));
     }
 
     #[test]
-    fn test_from_tonic_status() {
+    fn from_tonic_status() {
         let status = tonic::Status::internal("oops");
         let e: AgentError = status.into();
         assert!(matches!(e, AgentError::Rpc(_)));
     }
 
     #[test]
-    fn test_error_source_seat_is_none() {
+    fn error_source_seat_is_none() {
         let e = AgentError::Seat("x".to_string());
         assert!(std::error::Error::source(&e).is_none());
     }
 
     #[test]
-    fn test_error_source_rpc_is_none() {
+    fn error_source_rpc_is_none() {
         let e = AgentError::Rpc(tonic::Status::ok(""));
         assert!(std::error::Error::source(&e).is_none());
     }

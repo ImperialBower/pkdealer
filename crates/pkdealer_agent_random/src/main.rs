@@ -128,6 +128,7 @@ mod tests {
             big_blind: 100,
             street: "preflop".to_string(),
             action_history: vec![],
+            button_seat: None,
         }
     }
 
@@ -140,7 +141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_random_agent_legal_actions_with_to_call() {
+    async fn random_agent_legal_actions_with_to_call() {
         let agent = RandomAgent;
         let state = state_with_call();
         let decision = agent.decide(&state).await;
@@ -154,7 +155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_random_agent_legal_actions_without_to_call() {
+    async fn random_agent_legal_actions_without_to_call() {
         let agent = RandomAgent;
         let state = state_no_call();
         let decision = agent.decide(&state).await;
@@ -165,7 +166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_random_agent_raise_at_least_to_call() {
+    async fn random_agent_raise_at_least_to_call() {
         let agent = RandomAgent;
         let state = state_with_call();
         for _ in 0..200 {
@@ -180,7 +181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_random_agent_bet_at_least_big_blind() {
+    async fn random_agent_bet_at_least_big_blind() {
         let agent = RandomAgent;
         let state = state_no_call();
         for _ in 0..200 {
@@ -195,7 +196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_random_agent_all_three_actions_appear_with_call() {
+    async fn random_agent_all_three_actions_appear_with_call() {
         let agent = RandomAgent;
         let state = state_with_call();
         let (mut saw_fold, mut saw_call, mut saw_raise) = (false, false, false);
@@ -216,7 +217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_random_agent_both_actions_appear_without_call() {
+    async fn random_agent_both_actions_appear_without_call() {
         let agent = RandomAgent;
         let state = state_no_call();
         let (mut saw_check, mut saw_bet) = (false, false);
@@ -235,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn test_args_defaults() {
+    fn args_defaults() {
         let args =
             Args::try_parse_from(["pkdealer_agent_random"]).expect("default args should parse");
         assert_eq!(args.endpoint, "http://127.0.0.1:50051");
@@ -246,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_args_with_name_and_seat() {
+    fn args_with_name_and_seat() {
         let args = Args::try_parse_from([
             "pkdealer_agent_random",
             "--name",
@@ -263,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn test_args_with_endpoint() {
+    fn args_with_endpoint() {
         let args = Args::try_parse_from([
             "pkdealer_agent_random",
             "--endpoint",

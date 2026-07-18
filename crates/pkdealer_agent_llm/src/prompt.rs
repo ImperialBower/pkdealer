@@ -13,7 +13,7 @@ use pkdealer_agent_core::HandState;
 /// # Examples
 ///
 /// ```rust
-/// use pkdealer_agent_core::HandState;
+/// use pkdealer_agent_core::{HandState, SeatSnapshot};
 /// use pkdealer_agent_llm::build_prompt;
 ///
 /// let state = HandState {
@@ -23,10 +23,11 @@ use pkdealer_agent_core::HandState;
 ///     pot: 200,
 ///     to_call: 100,
 ///     my_chips: 9_900,
-///     stacks: vec![(0, "alice".to_string(), 9_900)],
+///     stacks: vec![SeatSnapshot { seat: 0, name: "alice".to_string(), chips: 9_900, bet: 100, is_active: true }],
 ///     big_blind: 100,
 ///     street: "preflop".to_string(),
 ///     action_history: vec![],
+///     button_seat: Some(0),
 /// };
 /// let prompt = build_prompt(&state);
 /// assert!(prompt.contains("Ah Kd"));
@@ -43,7 +44,7 @@ pub fn build_prompt(state: &HandState) -> String {
     let stacks_str = state
         .stacks
         .iter()
-        .map(|(seat, name, chips)| format!("seat {seat} {name}: {chips}"))
+        .map(|s| format!("seat {} {}: {}", s.seat, s.name, s.chips))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -99,6 +100,7 @@ pub fn build_prompt(state: &HandState) -> String {
 ///     big_blind: 100,
 ///     street: "flop".to_string(),
 ///     action_history: vec![],
+///     button_seat: None,
 /// };
 /// let odds = pot_odds(&state);
 /// assert!((odds - 0.25).abs() < 1e-9);
@@ -119,6 +121,7 @@ pub fn pot_odds(state: &HandState) -> f64 {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+    use pkdealer_agent_core::SeatSnapshot;
 
     fn sample_state() -> HandState {
         HandState {
@@ -129,12 +132,25 @@ mod tests {
             to_call: 100,
             my_chips: 9_700,
             stacks: vec![
-                (0, "alice".to_string(), 10_000),
-                (1, "bob".to_string(), 9_700),
+                SeatSnapshot {
+                    seat: 0,
+                    name: "alice".to_string(),
+                    chips: 10_000,
+                    bet: 100,
+                    is_active: true,
+                },
+                SeatSnapshot {
+                    seat: 1,
+                    name: "bob".to_string(),
+                    chips: 9_700,
+                    bet: 0,
+                    is_active: true,
+                },
             ],
             big_blind: 100,
             street: "flop".to_string(),
             action_history: vec!["alice bets 100".to_string()],
+            button_seat: Some(0),
         }
     }
 

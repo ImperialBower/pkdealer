@@ -57,11 +57,13 @@
 //! |----------|---------|---------|
 //! | `PKDEALER_ENDPOINT` | `http://127.0.0.1:50051` | Override `--endpoint` |
 
+use std::collections::HashMap;
 use std::process;
 
 use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use pkcore::Forgiving;
+use pkcore::analysis::player_stats::StatsRegistry;
 use pkcore::bot::decider::{BotDecider, RuleBasedDecider};
 use pkcore::bot::decision_config::{
     EquityMode, ExploitMode, PotOddsConfig, PreflopCharts, RangeMode, Toggle,
@@ -72,8 +74,18 @@ use pkcore::bot::table_snapshot::{SeatInfo, TableSnapshot};
 use pkcore::cards::Cards;
 use pkcore::games::GamePhase;
 use pkcore::games::betting_structure::{BetTier, BettingStructure};
+use pkcore::hand_history::HandCollection;
 use pkdealer_agent_core::{AgentConfig, Decision, HandState, PokerAgent, run_agent};
+use pkdealer_proto::dealer::dealer_service_client::DealerServiceClient;
+use pkdealer_proto::dealer::{ExportSessionRequest, GetSessionInfoRequest, RecordFormat};
+use tokio::sync::Mutex;
+use tonic::transport::Channel;
 use uuid::Uuid;
+
+/// gRPC metadata key carrying the caller's auth/visibility token. Mirrors
+/// `PLAYER_TOKEN_METADATA_KEY` in the service; `ExportSession` requires the
+/// spectator token here because its payload carries every seat's hole cards.
+const PLAYER_TOKEN_METADATA_KEY: &str = "x-player-token";
 
 /// Rule-based poker bot connected to a pkdealer gRPC service.
 #[derive(Debug, Parser)]
@@ -131,15 +143,26 @@ struct Args {
     #[arg(long, value_enum)]
     outs: Option<ToggleArg>,
 
-    /// Override opponent-adjusted exploitation. Engages only when the table
-    /// snapshot carries opponent stats, so it is a no-op on the current
-    /// pkdealer wire (which supplies none). Omit to keep the profile's setting.
+    /// Override opponent-adjusted exploitation. When enabled (`light`/`heavy`),
+    /// the agent pulls completed-hand history from the service via
+    /// `ExportSession` and feeds the decider real opponent stats, so the
+    /// adjustment engages against live opponents. Requires `--spectator-token`
+    /// (the service gates `ExportSession`). Omit to keep the profile's setting.
     #[arg(long, value_enum)]
     exploit: Option<ExploitArg>,
 
     /// Override the preflop decision-chart source. Omit to keep the profile's setting.
     #[arg(long, value_enum)]
     preflop_charts: Option<PreflopChartsArg>,
+
+    /// Spectator token used to pull completed-hand histories via `ExportSession`
+    /// when `exploit` is enabled. The service gates `ExportSession` on this token
+    /// (its payload carries every seat's hole cards), so opponent-stat
+    /// exploitation only engages when the operator hands the bot this shared
+    /// secret. Matches the service's `PKDEALER_SPECTATOR_TOKEN` (default
+    /// `spectator`). Ignored when `exploit` resolves to `off`.
+    #[arg(long, env = "PKDEALER_SPECTATOR_TOKEN", default_value = "spectator")]
+    spectator_token: String,
 }
 
 /// CLI mirror of [`EquityMode`] (the `samples` budget comes from `--equity-samples`).
@@ -259,16 +282,166 @@ fn apply_decision_overrides(profile: &mut BotProfile, args: &Args) -> bool {
 
 struct RulesAgent {
     profile: BotProfile,
+    /// Opponent-stat source, present only when `profile.decision.exploit` is not
+    /// `Off` and a service connection for `ExportSession` was established. When
+    /// `None`, the agent behaves exactly as it did before opponent stats were
+    /// wired: the snapshot carries `opponent_stats: None` and the `exploit` knob
+    /// is inert (see [`ExploitPuller`]).
+    exploit: Option<ExploitPuller>,
 }
 
 #[async_trait]
 impl PokerAgent for RulesAgent {
     /// Converts the gRPC-derived [`HandState`] into a pkcore [`TableSnapshot`]
     /// and delegates the decision to [`RuleBasedDecider`].
+    ///
+    /// When an [`ExploitPuller`] is attached, it first refreshes the per-player
+    /// [`StatsRegistry`] from the service's completed-hand history (throttled to
+    /// only re-ingest when a new hand has finished) and threads it — plus the
+    /// derived `seat → player_id` map — onto the snapshot so the decider's
+    /// `exploit` path engages against the real opponents.
     async fn decide(&self, state: &HandState) -> Decision {
+        if let Some(puller) = &self.exploit {
+            puller.refresh().await;
+            let guard = puller.state.lock().await;
+            let snapshot = snapshot_with_stats(state, Some(&guard.registry), &guard.seat_ids);
+            return pkcore_action_to_decision(RuleBasedDecider.decide(&self.profile, &snapshot));
+        }
         let snapshot = hand_state_to_snapshot(state);
         pkcore_action_to_decision(RuleBasedDecider.decide(&self.profile, &snapshot))
     }
+}
+
+/// Pulls completed-hand history from the pkdealer service and maintains the
+/// per-player [`StatsRegistry`] the decider's `exploit` path reads.
+///
+/// pkdealer splits hand *recording* (the service holds the authoritative
+/// `HandCollection`) from *deciding* (this agent), and pkcore's `StatsRegistry`
+/// can only be built by ingesting `HandHistory`. So the puller re-ingests the
+/// service's collection on its own gRPC connection: a cheap `GetSessionInfo`
+/// throttle re-exports and rebuilds only when the completed-hand count has
+/// grown. See `docs/GUIDE_Bot_Decision_Capabilities.md` → "Closing the wire
+/// gap" and pkcore EPIC-26a for the future serialize-the-registry path.
+struct ExploitPuller {
+    /// Dedicated connection for `GetSessionInfo` / `ExportSession`, separate
+    /// from the play connection owned by `run_agent`. `tokio::Mutex` because the
+    /// generated client needs `&mut self` per call and `decide` only has `&self`.
+    client: Mutex<DealerServiceClient<Channel>>,
+    /// Spectator token presented on `ExportSession` (the service gates it).
+    spectator_token: String,
+    /// The evolving registry, its `seat → player_id` map, and the last ingested
+    /// hand count (the throttle watermark).
+    state: Mutex<ExploitState>,
+}
+
+/// The mutable read the [`ExploitPuller`] maintains across decisions.
+#[derive(Default)]
+struct ExploitState {
+    /// Per-player aggregates keyed by `player_id`, rebuilt on each ingest.
+    registry: StatsRegistry,
+    /// Latest `seat → player_id` mapping, so snapshot seats carry the id the
+    /// decider looks up in `registry`.
+    seat_ids: HashMap<u8, Uuid>,
+    /// Completed-hand count at the last successful ingest; the `GetSessionInfo`
+    /// throttle skips re-export while this is unchanged.
+    last_hand_count: u32,
+}
+
+impl ExploitPuller {
+    /// Refreshes [`ExploitState`] from the service, but only when a new hand has
+    /// completed. Best-effort: any transport, auth, or parse failure leaves the
+    /// existing stats in place (the decider then adjusts on slightly stale — or,
+    /// on the very first hand, empty — reads rather than failing the decision).
+    async fn refresh(&self) {
+        let count = {
+            let mut client = self.client.lock().await;
+            match client.get_session_info(GetSessionInfoRequest {}).await {
+                Ok(resp) => resp.into_inner().hand_count,
+                Err(_) => return,
+            }
+        };
+        if count == 0 || count == self.state.lock().await.last_hand_count {
+            return;
+        }
+
+        let mut request = tonic::Request::new(ExportSessionRequest {
+            format: RecordFormat::Json as i32,
+            drain: false,
+        });
+        if let Ok(value) = self.spectator_token.parse() {
+            request
+                .metadata_mut()
+                .insert(PLAYER_TOKEN_METADATA_KEY, value);
+        }
+        let payload = {
+            let mut client = self.client.lock().await;
+            match client.export_session(request).await {
+                Ok(resp) => resp.into_inner().payload,
+                Err(_) => return,
+            }
+        };
+        let Ok(collection) = serde_json::from_str::<HandCollection>(&payload) else {
+            return;
+        };
+
+        let mut state = self.state.lock().await;
+        state.registry = build_registry(&collection);
+        state.seat_ids = seat_ids_from_collection(&collection);
+        state.last_hand_count = count;
+        eprintln!(
+            "[exploit] ingested {count} hands → {} players tracked",
+            state.registry.len()
+        );
+    }
+}
+
+/// Builds a fresh [`StatsRegistry`] by ingesting every completed hand in
+/// `collection`. Rebuilt wholesale (rather than incrementally) each refresh:
+/// `ingest_collection` is idempotent over a full collection and keeps the map
+/// exactly consistent with what the service holds.
+fn build_registry(collection: &HandCollection) -> StatsRegistry {
+    let mut registry = StatsRegistry::new();
+    registry.ingest_collection(collection);
+    registry
+}
+
+/// Derives the current `seat → player_id` map from a hand collection: the last
+/// recorded hand that seats a player wins, so the map reflects who currently
+/// occupies each seat. Delegates the latest-wins fold to [`latest_seat_ids`].
+fn seat_ids_from_collection(collection: &HandCollection) -> HashMap<u8, Uuid> {
+    latest_seat_ids(collection.hands().iter().flat_map(|hand| {
+        hand.players
+            .iter()
+            .map(|player| (player.seat, player.player_id))
+    }))
+}
+
+/// Folds `(seat, player_id)` pairs into a `seat → id` map, keeping the last id
+/// seen per seat and skipping seats whose `player_id` is `None` (legacy hands).
+/// Iteration order is the collection's hand order, so "last wins" == "most
+/// recent hand wins".
+fn latest_seat_ids(entries: impl Iterator<Item = (u8, Option<Uuid>)>) -> HashMap<u8, Uuid> {
+    let mut map = HashMap::new();
+    for (seat, id) in entries {
+        if let Some(id) = id {
+            map.insert(seat, id);
+        }
+    }
+    map
+}
+
+/// Returns the logical position (0-based index) of `seat` within the sorted
+/// list of occupied `seats`, or `None` when `seat` is not occupied.
+///
+/// pkcore's [`TableSnapshot::position`] expresses `dealer_button` and
+/// `logical_seat` as indices into the sorted occupied-seat list (`0` = earliest
+/// occupied seat), *not* as raw seat numbers, so raw seat numbers must be
+/// projected through this before they are stored on the snapshot.
+fn logical_index(sorted_seats: &[u8], seat: u8) -> Option<u8> {
+    sorted_seats
+        .iter()
+        .position(|&s| s == seat)
+        .and_then(|i| u8::try_from(i).ok())
 }
 
 /// Converts a [`HandState`] into a pkcore [`TableSnapshot`].
@@ -276,24 +449,49 @@ impl PokerAgent for RulesAgent {
 /// `current_bet` is approximated as `to_call` and `min_raise` as `big_blind`;
 /// the runner's floor-raise correction handles any undersized raise amounts.
 ///
+/// Each seat's `bet` and `is_active` flags are carried straight through from the
+/// [`HandState`]. `is_active` matters for the equity path: pkcore counts *live*
+/// opponents (folded / busted seats excluded) when it estimates multi-way
+/// equity, so passing the real flag keeps `--equity fast|exact` from
+/// systematically understating the hero's equity.
+///
+/// `dealer_button` and `logical_seat` are derived from `state.button_seat` and
+/// `state.seat` by projecting both raw seat numbers into logical positions over
+/// the sorted occupied-seat list (see [`logical_index`]). This makes
+/// `TableSnapshot::position` resolve, which is what `ranges: position_aware`
+/// consults. When `button_seat` is `None` (no button known), `dealer_button`
+/// stays `None` and the decider falls back to the flat range.
+///
 /// `hole_cards` and `board` are parsed from their space-separated index
 /// notation (e.g. `"Ah Kd"`) so that [`RuleBasedDecider`] runs its
 /// hand-strength *equity* path. When a card field is empty (e.g. `board`
 /// before the flop) or contains an unparseable token, [`Cards::forgiving_from_str`]
 /// yields what it can — an empty [`Cards`] in the empty case — and the decider
 /// falls back to its aggression-factor path for that decision.
-fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot<'static> {
+///
+/// `opponent_stats` is threaded straight onto the snapshot for the decider's
+/// `exploit` path; pass `None` (see [`hand_state_to_snapshot`]) to preserve the
+/// historical no-stats behavior. `seat_ids` supplies each seat's pkcore
+/// `player_id` so `SeatInfo::id` matches the registry keys the decider looks up;
+/// a seat absent from the map gets a fresh random id (which never matches a
+/// registry entry, so it simply contributes no opponent read).
+fn snapshot_with_stats<'a>(
+    state: &HandState,
+    opponent_stats: Option<&'a StatsRegistry>,
+    seat_ids: &HashMap<u8, Uuid>,
+) -> TableSnapshot<'a> {
     let stacks: Vec<SeatInfo> = state
         .stacks
         .iter()
-        .map(|(seat, name, chips)| SeatInfo {
-            id: Uuid::new_v4(),
-            seat: *seat,
-            name: name.clone(),
+        .map(|s| SeatInfo {
+            id: seat_ids.get(&s.seat).copied().unwrap_or_else(Uuid::new_v4),
+            seat: s.seat,
+            name: s.name.clone(),
             #[allow(clippy::cast_possible_truncation)]
-            chips: *chips as usize,
-            bet: 0,
-            is_active: true,
+            chips: s.chips as usize,
+            #[allow(clippy::cast_possible_truncation)]
+            bet: s.bet as usize,
+            is_active: s.is_active,
         })
         .collect();
 
@@ -305,6 +503,15 @@ fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot<'static> {
     };
 
     let seat_count = u8::try_from(stacks.len()).unwrap_or(u8::MAX);
+
+    // Logical positions index into the sorted list of occupied seats, which is
+    // what `TableSnapshot::position()` expects — not raw seat numbers.
+    let mut occupied: Vec<u8> = state.stacks.iter().map(|s| s.seat).collect();
+    occupied.sort_unstable();
+    let logical_seat = logical_index(&occupied, state.seat);
+    let dealer_button = state
+        .button_seat
+        .and_then(|button| logical_index(&occupied, button));
 
     #[allow(clippy::cast_possible_truncation)]
     TableSnapshot {
@@ -322,11 +529,19 @@ fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot<'static> {
         betting_structure: BettingStructure::default(),
         bet_tier: BetTier::default(),
         checked_this_street: false,
-        dealer_button: None,
+        dealer_button,
         seat_count,
-        logical_seat: None,
-        opponent_stats: None,
+        logical_seat,
+        opponent_stats,
     }
+}
+
+/// Converts a [`HandState`] into a pkcore [`TableSnapshot`] with no opponent
+/// stats attached — the historical behavior used by every non-`exploit` bot and
+/// by the unit tests. Delegates to [`snapshot_with_stats`] with `None` and an
+/// empty seat-id map (so `SeatInfo::id`s are fresh randoms, as before).
+fn hand_state_to_snapshot(state: &HandState) -> TableSnapshot<'static> {
+    snapshot_with_stats(state, None, &HashMap::new())
 }
 
 /// Converts a pkcore [`PkcoreAction`] into an agent-core [`Decision`].
@@ -392,6 +607,41 @@ fn load_profile(spec: &str) -> Result<BotProfile, Box<dyn std::error::Error>> {
     Ok(BotProfile::from_file(spec)?)
 }
 
+/// Builds an [`ExploitPuller`] when the profile enables the `exploit` knob,
+/// opening a dedicated `ExportSession` connection to `endpoint`.
+///
+/// Returns `None` — leaving the `exploit` path inert and adding no extra
+/// connection — in the common case (`exploit: off`) and, best-effort, when the
+/// connection cannot be established (the agent still plays without opponent
+/// stats rather than failing to start).
+async fn connect_exploit_puller(
+    profile: &BotProfile,
+    endpoint: String,
+    spectator_token: String,
+    name: &str,
+) -> Option<ExploitPuller> {
+    if matches!(profile.decision.exploit, ExploitMode::Off) {
+        return None;
+    }
+    match DealerServiceClient::connect(endpoint).await {
+        Ok(client) => {
+            eprintln!("[{name}] exploit enabled: pulling opponent stats via ExportSession");
+            Some(ExploitPuller {
+                client: Mutex::new(client),
+                spectator_token,
+                state: Mutex::new(ExploitState::default()),
+            })
+        }
+        Err(e) => {
+            eprintln!(
+                "[{name}] exploit requested but the ExportSession connection failed ({e}); \
+                 playing without opponent stats"
+            );
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -411,6 +661,14 @@ async fn main() {
     }
     eprintln!("[{}] profile: {profile}", args.name);
 
+    let exploit = connect_exploit_puller(
+        &profile,
+        args.endpoint.clone(),
+        args.spectator_token,
+        &args.name,
+    )
+    .await;
+
     let config = AgentConfig {
         endpoint: args.endpoint,
         name: args.name,
@@ -419,7 +677,7 @@ async fn main() {
         client_secret: args.client_secret,
     };
 
-    if let Err(e) = run_agent(RulesAgent { profile }, config).await {
+    if let Err(e) = run_agent(RulesAgent { profile, exploit }, config).await {
         eprintln!("Agent error: {e}");
         process::exit(1);
     }
@@ -429,6 +687,7 @@ async fn main() {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use pkdealer_agent_core::SeatSnapshot;
 
     fn sample_state() -> HandState {
         HandState {
@@ -439,17 +698,30 @@ mod tests {
             to_call: 100,
             my_chips: 9_900,
             stacks: vec![
-                (0, "alice".to_string(), 9_900),
-                (1, "bob".to_string(), 10_000),
+                SeatSnapshot {
+                    seat: 0,
+                    name: "alice".to_string(),
+                    chips: 9_900,
+                    bet: 100,
+                    is_active: true,
+                },
+                SeatSnapshot {
+                    seat: 1,
+                    name: "bob".to_string(),
+                    chips: 10_000,
+                    bet: 0,
+                    is_active: true,
+                },
             ],
             big_blind: 100,
             street: "preflop".to_string(),
             action_history: vec![],
+            button_seat: Some(0),
         }
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_numeric_fields() {
+    fn hand_state_to_snapshot_numeric_fields() {
         let state = sample_state();
         let snap = hand_state_to_snapshot(&state);
         assert_eq!(snap.seat, 0);
@@ -461,7 +733,143 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_stacks() {
+    fn latest_seat_ids_keeps_most_recent_per_seat() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        // Seat 0 appears twice (hand order): the later id `c` wins. Seat 2 has
+        // no `player_id` (legacy hand) and is skipped entirely.
+        let map = latest_seat_ids(
+            [(0u8, Some(a)), (1u8, Some(b)), (2u8, None), (0u8, Some(c))].into_iter(),
+        );
+        assert_eq!(map.get(&0), Some(&c));
+        assert_eq!(map.get(&1), Some(&b));
+        assert_eq!(map.get(&2), None);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_with_stats_sets_seat_ids_and_attaches_registry() {
+        let state = sample_state();
+        let registry = StatsRegistry::new();
+        let known = Uuid::new_v4();
+        let mut seat_ids = HashMap::new();
+        seat_ids.insert(1u8, known); // seat 0 deliberately absent → random fallback
+        let snap = snapshot_with_stats(&state, Some(&registry), &seat_ids);
+        let seat1 = snap
+            .stacks
+            .iter()
+            .find(|s| s.seat == 1)
+            .expect("seat 1 present");
+        let seat0 = snap
+            .stacks
+            .iter()
+            .find(|s| s.seat == 0)
+            .expect("seat 0 present");
+        assert_eq!(
+            seat1.id, known,
+            "mapped seat takes its player_id from the map"
+        );
+        assert_ne!(seat0.id, known, "unmapped seat gets a fresh random id");
+        assert!(
+            snap.opponent_stats.is_some(),
+            "registry is threaded onto the snapshot"
+        );
+    }
+
+    #[test]
+    fn hand_state_to_snapshot_has_no_opponent_stats() {
+        // The no-stats wrapper preserves the historical (pre-exploit) behavior.
+        let snap = hand_state_to_snapshot(&sample_state());
+        assert!(snap.opponent_stats.is_none());
+    }
+
+    #[test]
+    fn build_registry_from_empty_collection_is_empty() {
+        assert!(build_registry(&HandCollection::new()).is_empty());
+    }
+
+    #[test]
+    fn logical_index_found_and_missing() {
+        let occupied = [2u8, 4, 5, 7];
+        assert_eq!(logical_index(&occupied, 2), Some(0));
+        assert_eq!(logical_index(&occupied, 5), Some(2));
+        assert_eq!(logical_index(&occupied, 7), Some(3));
+        assert_eq!(logical_index(&occupied, 3), None);
+    }
+
+    #[test]
+    fn hand_state_to_snapshot_threads_bet_and_active() {
+        // Seat 1 has folded; seat 0 has 100 in the pot this street.
+        let state = HandState {
+            stacks: vec![
+                SeatSnapshot {
+                    seat: 0,
+                    name: "alice".to_string(),
+                    chips: 9_900,
+                    bet: 100,
+                    is_active: true,
+                },
+                SeatSnapshot {
+                    seat: 1,
+                    name: "bob".to_string(),
+                    chips: 10_000,
+                    bet: 0,
+                    is_active: false,
+                },
+            ],
+            ..sample_state()
+        };
+        let snap = hand_state_to_snapshot(&state);
+        assert_eq!(snap.stacks[0].bet, 100);
+        assert!(snap.stacks[0].is_active);
+        assert_eq!(snap.stacks[1].bet, 0);
+        assert!(!snap.stacks[1].is_active, "folded seat must not be active");
+    }
+
+    #[test]
+    fn hand_state_to_snapshot_derives_logical_positions() {
+        // Non-contiguous occupied seats: 3 (hero) and 6 (button).
+        let state = HandState {
+            seat: 3,
+            button_seat: Some(6),
+            stacks: vec![
+                SeatSnapshot {
+                    seat: 3,
+                    name: "hero".to_string(),
+                    chips: 9_000,
+                    bet: 0,
+                    is_active: true,
+                },
+                SeatSnapshot {
+                    seat: 6,
+                    name: "villain".to_string(),
+                    chips: 9_000,
+                    bet: 0,
+                    is_active: true,
+                },
+            ],
+            ..sample_state()
+        };
+        let snap = hand_state_to_snapshot(&state);
+        // Sorted occupied = [3, 6]: hero is logical 0, button is logical 1.
+        assert_eq!(snap.logical_seat, Some(0));
+        assert_eq!(snap.dealer_button, Some(1));
+        // With both set, position() resolves (enables position_aware ranges).
+        assert!(snap.position().is_some());
+    }
+
+    #[test]
+    fn hand_state_to_snapshot_no_button_leaves_position_unresolved() {
+        let state = HandState {
+            button_seat: None,
+            ..sample_state()
+        };
+        let snap = hand_state_to_snapshot(&state);
+        assert_eq!(snap.dealer_button, None);
+        assert!(snap.position().is_none());
+    }
+
+    #[test]
+    fn hand_state_to_snapshot_stacks() {
         let state = sample_state();
         let snap = hand_state_to_snapshot(&state);
         assert_eq!(snap.stacks.len(), 2);
@@ -470,13 +878,13 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_phase_preflop() {
+    fn hand_state_to_snapshot_phase_preflop() {
         let snap = hand_state_to_snapshot(&sample_state());
         assert_eq!(snap.phase, GamePhase::BettingPreFlop);
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_phase_flop() {
+    fn hand_state_to_snapshot_phase_flop() {
         let state = HandState {
             street: "flop".to_string(),
             ..sample_state()
@@ -485,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_phase_turn() {
+    fn hand_state_to_snapshot_phase_turn() {
         let state = HandState {
             street: "turn".to_string(),
             ..sample_state()
@@ -494,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_phase_river() {
+    fn hand_state_to_snapshot_phase_river() {
         let state = HandState {
             street: "river".to_string(),
             ..sample_state()
@@ -506,13 +914,13 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_empty_board_is_default_cards() {
+    fn hand_state_to_snapshot_empty_board_is_default_cards() {
         let snap = hand_state_to_snapshot(&sample_state());
         assert!(snap.board.is_empty());
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_parses_hole_cards() {
+    fn hand_state_to_snapshot_parses_hole_cards() {
         // sample_state() has hole_cards "Ah Kd"; the snapshot must carry both
         // cards so RuleBasedDecider runs its equity path rather than the
         // card-blind fallback path.
@@ -521,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_parses_board() {
+    fn hand_state_to_snapshot_parses_board() {
         let state = HandState {
             board: "Ts 9s 8c".to_string(),
             street: "flop".to_string(),
@@ -532,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hand_state_to_snapshot_empty_board_stays_empty() {
+    fn hand_state_to_snapshot_empty_board_stays_empty() {
         let state = HandState {
             board: String::new(),
             street: "preflop".to_string(),
@@ -543,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_fold() {
+    fn pkcore_action_to_decision_fold() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::Fold),
             Decision::Fold
@@ -551,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_check() {
+    fn pkcore_action_to_decision_check() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::Check),
             Decision::Check
@@ -559,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_call() {
+    fn pkcore_action_to_decision_call() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::Call),
             Decision::Call
@@ -567,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_bet() {
+    fn pkcore_action_to_decision_bet() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::Bet(200)),
             Decision::Bet(200)
@@ -575,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_raise() {
+    fn pkcore_action_to_decision_raise() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::Raise(400)),
             Decision::Raise(400)
@@ -583,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pkcore_action_to_decision_all_in() {
+    fn pkcore_action_to_decision_all_in() {
         assert_eq!(
             pkcore_action_to_decision(PkcoreAction::AllIn),
             Decision::AllIn
@@ -591,13 +999,13 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_builtin_gto() {
+    fn load_profile_builtin_gto() {
         let p = load_profile("gto").expect("gto should load");
         assert_eq!(p.name, "gto");
     }
 
     #[test]
-    fn test_load_profile_builtin_abbreviations() {
+    fn load_profile_builtin_abbreviations() {
         assert_eq!(load_profile("tp").expect("tp").name, "tight_passive");
         assert_eq!(load_profile("lag").expect("lag").name, "loose_aggressive");
         assert_eq!(load_profile("tag").expect("tag").name, "tight_aggressive");
@@ -606,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_all_builtins() {
+    fn load_profile_all_builtins() {
         for name in [
             "gto",
             "tight_passive",
@@ -626,13 +1034,13 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_unknown_path_returns_error() {
+    fn load_profile_unknown_path_returns_error() {
         let result = load_profile("nonexistent_profile_xyz.yaml");
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_load_profile_strong_all_on_has_decision_knobs_on() {
+    fn load_profile_strong_all_on_has_decision_knobs_on() {
         let p = load_profile("strong_all_on").expect("strong_all_on should load");
         assert_eq!(p.name, "strong_all_on");
         assert_eq!(p.decision.ranges, RangeMode::PositionAware);
@@ -641,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_weak_all_off_has_default_decision() {
+    fn load_profile_weak_all_off_has_default_decision() {
         let p = load_profile("weak_all_off").expect("weak_all_off should load");
         assert_eq!(p.name, "weak_all_off");
         assert_eq!(p.decision.equity, EquityMode::Off);
@@ -650,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_strong_weak_aliases() {
+    fn load_profile_strong_weak_aliases() {
         assert_eq!(
             load_profile("strong").expect("strong").name,
             "strong_all_on"
@@ -664,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_none_leaves_profile_unchanged() {
+    fn apply_decision_overrides_none_leaves_profile_unchanged() {
         let mut profile = BotProfile::gto();
         let before = profile.decision.clone();
         let args = args_from(["pkdealer_agent_rules"].as_slice());
@@ -673,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_equity_fast_uses_samples() {
+    fn apply_decision_overrides_equity_fast_uses_samples() {
         let mut profile = BotProfile::gto();
         let args = args_from(&[
             "pkdealer_agent_rules",
@@ -687,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_ranges_position_aware() {
+    fn apply_decision_overrides_ranges_position_aware() {
         let mut profile = BotProfile::gto();
         let args = args_from(&["pkdealer_agent_rules", "--ranges", "position-aware"]);
         assert!(apply_decision_overrides(&mut profile, &args));
@@ -695,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_pot_odds_clamped() {
+    fn apply_decision_overrides_pot_odds_clamped() {
         let mut profile = BotProfile::gto();
         let args = args_from(&["pkdealer_agent_rules", "--pot-odds-discipline", "5.0"]);
         assert!(apply_decision_overrides(&mut profile, &args));
@@ -703,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_all_knobs() {
+    fn apply_decision_overrides_all_knobs() {
         let mut profile = BotProfile::gto();
         let args = args_from(&[
             "pkdealer_agent_rules",
@@ -730,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_decision_overrides_can_disable_profile_knobs() {
+    fn apply_decision_overrides_can_disable_profile_knobs() {
         // strong_all_on ships with position-aware ranges + Monte-Carlo equity;
         // overrides must be able to force them back off.
         let mut profile = load_profile("strong_all_on").expect("strong_all_on");
@@ -747,9 +1155,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rules_agent_legal_action_with_to_call() {
+    async fn rules_agent_legal_action_with_to_call() {
         let agent = RulesAgent {
             profile: BotProfile::gto(),
+            exploit: None,
         };
         let state = sample_state();
         let decision = agent.decide(&state).await;
@@ -763,9 +1172,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rules_agent_legal_action_without_to_call() {
+    async fn rules_agent_legal_action_without_to_call() {
         let agent = RulesAgent {
             profile: BotProfile::gto(),
+            exploit: None,
         };
         let state = HandState {
             to_call: 0,
@@ -779,9 +1189,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rules_agent_zero_chips_checks() {
+    async fn rules_agent_zero_chips_checks() {
         let agent = RulesAgent {
             profile: BotProfile::gto(),
+            exploit: None,
         };
         let state = HandState {
             my_chips: 0,
@@ -793,15 +1204,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rules_agent_all_profiles_produce_actions() {
+    async fn rules_agent_all_profiles_produce_actions() {
         for profile in BotProfile::default_profiles() {
-            let agent = RulesAgent { profile };
+            let agent = RulesAgent {
+                profile,
+                exploit: None,
+            };
             let _ = agent.decide(&sample_state()).await;
         }
     }
 
     #[test]
-    fn test_args_defaults() {
+    fn args_defaults() {
         let args =
             Args::try_parse_from(["pkdealer_agent_rules"]).expect("default args should parse");
         assert_eq!(args.endpoint, "http://127.0.0.1:50051");
@@ -821,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_args_parse_decision_knobs() {
+    fn args_parse_decision_knobs() {
         let args = Args::try_parse_from([
             "pkdealer_agent_rules",
             "--equity",
@@ -841,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn test_args_with_profile_name() {
+    fn args_with_profile_name() {
         let args = Args::try_parse_from([
             "pkdealer_agent_rules",
             "--name",
@@ -855,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_args_with_seat_and_chips() {
+    fn args_with_seat_and_chips() {
         let args = Args::try_parse_from(["pkdealer_agent_rules", "--seat", "2", "--chips", "5000"])
             .expect("seat/chips args should parse");
         assert_eq!(args.seat, Some(2));
