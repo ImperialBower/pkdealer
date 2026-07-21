@@ -3,7 +3,7 @@
 **Status:** design — awaiting implementation plan
 **Date:** 2026-05-20
 **Owner:** pkdealer
-**Epic doc:** [`docs/EPIC-22_OTel.md`](../../EPIC-22_OTel.md)
+**Epic doc:** [`docs/EPIC-22_OTel-CLOSED.md`](../../EPIC-22_OTel-CLOSED.md)
 
 ---
 

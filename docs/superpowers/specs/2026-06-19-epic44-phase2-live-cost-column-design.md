@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-19
 **Branch:** epic-44
-**Epic:** [EPIC-44 Token Accounting & External Cost Simulation](../../EPIC-44_Token_Accounting_and_Cost_Simulation.md)
+**Epic:** [EPIC-44 Token Accounting & External Cost Simulation](../../EPIC-44_Token_Accounting_and_Cost_Simulation-INC.md)
 **Builds on:** Phase 1 (per-seat token accumulator) ✅, `pkdealer_pricing` leaf crate ✅
 
 ## Goal

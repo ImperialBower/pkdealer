@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-19
 **Branch:** epic-44
-**Epic:** [EPIC-44 Token Accounting & External Cost Simulation](../../EPIC-44_Token_Accounting_and_Cost_Simulation.md)
+**Epic:** [EPIC-44 Token Accounting & External Cost Simulation](../../EPIC-44_Token_Accounting_and_Cost_Simulation-INC.md)
 **Phase 0 status:** ✅ shipped (`crates/pkdealer_costsim`)
 
 ## Goal
