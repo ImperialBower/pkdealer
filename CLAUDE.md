@@ -237,3 +237,21 @@ Prometheus + Grafana. See `crates/pkdealer_service/README.md` for env
 vars and the full quickstart. Toggle OTel off with `OTEL_SDK_DISABLED=true`
 when running tests or `cargo run` without a collector.
 
+## Knowledge Bundle (OKF)
+
+This repo keeps an [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+bundle at `.okf/` — markdown concepts with YAML frontmatter describing the
+workspace crates, the DealerService gRPC contract, runbooks (arena,
+observability, developer workflow), and the EPIC doc convention.
+
+- **Consume**: read `.okf/index.md` first for orientation, then follow links
+  into only the concepts relevant to the task.
+- **Maintain**: when a change touches something the bundle describes (new
+  crate, new RPC, changed workflow), update the affected concept and its
+  `timestamp`, refresh the relevant `index.md`, and add a dated entry to
+  `.okf/log.md`.
+- **Validate** before committing bundle changes: `/okf:validate .okf --strict`
+  (every non-reserved `.md` needs frontmatter with a non-empty `type`;
+  `index.md` files carry no frontmatter, except the root index's
+  `okf_version`).
+
