@@ -63,12 +63,13 @@ mention of cheating anywhere in the repo is two *prevention* notes in
 
 | Component | Status |
 |---|---|
-| `GroundTruthLabels` — session metadata (who colludes, which vector, which style) | Planned |
+| Identity + hand-sequence plumbing (`hand_no` on `HandState`, name→`Uuid` resolution) | Planned |
+| `GroundTruthLabels` — UUID-keyed session metadata (who colludes, which vector, style) | Planned |
 | `RedactedHand` / `RedactedHandView` — typed hole-card firewall | Planned |
 | `CollusionConfig` + CLI/env on `pkdealer_agent_rules` | Planned |
 | Vector A — `SpectatorLeak` partner-card puller | Planned |
 | Collusion strategies — soft-play / whipsaw / chip-dump | Planned |
-| Vector B — `Backchannel` peer card-sharing | Planned |
+| Vector B — `Backchannel` peer card-sharing + broker service | Planned |
 | `pkdealer_boss` offline analyzer (pairwise metrics + `SuspicionScore`) | Planned |
 | Ground-truth scorer — hands-to-detection + false-positive rate | Planned |
 | Live boss binary (`pkdealer_agent_boss`) + OTel flagging | Planned |
@@ -182,7 +183,9 @@ Extends the existing decision-override flags (`apply_decision_overrides`
 
 ```rust
 struct CollusionConfig {
-    partner: String,          // --collude-with <name>: partner's agent name
+    partner: String,          // --collude-with <name>: partner's *arena-composed*
+                              //   name (unique, e.g. `cheat_b` / `gto_2`),
+                              //   resolved to a stable Uuid before use
     channel: CollusionChannel,// --collusion-channel spectator|peer
     style: CollusionStyle,    // --collusion-style soft|whipsaw|dump
 }
@@ -195,6 +198,23 @@ Partner cards reach the decider by extending the existing snapshot path
 optional `partner_hole: Option<Cards>`; the collusion wrapper reads it. When no
 collusion is configured the field is `None` and behavior is byte-for-byte the
 current agent. Cheating is strictly additive and off by default.
+
+**Identity & hand sequence — shared Phase-0 plumbing for both vectors.** Two facts
+the agent does not carry today must be threaded in first:
+
+- **Stable partner identity (UUID, not name).** `HandState`/`SeatSnapshot` expose
+  only seat *names* (`crates/pkdealer_agent_core/src/hand_state.rs:28`), but the whole
+  detection pipeline keys on player `Uuid` (`RedactedHand.player_id`; the `Uuid`-keyed
+  `StatsRegistry`). So `--collude-with` takes the **arena-composed** name — unique
+  because `bin/arena:284` emits `${name}_${n}` — and the agent **resolves it to the
+  partner's `Uuid`** from the status snapshot. Labels and peer shares store the
+  **UUID**; the display name is kept only for human readability. This removes the
+  name-collision ambiguity around duplicates like `gto_1` / `gto_2`.
+- **Hand sequence.** A monotonic hand number already exists service-side as
+  `TableStatus.round_number` (`crates/pkdealer_service/src/main.rs:646`, incremented
+  at `:996`; also surfaced as `GetSessionInfo.hand_count`), but is **not** yet on
+  `HandState`. Thread it onto `HandState` as `hand_no` so the snapshot and the
+  Vector-B `CardShare` agree on which hand a shared card belongs to.
 
 ### Vector A — `SpectatorLeak`
 
@@ -221,7 +241,9 @@ seat instead of at a `StatsRegistry`.
 between colluding processes, brokered by neither the dealer nor a spectator token.
 
 ```rust
-// One line per share, over a local TCP or Unix socket the colluders agree on.
+// One share per hand. `hand_no` = the dealer's `round_number` for that hand
+// (threaded onto HandState in Phase 0), so two peers never mismatch hands.
+// `player_id` is the sharer's resolved Uuid, not a display name.
 struct CardShare { hand_no: u32, seat: u8, player_id: Uuid, hole_cards: String }
 
 trait Backchannel {
@@ -230,10 +252,23 @@ trait Backchannel {
 }
 ```
 
-Each colluder publishes its own cards each hand and reads its partner's. Addressed
-by env (`PKDEALER_BACKCHANNEL=127.0.0.1:PORT`). Explicitly **not** the dealer
-service — the service never learns cards are shared. This is the "realistic"
-vector: partner-only information, no privileged token.
+Each colluder publishes its own cards each hand and reads its partner's, matched by
+`hand_no`. **Addressing must survive container isolation:** `bin/arena` puts every
+agent in its own compose service/container (`bin/arena:284`), each with its own
+network namespace, so a bare `127.0.0.1:PORT` cannot bridge two colluders. Two
+workable designs:
+
+- **Direct, via compose DNS** — one colluder binds a TCP listener; the partner dials
+  it by **service hostname** (`PKDEALER_BACKCHANNEL=cheat_b:9099`), which docker's
+  embedded DNS resolves on the shared compose network. Simplest, but asymmetric (one
+  listens, one dials).
+- **Broker service** *(recommended)* — a tiny `pkdealer_backchannel` compose service
+  both colluders dial (`PKDEALER_BACKCHANNEL=backchannel:9099`); it fans `CardShare`s
+  out by pair. Symmetric, scales past two seats, and keeps the agents identical — the
+  channel becomes a first-class, inspectable component rather than hidden socket glue.
+
+Either way it is **not** the dealer service — the service never learns cards are
+shared. This is the "realistic" vector: partner-only information, no privileged token.
 
 Rationale: Vectors A and B must be *behaviorally indistinguishable* at the table
 so the Boss can be shown to catch collusion, not catch a token. Keeping the
@@ -277,10 +312,13 @@ takes **only** `&[RedactedHand]` and computes, per unordered seat-pair:
   (catches Whipsaw).
 - **Mutual VPIP/PFR conditioning** — how each player's `vpip()`/`pfr()`
   (`player_stats.rs:119,125`) shifts when the partner is in the pot.
-- **Combined win-rate lift** — the pair's pooled chip result vs the **collusion-off
-  baseline**: the same two agents, same lineup and seats, run with collusion
-  disabled (the Phase 5 calibration captures this control run). Lift = pooled
-  bb/100 with collusion minus pooled bb/100 in the control.
+
+Every metric above is computed from the **observed session alone** — no
+counterfactual — which is exactly why the Boss can run them live. Win-rate *lift*
+(did colluding actually **pay**?) is deliberately **absent here**: it needs a
+collusion-off control run the Boss can never observe, so it is a *validation*
+metric, not a detection signal, and lives in Phase 5 (Work Item **5b**), overlapping
+exit criterion 1.
 
 These fold into a per-pair `SuspicionScore` carrying a `pkcore::Confidence`
 (`player_stats.rs:220`) driven by sample size — the Boss says nothing with
@@ -297,9 +335,15 @@ allowed to touch hole cards, and it is import-isolated from the detection librar
 ### `GroundTruthLabels`
 
 `crates/pkdealer_boss/src/labels.rs` (new). Session-level metadata written by the
-sim harness: `{ colluding_pairs: [(name, name)], vector: Spectator|Peer, style }`.
-Serialized alongside the exported session (a sidecar YAML, since the proto is
-untouched). Consumed only by the scorer.
+sim harness, keyed on **stable player `Uuid`s — not display names**, which collide
+(`gto_1`/`gto_2`) and aren't what the pipeline keys on:
+`{ colluding_pairs: [(Uuid, Uuid)], vector: Spectator|Peer, style }`, with the
+human-facing arena names retained alongside purely for readability. The harness
+resolves each `--collude-with` name → `Uuid` at write time — the same UUIDs the
+recorder stamps on `PlayerEntry.player_id` (`hand_history.rs:1468`) and that
+`RedactedHand` carries — so the scorer matches labels to hands with zero name
+guesswork. Serialized as a sidecar YAML (the proto is untouched). Consumed only by
+the scorer.
 
 ### Live boss binary (later phase)
 
@@ -330,8 +374,12 @@ Prefer the offline path for anything that must be provably blind.
   `pkdealer_costsim`); add to workspace `Cargo.toml` members.
 - [ ] **0b.** Implement `RedactedHand` + `redact()` in
   `crates/pkdealer_boss/src/redacted.rs`, consuming `HandCollection`.
-- [ ] **0c.** Implement `GroundTruthLabels` + sidecar YAML (de)serialization.
-- [ ] **0d.** Feature-gate: add a `collusion` feature to `pkdealer_agent_rules`
+- [ ] **0c.** Implement `GroundTruthLabels` (**UUID-keyed** pairs + names for
+  readability) + sidecar YAML (de)serialization.
+- [ ] **0d.** Thread `hand_no` (from `TableStatus.round_number`,
+  `crates/pkdealer_service/src/main.rs:646`) onto `HandState`, and add partner
+  name→`Uuid` resolution from the status snapshot. Both vectors depend on this.
+- [ ] **0e.** Feature-gate: add a `collusion` feature to `pkdealer_agent_rules`
   and `pkdealer_agent_core`; confirm `cargo check` is green with and without it.
 
 ### Phase 1 — Vector A colluders + strategies
@@ -343,23 +391,29 @@ Prefer the offline path for anything that must be provably blind.
 - [ ] **1c.** `CollusionStyle` strategies (soft/whipsaw/dump) as decider wrappers.
 - [ ] **1d.** `arena.toml` entries for a colluding lineup; thread the new flags
   through `emit_service` (`bin/arena:234`).
-- [ ] **1e.** Sim check: colluding pair's combined chips beat an honest control
-  over N hands (the cheat must actually pay).
+- [ ] **1e.** Sim smoke check: colluding pair's combined chips beat an honest
+  control over N hands (mechanically confirms the cheat works — the *replicated,
+  confidence-bounded* version is exit criterion 1 / Work Item 5b).
 
 ### Phase 2 — The Boss (offline) — *heart of the EPIC*
 
-- [ ] **2a.** Pairwise metrics over `&[RedactedHand]` (chip-flow, soft-play index,
-  whipsaw count, conditioned VPIP/PFR, win-rate lift).
+- [ ] **2a.** Pairwise metrics over `&[RedactedHand]`, all observed-session-only
+  (chip-flow, soft-play index, whipsaw count, conditioned VPIP/PFR). *No win-rate
+  lift here — it needs a control run (Work Item 5b).*
 - [ ] **2b.** `SuspicionScore` composite + `Confidence` gating.
 - [ ] **2c.** Ground-truth scorer: hands-to-detection + FP rate.
 - [ ] **2d.** `pkdealer_boss` binary: read exported session + labels → report.
 
 ### Phase 3 — Vector B backchannel
 
-- [ ] **3a.** `Backchannel` (local JSON socket) in `pkdealer_agent_core`.
-- [ ] **3b.** Wire `--collusion-channel peer` to publish/subscribe partner cards.
+- [ ] **3a.** `Backchannel` in `pkdealer_agent_core` (recommended: a small
+  `pkdealer_backchannel` **broker** compose service both colluders dial by hostname;
+  fall back to direct compose-DNS if simpler). NOT `127.0.0.1` — containers are
+  network-isolated (`bin/arena:284`).
+- [ ] **3b.** Wire `--collusion-channel peer` to publish/subscribe partner cards,
+  matched by `hand_no`; `CardShare.player_id` is the resolved `Uuid`.
 - [ ] **3c.** Re-run the Boss against a Vector-B session; assert the detection
-  signature matches Vector A (same behavior, different channel).
+  signature matches Vector A within tolerance (same behavior, different channel).
 
 ### Phase 4 — Live boss
 
@@ -367,11 +421,20 @@ Prefer the offline path for anything that must be provably blind.
 - [ ] **4b.** OTel `pkdealer.boss.suspicion` gauge + structured flag log.
 - [ ] **4c.** Arena wiring: a `boss` type in `emit_service` (`bin/arena:218`).
 
-### Phase 5 — Calibration & report
+### Phase 5 — Calibration, validation & report
 
-- [ ] **5a.** Threshold sweep: tune suspicion weights/cutoff for best speed vs FP.
-- [ ] **5b.** Honest-lineup FP study (no colluders present → zero flags).
-- [ ] **5c.** DEVLOG close-out section `## EPIC-46 — Collusion Detection (YYYY-MM-DD)`.
+- [ ] **5a.** Threshold sweep over **K seeded runs** (not one high-variance sample —
+  the gRPC arena is non-mirrored): tune suspicion weights/cutoff for best
+  hands-to-detection vs FP.
+- [ ] **5b.** Collusion-off **control run** (same agents, same seats, collusion
+  disabled) → compute **win-rate lift** = pooled bb/100 (collusion) − pooled bb/100
+  (control). This is the "did it pay" validation, kept out of the live detector.
+- [ ] **5c.** Honest-lineup FP study over K runs → report a false-positive **rate
+  with a confidence interval**, not a single "zero".
+- [ ] **5d.** Statistical write-up: state "cheat pays" and detection speed as
+  **replicated / confidence-bounded** results; note that EPIC-45's mirrored decks
+  would shrink these intervals.
+- [ ] **5e.** DEVLOG close-out section `## EPIC-46 — Collusion Detection (YYYY-MM-DD)`.
 
 ---
 
@@ -395,9 +458,16 @@ Prefer the offline path for anything that must be provably blind.
   the flagging band regardless of signal.
 - `scorer_reports_hands_to_detection` — labeled colluding session → scorer returns
   a finite hands-to-detection for the true pair.
-- `boss_zero_fp_on_honest_control` — an all-honest session → no pair flagged.
+- `boss_low_fp_on_honest_control` — over K all-honest runs the false-positive rate
+  is within the calibrated bound (reported with a CI, not asserted as a single zero).
 - `vector_a_and_b_same_signature` — the same style over both channels yields
   detection scores within tolerance (Phase 3).
+- `collude_with_resolves_composed_name_to_uuid` — `--collude-with gto_2` resolves to
+  the correct partner `Uuid` from the status snapshot; ambiguous/duplicate base names
+  never leak into labels or shares.
+- `backchannel_matches_shares_by_hand_no` — a share published for hand N is returned
+  to the partner only for hand N (no cross-hand contamination), using
+  `round_number`-derived `hand_no`.
 
 ## Key Files
 
@@ -408,9 +478,11 @@ Prefer the offline path for anything that must be provably blind.
 | `crates/pkdealer_boss/src/scorer.rs` | ground-truth grading (may read hole cards) |
 | `crates/pkdealer_boss/src/labels.rs` | `GroundTruthLabels` sidecar |
 | `crates/pkdealer_agent_rules/src/collude/` | `CollusionConfig`, `SpectatorLeak`, strategies |
-| `crates/pkdealer_agent_core/src/backchannel.rs` | Vector B peer channel |
+| `crates/pkdealer_agent_core/src/backchannel.rs` | Vector B peer-channel client |
+| `crates/pkdealer_backchannel/` | Vector B broker compose service (recommended) |
+| `crates/pkdealer_agent_core/src/hand_state.rs:106` | add `hand_no` (from `round_number`) |
 | `crates/pkdealer_agent_boss/` | live observer binary (Phase 4) |
-| `arena.toml`, `bin/arena` | colluding + boss lineups |
+| `arena.toml`, `bin/arena` | colluding + boss + broker lineups |
 
 ## Reuse (do NOT recreate)
 
@@ -422,6 +494,9 @@ Prefer the offline path for anything that must be provably blind.
   whose `ExportSession` polling is completed-hand-driven.
 - `crates/pkdealer_agent_rules/src/main.rs:478` — `snapshot_with_stats`: the snapshot
   threading point to extend with `partner_hole`.
+- `crates/pkdealer_service/src/main.rs:646,996` — `TableStatus.round_number`: the
+  existing monotonic hand sequence to thread onto `HandState` as `hand_no` (Vector B
+  hand-matching); also surfaced as `GetSessionInfo.hand_count`.
 - `player_stats.rs:55,163,265,342` — `PlayerStats` / `StatsRegistry` /
   `aggression_factor` / `ingest_collection`: the public-stat engine the Boss reuses.
 - `player_stats.rs:220,233` — `Confidence` / `from_sample_size`: sample-size gating.
@@ -471,12 +546,14 @@ cargo run -p pkdealer_boss -- --session ./out/session-*.yaml --labels ./out/labe
 
 Exit criteria:
 
-1. A configured colluding pair's combined chip result **beats** an honest control
-   lineup over a fixed hand count (the cheat pays).
+1. Across **K seeded runs**, a configured colluding pair's pooled chip result
+   **beats** the collusion-off control at **p < 0.05** — the cheat pays as a
+   *replicated* result, not a single high-variance sample.
 2. The Boss, reading **only** `RedactedHand`, flags the true colluding pair with a
-   finite, reported **hands-to-detection**.
-3. On an all-honest control session the Boss flags **no** pair (false-positive rate
-   zero at the calibrated threshold).
+   finite, reported **hands-to-detection** (reported as a distribution over the K runs).
+3. Over **K all-honest control runs**, the Boss's **false-positive rate** stays below
+   the calibrated bound (target ≈ 0), reported **with a confidence interval** — not
+   asserted as an absolute zero on a single run.
 4. Vectors A and B produce detection scores within tolerance of each other — the
    Boss catches the *behavior*, not the channel.
 5. `redact()` provably emits no hole cards or deck (test `redact_drops_hole_cards`),
