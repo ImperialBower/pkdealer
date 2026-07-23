@@ -31,11 +31,11 @@
 - Headless `pkdealer_arena` crate + `bin/arena_eval`: mirror (duplicate) poker, position-equalized, cash + tournament modes; leaderboard+CI, behavioral profile, H2H matrix, corpus export; LLM cost budget.
 - Phase 0 shares the `pkcore` `set_next_deck` deck-replay primitive with EPIC-41.
 
-### EPIC-46 — Collusion Simulation & Detection · **Not started** (new, cheat-detection kata)
-`docs/EPIC-46_Collusion_Detection.md`
-- Colluding rules-agents that share hole cards via two vectors: spectator-token leak (Vector A, reuses the `sbot` `ExploitPuller` pattern) and a new bot-to-bot backchannel (Vector B); three styles — soft-play / whipsaw / chip-dump.
-- "Boss" detector, hole-card-blind by a typed `RedactedHand` firewall: pairwise metrics + `SuspicionScore` over public play; offline analyzer (`pkdealer_boss`) first, live `pkdealer_agent_boss` binary later.
-- Graded on hands-to-detection + false-positive rate vs honest controls. Built on EPIC-23/25 + sbot exploit wiring; related to EPIC-45 (deterministic decks would sharpen the benchmark).
+### EPIC-70 — Collusion Simulation & Cheat Detection · **Not started** (cheat-detection kata)
+`docs/EPIC-70_Collusion_and_Cheat_Detection.md` — consolidated 2026-07-22 from the former pkdealer EPIC-46 (number retired: 46–49 belong to pkarena0-web per `pkcore/ROADMAP.md`) and the original EPIC-70 "sentinel" draft.
+- Colluding rules-agents that share hole cards via two vectors: spectator-token leak (Vector A, reuses the `sbot` `ExploitPuller` pattern) and a new bot-to-bot backchannel (Vector B); three styles — soft-play / whipsaw / chip-dump; `team` field in `arena.toml` expanded by `bin/arena` into partner flags.
+- "Boss" detector, hole-card-blind by a typed `RedactedHand` firewall: pairwise public-play signals feeding a sequential SPRT log-likelihood verdict (time-to-detection = flag-hand index); offline analyzer (`pkdealer_boss`) first, live `pkdealer_agent_boss` binary later; card-aware EV-sacrifice oracle lives in the grading tier only.
+- Graded on hands-to-detection + false-positive rate vs honest controls. Built on EPIC-23/25/42 + sbot exploit wiring; related to EPIC-45 (deterministic decks would sharpen the benchmark); pkcore EPIC-79 Mental Poker is the out-of-scope *fix*.
 
 ### External render (separate repos)
 - EPIC-44 token + cost columns: the data (`SeatInfo.input_tokens/output_tokens/cost_micro_usd`) ships from this repo; the **rendered columns live in `pkspectator` / pktui** (external).
