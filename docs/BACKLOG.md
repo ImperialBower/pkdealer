@@ -31,6 +31,12 @@
 - Headless `pkdealer_arena` crate + `bin/arena_eval`: mirror (duplicate) poker, position-equalized, cash + tournament modes; leaderboard+CI, behavioral profile, H2H matrix, corpus export; LLM cost budget.
 - Phase 0 shares the `pkcore` `set_next_deck` deck-replay primitive with EPIC-41.
 
+### EPIC-46 — Collusion Simulation & Detection · **Not started** (new, cheat-detection kata)
+`docs/EPIC-46_Collusion_Detection.md`
+- Colluding rules-agents that share hole cards via two vectors: spectator-token leak (Vector A, reuses the `sbot` `ExploitPuller` pattern) and a new bot-to-bot backchannel (Vector B); three styles — soft-play / whipsaw / chip-dump.
+- "Boss" detector, hole-card-blind by a typed `RedactedHand` firewall: pairwise metrics + `SuspicionScore` over public play; offline analyzer (`pkdealer_boss`) first, live `pkdealer_agent_boss` binary later.
+- Graded on hands-to-detection + false-positive rate vs honest controls. Built on EPIC-23/25 + sbot exploit wiring; related to EPIC-45 (deterministic decks would sharpen the benchmark).
+
 ### External render (separate repos)
 - EPIC-44 token + cost columns: the data (`SeatInfo.input_tokens/output_tokens/cost_micro_usd`) ships from this repo; the **rendered columns live in `pkspectator` / pktui** (external).
 
