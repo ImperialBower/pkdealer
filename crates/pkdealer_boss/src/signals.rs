@@ -86,6 +86,10 @@ pub struct PairHandObs {
     pub baseline_actions: Vec<(Uuid, bool)>,
     /// Number of whipsaw (raise → partner-re-raise → field-folds) patterns.
     pub whipsaw_events: u32,
+    /// Whether a whipsaw *setup* existed this hand (a pair member opened while
+    /// both the partner and a third party were still live) — the precondition
+    /// for a whipsaw, regardless of whether one completed.
+    pub whipsaw_opportunity: bool,
     /// Directional flow when the pot was contested by the pair alone.
     pub pair_pot: Option<PairPotOutcome>,
 }
@@ -199,6 +203,7 @@ pub fn observe_hand(hand: &RedactedHand, pair: &Pair) -> PairHandObs {
         hu_actions,
         baseline_actions,
         whipsaw_events: count_whipsaw(hand, pair, &dealt),
+        whipsaw_opportunity: has_whipsaw_opportunity(hand, pair, &dealt),
         pair_pot: pair_pot_outcome(hand, pair),
     }
 }
@@ -270,6 +275,72 @@ fn street_has_whipsaw(
             if field_folds {
                 return true;
             }
+        }
+    }
+    false
+}
+
+/// Whether any street held a whipsaw *setup*: a pair member opened while both
+/// the partner (able to re-raise) and a third party (to be squeezed) were still
+/// live. This is the strict precondition of [`count_whipsaw`] — every completed
+/// whipsaw implies its opportunity — without requiring the re-raise or the field
+/// fold. Gating the whipsaw signal on this (rather than on every dealt hand)
+/// stops "no whipsaw this hand" from being read as evidence of honesty when no
+/// setup ever arose.
+fn has_whipsaw_opportunity(hand: &RedactedHand, pair: &Pair, dealt: &HashSet<Uuid>) -> bool {
+    for street in [
+        RedactedStreet::Preflop,
+        RedactedStreet::Flop,
+        RedactedStreet::Turn,
+        RedactedStreet::River,
+    ] {
+        let idxs: Vec<usize> = hand
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.street == street)
+            .map(|(k, _)| k)
+            .collect();
+        if street_has_whipsaw_opportunity(hand, pair, dealt, &idxs) {
+            return true;
+        }
+    }
+    false
+}
+
+fn street_has_whipsaw_opportunity(
+    hand: &RedactedHand,
+    pair: &Pair,
+    dealt: &HashSet<Uuid>,
+    idxs: &[usize],
+) -> bool {
+    for &i in idxs {
+        let opener = &hand.actions[i];
+        if !(pair.contains(opener.player_id)
+            && matches!(opener.action, ActionType::Bet | ActionType::Raise))
+        {
+            continue;
+        }
+        let partner = if opener.player_id == pair.a {
+            pair.b
+        } else {
+            pair.a
+        };
+        // Who has folded as of the open. The opener isn't a fold, so `..=i` and
+        // `..i` agree; anyone still live here could act after the open.
+        let folded_by_open: HashSet<Uuid> = hand.actions[..i]
+            .iter()
+            .filter(|a| a.action == ActionType::Fold)
+            .map(|a| a.player_id)
+            .collect();
+        if folded_by_open.contains(&partner) || !dealt.contains(&partner) {
+            continue; // partner can't re-raise
+        }
+        let third_party_live = dealt
+            .iter()
+            .any(|p| !pair.contains(*p) && !folded_by_open.contains(p));
+        if third_party_live {
+            return true;
         }
     }
     false
@@ -526,6 +597,76 @@ mod tests {
     fn pairs_in_enumerates_unordered_pairs() {
         let hands = redact(&fixtures::collection(fixtures::honest_corpus(8)));
         assert_eq!(pairs_in(&hands).len(), 6);
+    }
+
+    // A hand where a pair member opens and the partner + a third party are both
+    // still live to act — a whipsaw *setup* — but the partner does not re-raise,
+    // so no whipsaw event completes.
+    fn opportunity_hand(no: usize) -> pkcore::hand_history::HandHistory {
+        use pkcore::hand_history::ActionType;
+        fixtures::build_hand(fixtures::HandSpec {
+            no,
+            players: vec![
+                fixtures::player(0, "mallory_1", MALLORY, 10_000.0, Some("Ac Kc")),
+                fixtures::player(1, "trudy_1", TRUDY, 10_000.0, Some("Qd Jd")),
+                fixtures::player(2, "gto_1", GTO, 10_000.0, Some("7h 2s")),
+            ],
+            preflop: vec![
+                fixtures::act(0, MALLORY, ActionType::Raise, Some(300.0)),
+                fixtures::act(2, GTO, ActionType::Call, Some(300.0)),
+                fixtures::act(1, TRUDY, ActionType::Call, Some(300.0)),
+            ],
+            flop: None,
+            turn: None,
+            river: None,
+            nets: vec![(0, 0.0), (1, 0.0), (2, 0.0)],
+        })
+    }
+
+    // A fold-around: both pair members fold preflop, so no pair member ever
+    // opens — there is no whipsaw setup at all.
+    fn no_opportunity_hand(no: usize) -> pkcore::hand_history::HandHistory {
+        use pkcore::hand_history::ActionType;
+        fixtures::build_hand(fixtures::HandSpec {
+            no,
+            players: vec![
+                fixtures::player(0, "mallory_1", MALLORY, 10_000.0, Some("2c 7d")),
+                fixtures::player(1, "trudy_1", TRUDY, 10_000.0, Some("3c 8d")),
+                fixtures::player(2, "gto_1", GTO, 10_000.0, Some("Ah Kh")),
+            ],
+            preflop: vec![
+                fixtures::act(0, MALLORY, ActionType::Fold, None),
+                fixtures::act(1, TRUDY, ActionType::Fold, None),
+            ],
+            flop: None,
+            turn: None,
+            river: None,
+            nets: vec![(0, 0.0), (1, 0.0), (2, 0.0)],
+        })
+    }
+
+    #[test]
+    fn observe_hand_flags_whipsaw_opportunity_without_the_event() {
+        let hands = redact(&fixtures::collection(vec![opportunity_hand(1)]));
+        let obs = observe_hand(&hands[0], &Pair::new(MALLORY, TRUDY));
+        assert!(
+            obs.whipsaw_opportunity,
+            "a pair-member open with both a live partner and a live third party is a whipsaw setup"
+        );
+        assert_eq!(
+            obs.whipsaw_events, 0,
+            "the partner only called — the setup existed but no whipsaw completed"
+        );
+    }
+
+    #[test]
+    fn observe_hand_no_whipsaw_opportunity_when_folded_around() {
+        let hands = redact(&fixtures::collection(vec![no_opportunity_hand(1)]));
+        let obs = observe_hand(&hands[0], &Pair::new(MALLORY, TRUDY));
+        assert!(
+            !obs.whipsaw_opportunity,
+            "no pair member opened, so there is no whipsaw setup"
+        );
     }
 
     #[test]

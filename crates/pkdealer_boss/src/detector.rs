@@ -177,8 +177,13 @@ fn assess_pair(sorted: &[&RedactedHand], pair: &Pair, params: &SprtParams) -> Ve
             llr += bernoulli_llr(*aggressive, p_h, p_c);
         }
 
-        // 3. Whipsaw: one Bernoulli per hand both members were dealt.
-        if obs.both_dealt {
+        // 3. Whipsaw: one Bernoulli per hand a whipsaw *setup* actually arose
+        //    (a pair member opened with the partner and a third party live).
+        //    Gating on opportunity — like soft-play (heads-up actions) and flow
+        //    (pair-pots) — stops a whipsaw-free hand with no setup from being
+        //    read as honest evidence, which otherwise buries single-style
+        //    colluders (e.g. chip-dumpers, who never whipsaw) over a long run.
+        if obs.whipsaw_opportunity {
             llr += bernoulli_llr(
                 obs.whipsaw_events > 0,
                 params.whipsaw_honest,
@@ -259,6 +264,47 @@ mod tests {
         let at = guilty.flagged_at_hand.expect("colluding pair must flag");
         assert!(at >= 50, "confidence floor holds: {at}");
         assert!(at <= 120, "flag within the session: {at}");
+    }
+
+    // A fold-around hand: both pair members are dealt but fold preflop, so no
+    // whipsaw setup ever arises and the pair contributes no other signal.
+    fn filler(no: usize) -> pkcore::hand_history::HandHistory {
+        use pkcore::hand_history::ActionType;
+        fixtures::build_hand(fixtures::HandSpec {
+            no,
+            players: vec![
+                fixtures::player(0, "mallory_1", MALLORY, 10_000.0, Some("2c 7d")),
+                fixtures::player(1, "trudy_1", TRUDY, 10_000.0, Some("3c 8d")),
+                fixtures::player(2, "gto_1", GTO, 10_000.0, Some("Ah Kh")),
+            ],
+            preflop: vec![
+                fixtures::act(0, MALLORY, ActionType::Fold, None),
+                fixtures::act(1, TRUDY, ActionType::Fold, None),
+            ],
+            flop: None,
+            turn: None,
+            river: None,
+            nets: vec![(0, 0.0), (1, 0.0), (2, 0.0)],
+        })
+    }
+
+    #[test]
+    fn whipsaw_free_hands_add_no_evidence() {
+        // Regression for the 2026-07-24 live-run miss: whipsaw used to fire on
+        // every dealt hand, so ~100 whipsaw-free hands dragged the LLR to ~-14
+        // (ln(0.85/0.98) each) and buried any real collusion signal. A pair that
+        // never even had a whipsaw *setup* must accumulate no such evidence.
+        let hands = redact(&fixtures::collection((1..=100).map(filler).collect()));
+        let verdicts = assess(&hands, &SprtParams::default());
+        let pair = verdicts
+            .iter()
+            .find(|v| v.pair == Pair::new(MALLORY, TRUDY))
+            .unwrap();
+        assert!(
+            pair.llr.abs() < 1e-9,
+            "whipsaw-free filler must add no evidence, got LLR {}",
+            pair.llr
+        );
     }
 
     #[test]

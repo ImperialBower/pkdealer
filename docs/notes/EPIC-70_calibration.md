@@ -42,6 +42,53 @@ lineup), so the fitted null below pools *all* pairs in one mixed session — a
 harness smoke test, not a calibrated model. A proper null needs honest-only
 control runs.
 
+## Whipsaw-gating fix + what it exposed (2026-07-24)
+
+The −114.56 above was traced to a structural bug: the whipsaw signal fired on
+**every** dealt hand (`if obs.both_dealt`), so a whipsaw-free hand always added
+`ln(0.85/0.98) ≈ −0.142` — about −132 over 927 hands — while soft-play and flow
+only contribute when their situation arises. Fixed by **opportunity-gating**
+whipsaw (`signals::has_whipsaw_opportunity`; detector now gates on
+`obs.whipsaw_opportunity`), making it symmetric with the other two signals. The
+fix is unit-proven (a 100-hand whipsaw-free corpus went from LLR −14.23 → 0) and
+all crate tests stay green.
+
+**But the fix exposed a bigger problem — the detector is *inverted* on real
+data.** The whipsaw drag had been acting as an accidental global "honest
+ballast"; removing it (correctly) surfaced that the remaining signals flag
+honest pairs. Full per-pair report on the same 927-hand session, post-fix
+(only `carol+dave` colludes):
+
+| pair | soft-idx | whipsaw | pair-pots | net-flow | LLR | flagged | honest? |
+|---|---|---|---|---|---|---|---|
+| gto+lag | 1.00 | 65 | 55 | 81990 | **44.63** | **@267** | honest → FP |
+| gto+dave | 1.26 | 45 | 42 | −19766 | **2.25→flag** | **@84** | honest → FP |
+| dave+lag | 1.30 | 32 | 45 | −2000 | −13.49 | **@51** | honest → FP |
+| gto+carol | 0.93 | 17 | 27 | 34700 | −36.46 | **@341** | honest → FP |
+| **carol+dave** | **0.20** | 4 | 5 | 5500 | **−2.55** | **—** | **colluders → MISS** |
+| carol+lag | 1.39 | 13 | 32 | 8300 | −146.25 | — | honest |
+
+Result: **4 of 5 honest pairs flagged (FP 0.80), the real colluders missed.**
+
+**Sharpened finding — a signal-quality problem, not a constants tweak.**
+`soft_play_index` **cleanly separates** the colluders (0.20) from every honest
+pair (0.93–1.39) — this figure supersedes the 0.51 mid-run snapshot above (that
+was at 232 hands; 0.20 is the 927-hand value). But **whipsaw and flow are
+net-harmful for this bot population**: two aggressive honest bots (`gto`/`lag`)
+rack up 65 "whipsaw patterns" and 82k directional net-flow just by battling, and
+that noise both flags honest pairs and dilutes the one signal that works. No
+setting of `whipsaw_colluding`/`flow_colluding` fixes that an honest aggressive
+pair and a whipsaw colluder leave the same trace.
+
+**Decision: park the detector.** The next move — lean on soft-play, gate or drop
+whipsaw/flow — cannot be thresholded honestly from one run (where is the line
+between a colluder at 0.20 and an honest nit at 0.7?). It is **arena-gated**:
+capture a `soft`-style colluding run **and** an honest-only control, then
+calibrate with the hypothesis *"soft-play is the workhorse; whipsaw/flow are
+noise here."* Until then, no constants are changed (no fabricated numbers). Note
+`dump` is a poor target regardless: undetectable **and** unprofitable here
+(−19.91 bb/100); the calibration run should use `soft`.
+
 ## Method (implemented)
 
 - **Honest null fit** — `calibrate::fit_null` pools every pair across K honest
