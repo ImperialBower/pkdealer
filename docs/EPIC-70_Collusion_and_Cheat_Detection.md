@@ -110,22 +110,31 @@ mention of cheating anywhere in the repo is two *prevention* notes in
 
 | Component | Status |
 |---|---|
-| `arena.toml` `team` field + `bin/arena` expansion into collusion flags | Planned |
-| Identity + hand-sequence plumbing (`hand_no` on `HandState`, name→`Uuid` resolution) | Planned |
-| `GroundTruthLabels` — UUID-keyed session metadata (who colludes, which vector, style) | Planned |
-| `RedactedHand` / `RedactedHandView` — typed hole-card firewall | Planned |
-| `CollusionConfig` + CLI/env on `pkdealer_agent_rules` | Planned |
-| Vector A — `SpectatorLeak` partner-card puller | Planned |
-| Collusion strategies — soft-play / whipsaw / chip-dump | Planned |
-| Vector B — `Backchannel` peer card-sharing + broker service | Planned |
-| `pkdealer_boss` offline analyzer (pairwise metrics + SPRT verdict) | Planned |
-| Ground-truth scorer — hands-to-detection + FP rate + EV-sacrifice oracle | Planned |
-| Live boss binary (`pkdealer_agent_boss`) + OTel instruments | Planned |
-| Calibration report — SPRT thresholds + honest-lineup FP study | Planned |
+| `arena.toml` `team` field + `bin/arena` expansion into collusion flags | **Complete** (0f) |
+| `hand_no` on `HandState` (from dealer `round_number`) | **Complete** (0d) |
+| name→`Uuid` resolution | **Complete** — rides the export path in `GroundTruthLabels::resolve`, not the status snapshot (proto `SeatInfo` carries no UUID); live agent-side resolution is a Vector-B/Phase-3 need |
+| `GroundTruthLabels` — UUID-keyed session metadata (who colludes, which vector, style) | **Complete** (0c) |
+| `RedactedHand` — typed hole-card firewall (single `redact()` choke point) | **Complete** (0a/0b); `RedactedHandView` folded into `RedactedHand` |
+| `CollusionConfig` + CLI/env on `pkdealer_agent_rules` (behind `collusion` feature) | **Complete** (1a) |
+| Vector A — `SpectatorLeak` partner-card puller + honor filter | **Complete** (1b) |
+| Collusion strategies — soft-play / whipsaw / chip-dump | **Complete** (1c/1d) |
+| Vector B — `Backchannel` peer card-sharing + broker service | **Complete** (3a/3b); `pkdealer_backchannel` broker + `BackchannelClient`/`PeerSource`, reachable from `bin/arena` via the per-seat `channel` field (3-arena) |
+| Vector-B arena wiring — per-seat `channel`, broker service, A/B parity | **Complete** (3-arena/3c); `tests/arena_peer.sh`, `vector_label_does_not_change_the_grade` |
+| `pkdealer_boss` offline analyzer (pairwise signals + SPRT verdict + CLI) | **Complete** (2a/2b/2d) |
+| Ground-truth scorer — hands-to-detection + FP rate + EV-sacrifice oracle | **Complete** (2c) |
+| Live boss binary (`pkdealer_agent_boss`) + OTel instruments | **Authored, unvalidated** (4a/4b/4c) — builds + unit-tested; poll loop not run against a live arena |
+| Calibration report — SPRT thresholds + honest-lineup FP study | **Harness authored, results pending** (5a–5e) — `calibrate.rs` fixture-tested; every result table is a `pending live run` placeholder (no fabricated numbers) |
 
-> **Not yet started.** Design only, consolidated 2026-07-22 from the two source
-> epics (see Consolidation note). Citations grounded on the `sbot` branch
-> (`ae8c145`) and commit `b999673`.
+> **Phases 0–2 delivered** on branch `boss` (2026-07-23): the typed firewall,
+> UUID-keyed labels, `hand_no` plumbing, arena `team` expansion, Vector-A
+> colluders (soft-play / whipsaw / chip-dump behind the `collusion` feature),
+> and the offline Boss — pairwise public-information signals, a Wald SPRT
+> detector, a card-aware ground-truth scorer, and a `pkdealer_boss` CLI. Full
+> sweep green: `cargo test --workspace` = **414 passed / 0 failed**;
+> `cargo clippy --workspace -- -D warnings` clean; `./tests/arena_team.sh` OK.
+> Phases 3–5 (peer backchannel, live boss + OTel, calibration) remain
+> **Deferred**. See the **Implementation corrigendum** at the end for the
+> design-vs-actual deltas.
 
 ---
 
@@ -513,18 +522,18 @@ Prefer the offline path for anything that must be provably blind.
 
 ### Phase 0 — Firewall, labels & team plumbing (prerequisites)
 
-- [ ] **0a.** Create `crates/pkdealer_boss` crate skeleton (mirror
+- [x] **0a.** Create `crates/pkdealer_boss` crate skeleton (mirror
   `pkdealer_costsim`); add to workspace `Cargo.toml` members.
-- [ ] **0b.** Implement `RedactedHand` + `redact()` in
+- [x] **0b.** Implement `RedactedHand` + `redact()` in
   `crates/pkdealer_boss/src/redacted.rs`, consuming `HandCollection`.
-- [ ] **0c.** Implement `GroundTruthLabels` (**UUID-keyed** pairs + names for
+- [x] **0c.** Implement `GroundTruthLabels` (**UUID-keyed** pairs + names for
   readability) + sidecar YAML (de)serialization.
-- [ ] **0d.** Thread `hand_no` (from `TableStatus.round_number`,
+- [x] **0d.** Thread `hand_no` (from `TableStatus.round_number`,
   `crates/pkdealer_service/src/main.rs:646`) onto `HandState`, and add partner
   name→`Uuid` resolution from the status snapshot. Both vectors depend on this.
-- [ ] **0e.** Feature-gate: add a `collusion` feature to `pkdealer_agent_rules`
+- [x] **0e.** Feature-gate: add a `collusion` feature to `pkdealer_agent_rules`
   and `pkdealer_agent_core`; confirm `cargo check` is green with and without it.
-- [ ] **0f.** Add optional `team` to the `arena.toml` schema doc header
+- [x] **0f.** Add optional `team` to the `arena.toml` schema doc header
   (`arena.toml:11-15`) + two example colluder entries; in `bin/arena`, read it
   via `registry_field` (`bin/arena:52-64`) and expand team membership into
   `--collude-with`/`--collusion-channel`/`--collusion-style` flags in
@@ -534,69 +543,84 @@ Prefer the offline path for anything that must be provably blind.
 
 ### Phase 1 — Vector A colluders + strategies
 
-- [ ] **1a.** `CollusionConfig` + CLI/env flags on `pkdealer_agent_rules`
+- [x] **1a.** `CollusionConfig` + CLI/env flags on `pkdealer_agent_rules`
   (`--collude-with`, `--collusion-channel`, `--collusion-style`); a colluder
   requires a spectator token, reusing the `--exploit` validation pattern
   (`crates/pkdealer_agent_rules/src/main.rs:617-643`).
-- [ ] **1b.** `SpectatorLeak` puller (partner-card extraction, honor filter),
+- [x] **1b.** `SpectatorLeak` puller (partner-card extraction, honor filter),
   cloned from `ExploitPuller` (`crates/pkdealer_agent_rules/src/main.rs:325`).
-- [ ] **1c.** `CollusionStyle` strategies (soft/whipsaw/dump) as decider wrappers.
-- [ ] **1d.** Unit tests proving coordination is **partner-conditioned, not just
+- [x] **1c.** `CollusionStyle` strategies (soft/whipsaw/dump) as decider wrappers.
+- [x] **1d.** Unit tests proving coordination is **partner-conditioned, not just
   passive**: colluder checks back a made hand vs. a live partner (soft-play) but
   bets the same hand vs. a lone non-teammate; colluder folds the *worse* of two
   known team hands to concentrate equity.
-- [ ] **1e.** `arena.toml` colluding lineup entries ride Phase 0f expansion.
+- [x] **1e.** `arena.toml` colluding lineup entries ride Phase 0f expansion.
 - [ ] **1f.** Sim smoke check: colluding pair's combined chips beat an honest
   control over N hands (mechanically confirms the cheat works — the *replicated,
-  confidence-bounded* version is exit criterion 1 / Work Item 5b).
+  confidence-bounded* version is exit criterion 1 / Work Item 5b). **Deferred** —
+  needs a live `docker compose` arena run; not a blocker for the Phase 2 Boss,
+  which is validated on synthetic corpora instead.
 
 ### Phase 2 — The Boss (offline) — *heart of the EPIC*
 
-- [ ] **2a.** Pairwise signals over `&[RedactedHand]`, all observed-session-only
+- [x] **2a.** Pairwise signals over `&[RedactedHand]`, all observed-session-only
   (chip-flow, soft-play index, whipsaw count, conditioned VPIP/PFR). *No win-rate
   lift here — it needs a control run (Work Item 5b).*
-- [ ] **2b.** `detector.rs` — per-pair SPRT LLR accumulator with Wald bounds +
+- [x] **2b.** `detector.rs` — per-pair SPRT LLR accumulator with Wald bounds +
   `Confidence` sample-size floor; `Verdict` with `flagged_at_hand`.
-- [ ] **2c.** Ground-truth scorer: hands-to-detection + FP rate + the
+- [x] **2c.** Ground-truth scorer: hands-to-detection + FP rate + the
   EV-sacrifice oracle (card-aware, scorer-tier only).
-- [ ] **2d.** `pkdealer_boss` binary: read exported session + labels → report.
+- [x] **2d.** `pkdealer_boss` binary: read exported session + labels → report.
 
 ### Phase 3 — Vector B backchannel
 
-- [ ] **3a.** `Backchannel` in `pkdealer_agent_core` (recommended: a small
-  `pkdealer_backchannel` **broker** compose service both colluders dial by hostname;
-  fall back to direct compose-DNS if simpler). NOT `127.0.0.1` — containers are
-  network-isolated (`bin/arena:284`).
-- [ ] **3b.** Wire `--collusion-channel peer` to publish/subscribe partner cards,
-  matched by `hand_no`; `CardShare.player_id` is the resolved `Uuid`.
-- [ ] **3c.** Re-run the Boss against a Vector-B session; assert the detection
-  signature matches Vector A within tolerance (same behavior, different channel).
+- [x] **3a.** `Backchannel` in `pkdealer_agent_core` — the `pkdealer_backchannel`
+  **broker** compose service both colluders dial by hostname (NOT `127.0.0.1` —
+  containers are network-isolated). Broker crate + `CardShare` landed.
+- [x] **3b.** `--collusion-channel peer` publishes/subscribes partner cards via
+  `BackchannelClient`/`PeerSource`, matched by `hand_no`; `CardShare.player_id`
+  is the resolved `Uuid`. Wired into `connect_partner_source`.
+- [x] **3-arena.** Make Vector B reachable from a real arena: per-seat `channel`
+  field in `arena.toml` (`spectator`|`peer`); `bin/arena` emits the resolved
+  `--collusion-channel`, auto-adds the broker service + `PKDEALER_BACKCHANNEL`
+  env + `depends_on` when any peer colluder is present. Test: `tests/arena_peer.sh`.
+- [x] **3c.** A/B parity pinned at the detection + grading tier: `detector::assess`
+  never receives the channel (structural); `scorer::score` graded under
+  `Spectator` vs `Peer` labels is byte-identical (`vector_label_does_not_change_the_grade`,
+  verified to fail under an injected vector branch). **Live-session** parity (a
+  recorded Vector-B run) still needs Phase-3 arena execution — the redacted-layer
+  parity is by construction (both channels erase to the same `RedactedHand`s).
 
 ### Phase 4 — Live boss
 
-- [ ] **4a.** `pkdealer_agent_boss` binary: `ExportSession` polling + redact-at-ingest.
-- [ ] **4b.** OTel instruments (`pair_llr` gauge, `flag_hand` histogram,
-  `false_positive` counter) via a boss-local `Metrics` + `init_otel`
-  (`crates/pkdealer_service/src/otel.rs:105`); honor `OTEL_SDK_DISABLED`.
-- [ ] **4c.** Arena wiring: a `boss` type in `emit_service` (`bin/arena:218`).
+- [x] **4a.** `pkdealer_agent_boss` binary: `ExportSession` polling +
+  redact-at-ingest (`app::ingest` drops the collection before any detector code).
+  **Authored, unvalidated** — the poll loop is not run against a live arena; the
+  pure `ingest`/`evaluate` pieces are unit-tested.
+- [x] **4b.** OTel instruments (`pkdealer.boss.pair_llr` gauge, `flag_hand`
+  histogram, `false_positive` counter) via a boss-local `Metrics` + `init_otel`
+  mirroring `crates/pkdealer_service/src/otel.rs`; honors `OTEL_SDK_DISABLED`.
+  The `false_positive` counter increments only against an optional `--labels`
+  sidecar (a blind boss has no ground truth and leaves it at zero).
+- [x] **4c.** Arena wiring: a `boss` type in `emit_service` (observer, no seat,
+  no `--profile`; spectator token from env). Test: `tests/arena_boss.sh`.
 
 ### Phase 5 — Calibration, validation & report
 
-- [ ] **5a.** SPRT calibration over **K seeded runs** (not one high-variance
-  sample — the gRPC arena is non-mirrored): fit the honest null distribution
-  per signal from control runs; set Wald bounds from target FP/FN; sweep for
-  best hands-to-detection vs FP.
-- [ ] **5b.** Collusion-off **control run** (same agents, same seats, collusion
-  disabled) → compute **win-rate lift** = pooled bb/100 (collusion) − pooled bb/100
-  (control). This is the "did it pay" validation, kept out of the live detector.
-- [ ] **5c.** Honest-lineup FP study over K runs → report a false-positive **rate
-  with a confidence interval**, not a single "zero".
-- [ ] **5d.** Statistical write-up: state "cheat pays" and detection speed as
-  **replicated / confidence-bounded** results, including a table of
-  `(team archetype, collusion style) → median hands-to-detection` and the
-  oracle-vs-blind-Boss gap; note that EPIC-45's mirrored decks would shrink
-  these intervals.
-- [ ] **5e.** DEVLOG close-out section `## EPIC-70 — Collusion & Cheat Detection (YYYY-MM-DD)`.
+- [x] **5a.** SPRT calibration harness: `calibrate::fit_null` fits the honest
+  null distribution per signal (`net_flow`, `soft_play_index`, `whipsaw_count`)
+  as mean+std over K control runs. **Harness only** — fitting real numbers and
+  the Wald-bound sweep need K seeded/live runs (EPIC-41, unstarted).
+- [x] **5b.** `calibrate::win_rate_lift` = pooled bb/100 (collusion) − pooled
+  bb/100 (control), from public `net`/`big_blind` only. Fixture-tested.
+- [x] **5c.** `calibrate::fp_rate_with_ci` — false-positive **rate with a 95%
+  Wilson confidence interval** over K runs (not a single "zero"). Fixture-tested.
+- [x] **5d.** Statistical write-up `docs/notes/EPIC-70_calibration.md` — method
+  implemented; **every result table is a `pending live run` placeholder** (the
+  `(archetype, style) → median hands-to-detection` and oracle-vs-blind-Boss
+  tables included). No fabricated figures. Notes EPIC-45's mirrored decks.
+- [x] **5e.** DEVLOG close-out section `## EPIC-70 — Collusion & Cheat Detection
+  (2026-07-24)`.
 
 ---
 
@@ -723,11 +747,16 @@ Prefer the offline path for anything that must be provably blind.
 ## Verification
 
 ```bash
-cargo build --workspace --features collusion
-cargo clippy --workspace --features collusion -- -D warnings
-OTEL_SDK_DISABLED=true cargo test -p pkdealer_boss --all-features
+# NOTE: `--features` does not work with `--workspace` in a virtual workspace —
+# scope the feature to the crate that declares it (`-p <crate> --features …`).
+cargo build --workspace
+cargo build -p pkdealer_agent_rules --features collusion
+cargo clippy --workspace -- -D warnings
+cargo clippy -p pkdealer_agent_rules --features collusion -- -D warnings
+OTEL_SDK_DISABLED=true cargo test --workspace
 OTEL_SDK_DISABLED=true cargo test -p pkdealer_agent_rules --features collusion
 cargo test --doc -p pkdealer_boss
+./tests/arena_team.sh
 
 # End-to-end sim: mallory + trudy secretly on team A vs four honest bots.
 # Team membership lives in arena.toml; bin/arena expands it into partner flags.
@@ -765,3 +794,100 @@ Exit criteria:
    and behind the `collusion` feature. (Note: `cargo test --workspace` itself now
    *runs more* — the new crates — so compare per-crate, not by raw workspace pass
    count.)
+
+---
+
+## Implementation corrigendum
+
+Phases 0–2 landed on branch `boss` (2026-07-23). Design-vs-actual deltas, each
+deliberate:
+
+1. **Amounts are `f64`, not `u32`, in `RedactedHand`.** pkcore `HandHistory`
+   stores all chip amounts as `f64`; narrowing to `u32` would invent NaN/
+   fractional edge cases for no benefit. `RedactedAction.amount` is
+   `Option<f64>`, `RedactedSeat.{starting_stack,net}` are `f64`.
+2. **`RedactedSeat` carries `name`.** Display names are public information (any
+   observer sees them) and reports are unreadable without them. The `redact()`
+   firewall still drops `hole_cards` and the deck — only card data is removed.
+3. **`hand_no` in redacted output is the 1-based position in the collection**,
+   not `HandMeta.id` (which would be fragile to parse). The live path threads
+   the dealer's `TableStatus.round_number` onto `HandState.hand_no`.
+4. **Partner name→UUID resolution rides the export path, not the status
+   snapshot.** Verified: proto `SeatInfo` carries no UUID field, so the design
+   sketch's "resolve from the status snapshot" is impossible as written.
+   Resolution lives in `GroundTruthLabels::resolve()` against the recorded
+   `HandCollection` (where `PlayerEntry` pairs `name` with `player_id`). Live
+   agent-side UUID resolution is only needed by Vector B (Phase 3).
+5. **`--collusion-channel peer` parses but is rejected at startup** with a clear
+   "EPIC-70 Phase 3" message, and `CollusionChannel::Peer` carries a targeted
+   `dead_code` allow. The flag surface matches the spec now so compose files
+   won't change when Phase 3 lands.
+6. **SPRT likelihood models are explicit pre-calibration defaults** (documented
+   on `SprtParams`). The soft-play model uses each player's *own running
+   baseline* aggression as the honest hypothesis, with a fixed fallback until
+   the baseline has ≥ 20 actions. Phase 5 calibration replaces the numbers, not
+   the shapes.
+7. **A "pair-only pot" is defined by sole *investors*, not sole non-folders.**
+   The design sketch's "non-folders == the pair" breaks the fold-dump case (the
+   dumper folds), so chip-flow attribution uses "only these two committed chips;
+   everyone else folded without investing" — which handles both a showdown-dump
+   and a fold-dump. The scorer's card-aware oracle uses the non-folder form for
+   its separate passive-strong check.
+8. **A/B equivalence is now pinned *behaviorally* at the `RulesAgent::choose`
+   layer, not only structurally.** `choose` reads partner cards through the
+   `PartnerCardSource` trait object and never mentions `config.channel`, so it is
+   channel-blind by construction — but the type signature alone can't stop a
+   later `if config.channel == Peer { … }`, and every collusion test hardcoded
+   `channel: Peer`, so such a regression would have stayed green. The existing
+   `collude::ab_equivalence::vector_a_and_b_same_signature` guards the *source +
+   `apply_style`* layer (it calls `apply_style` directly, never `choose`), so it
+   cannot see a branch inside `choose`. Closed by parameterizing
+   `colluder_wiring::colluding_agent()` over `CollusionChannel` and adding
+   `channel_label_does_not_change_the_decision`, which builds two `RulesAgent`s
+   differing *only* in `config.channel`, feeds both the same channel-agnostic
+   stub source, and asserts `decide()` returns the same (colluding) `Decision`.
+   Verified to fail when a channel branch is injected into `choose`. This is the
+   behavioral half of exit criterion 5 at the agent tier (the table-signature
+   half still needs the live Phase-3 Vector-B run).
+
+9. **Vector-B channel selection is a per-seat `arena.toml` field, not a global
+   flag.** `channel = "spectator" | "peer"` (default `spectator`) sits next to
+   `style`, read per seat at `collusion_partner_for`/`emit_service`. `bin/arena`
+   emits the resolved `--collusion-channel` (previously hard-coded to
+   `spectator`) and, when *any* peer colluder is present, auto-adds a
+   `pkdealer_backchannel` broker service (built from `Dockerfile.agent` with
+   `BIN_NAME`) plus `PKDEALER_BACKCHANNEL`/`depends_on` on each peer seat. Guard:
+   `tests/arena_peer.sh`.
+10. **Phase 4 is authored, not validated.** `pkdealer_agent_boss` builds, its
+    pure pieces (`ingest` redact-at-ingest, `evaluate` flag/false-positive
+    decision) are unit-tested, and clippy is clean — but the live `ExportSession`
+    poll loop is **not** run against a running arena in the session that wrote
+    it. The `false_positive` OTel counter increments only against an optional
+    `--labels` sidecar; a genuinely blind boss leaves it at zero.
+11. **Phase 5 ships the harness, not the results.** `calibrate.rs` (`fit_null`,
+    `fp_rate_with_ci` with a Wilson interval, `win_rate_lift`) is fixture-tested,
+    but no seeded/live K-run corpus exists (EPIC-41 unstarted), so
+    `docs/notes/EPIC-70_calibration.md` leaves **every result table as a
+    `pending live run` placeholder** — the EPIC's no-fabricated-numbers rule.
+
+Two smaller notes: the `collusion` cargo feature is scoped per-crate (a virtual
+workspace rejects `--workspace --features`); and the classic SPRT lower-bound
+early-stop is dropped in favor of session-long accumulation (flagging still
+requires the Wald upper bound **and** a ≥ 50-hand `Confidence` floor).
+
+### Phase status summary
+
+| Phase | Scope | Status |
+|---|---|---|
+| 0 — firewall, labels, plumbing | `RedactedHand` + `redact()`, `GroundTruthLabels`, `hand_no`, `collusion` feature, arena `team` expansion | **Complete** |
+| 1 — Vector-A colluders | `CollusionConfig` + CLI, `SpectatorLeak` + honor filter, soft/whipsaw/dump strategies, `RulesAgent` wiring | **Complete** (1f live-sim smoke deferred) |
+| 2 — the Boss (offline) | pairwise signals, SPRT detector, ground-truth scorer + oracle, `pkdealer_boss` CLI | **Complete** |
+| 3 — Vector-B backchannel | peer card-sharing broker + `bin/arena` `channel` wiring, A/B parity | **Complete** (live-session A/B run still needs a docker arena) |
+| 4 — live boss | `pkdealer_agent_boss` + OTel instruments + arena `boss` type | **Authored, unvalidated** (poll loop not run live) |
+| 5 — calibration & report | `calibrate.rs` (null fit, FP CI, win-rate lift) + templated write-up | **Harness complete, results `pending live run`** |
+
+**Inherited debt / not yet closed:** exit criteria 1, 4, 5 (replicated chip
+edge, K-run FP confidence interval, A/B channel equivalence) require live arena
+runs and Phases 3/5. Criterion 3 is met *on synthetic corpora* — the SPRT flags
+each planted style with a finite hands-to-detection (floor-limited to 50) — but
+not yet on recorded live sessions.

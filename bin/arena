@@ -213,12 +213,27 @@ mv "$OVERRIDE_BASE" "$OVERRIDE"
 # instance <id> of registry player <name>.
 emit_service() {
   local id="$1" name="$2"
-  local t bin image profile model
+  local t bin image profile model collude_partner="" collude_style="" collude_channel=""
   t="$(registry_field "$name" type)"
+  # EPIC-70: resolve any collusion partner/style/channel before the image is chosen.
+  if [[ "$t" == rules ]]; then
+    local partner_meta
+    if partner_meta="$(collusion_partner_for "$id")"; then
+      read -r collude_partner collude_style collude_channel <<<"$partner_meta"
+    fi
+  fi
   case "$t" in
-    rules)  bin=pkdealer_agent_rules;  image=pkdealer/agent_rules:latest ;;
+    rules)
+      bin=pkdealer_agent_rules
+      if [[ -n "$collude_partner" ]]; then
+        image=pkdealer/agent_rules_collusion:latest
+      else
+        image=pkdealer/agent_rules:latest
+      fi
+      ;;
     ollama) bin=pkdealer_agent_ollama; image=pkdealer/agent_ollama:latest ;;
     claude) bin=pkdealer_agent_claude; image=pkdealer/agent_claude:latest ;;
+    boss)   bin=pkdealer_agent_boss;   image=pkdealer/agent_boss:latest ;;
   esac
 
   {
@@ -229,9 +244,21 @@ emit_service() {
     printf '      dockerfile: Dockerfile.agent\n'
     printf '      args:\n'
     printf '        BIN_NAME: %s\n' "$bin"
+    if [[ -n "$collude_partner" ]]; then
+      printf '        FEATURES: collusion\n'
+    fi
     if [[ "$t" == rules ]]; then
       profile="$(registry_field "$name" profile)"
-      printf '    command: ["--name", "%s", "--profile", "%s"]\n' "$id" "$profile"
+      if [[ -n "$collude_partner" ]]; then
+        printf '    command: ["--name", "%s", "--profile", "%s", "--collude-with", "%s", "--collusion-channel", "%s", "--collusion-style", "%s"]\n' \
+          "$id" "$profile" "$collude_partner" "$collude_channel" "$collude_style"
+      else
+        printf '    command: ["--name", "%s", "--profile", "%s"]\n' "$id" "$profile"
+      fi
+    elif [[ "$t" == boss ]]; then
+      # EPIC-70 Phase 4: the live Boss is an observer, not a seat. It takes no
+      # --name/--profile; endpoint + spectator token come from the environment.
+      : # no command — the container entrypoint runs with env-driven defaults
     else
       printf '    command: ["--name", "%s"]\n' "$id"
     fi
@@ -243,6 +270,12 @@ emit_service() {
     printf '      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317\n'
     printf '      OTEL_SERVICE_NAME: agent_%s\n' "$id"
     printf '      RUST_LOG: info\n'
+    # EPIC-70 Vector B: a peer colluder dials the backchannel broker by its
+    # compose service hostname; flag that the broker must be emitted.
+    if [[ "$collude_channel" == peer ]]; then
+      printf '      PKDEALER_BACKCHANNEL: pkdealer_backchannel:9099\n'
+      needs_broker=1
+    fi
     if [[ "$t" == ollama ]]; then
       model="$(registry_field "$name" model)"
       printf '      OLLAMA_HOST: %s\n' "$OLLAMA_HOST_VAL"
@@ -253,6 +286,11 @@ emit_service() {
       # 'up' time and never written into the /tmp override file.
       printf '      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}\n'
       printf '      ANTHROPIC_MODEL: %s\n' "$model"
+    elif [[ "$t" == boss ]]; then
+      # ExportSession is spectator-gated; the Boss must present the same token
+      # the service accepts. Interpolated from the host (default "spectator") so
+      # it tracks whatever PKDEALER_SPECTATOR_TOKEN the service was started with.
+      printf '      PKDEALER_SPECTATOR_TOKEN: ${PKDEALER_SPECTATOR_TOKEN:-spectator}\n'
     fi
     if [[ "$t" == ollama ]]; then
       printf '    extra_hosts:\n'
@@ -261,6 +299,29 @@ emit_service() {
     printf '    depends_on:\n'
     printf '      - pkdealer_service\n'
     printf '      - otel-collector\n'
+    if [[ "$collude_channel" == peer ]]; then
+      printf '      - pkdealer_backchannel\n'
+    fi
+  } >> "$OVERRIDE"
+}
+
+# EPIC-70 Vector B: emit the standalone backchannel broker both peer colluders
+# dial. Built from the shared agent Dockerfile (BIN_NAME selects the bin); it
+# never contacts the dealer, so it has no depends_on and takes no CLI args
+# (it reads PKDEALER_BACKCHANNEL_BIND from the environment).
+emit_backchannel_broker() {
+  {
+    printf '  pkdealer_backchannel:\n'
+    printf '    image: pkdealer/backchannel:latest\n'
+    printf '    build:\n'
+    printf '      context: .\n'
+    printf '      dockerfile: Dockerfile.agent\n'
+    printf '      args:\n'
+    printf '        BIN_NAME: pkdealer_backchannel\n'
+    printf '    restart: unless-stopped\n'
+    printf '    environment:\n'
+    printf '      PKDEALER_BACKCHANNEL_BIND: 0.0.0.0:9099\n'
+    printf '      RUST_LOG: info\n'
   } >> "$OVERRIDE"
 }
 
@@ -276,14 +337,63 @@ while IFS= read -r u; do
   uniq_names+=("$u")
 done < <(printf '%s\n' "${players[@]}" | awk '!seen[$0]++')
 
-# Emit name_1 … name_k for each player so repeats get unique service names,
-# --name flags, and OTEL_SERVICE_NAME values.
+# ── EPIC-70: expand `team` membership into pairwise collusion flags ──────────
+# First pass: composed instance ids in emission order, with team + registry name.
+# (name_1 … name_k per player so repeats get unique service names / --name flags.)
+composed_ids=(); composed_regnames=(); composed_teams=()
 for name in "${uniq_names[@]}"; do
   k="$(printf '%s\n' "${players[@]}" | grep -cx -- "$name" || true)"
+  team="$(registry_field "$name" team)"
+  if [[ -n "$team" && "$(registry_field "$name" type)" != rules ]]; then
+    echo "❌ '$name' declares team '$team' but is not a rules agent — colluders are rules-only (EPIC-70)." >&2
+    exit 1
+  fi
   for ((n = 1; n <= k; n++)); do
-    emit_service "${name}_${n}" "$name"
+    composed_ids+=("${name}_${n}")
+    composed_regnames+=("$name")
+    composed_teams+=("${team:-}")
   done
 done
+
+# Every declared team must field exactly two seats (pairs only in EPIC-70).
+while IFS= read -r team; do
+  [[ -n "$team" ]] || continue
+  count=0
+  for tm in "${composed_teams[@]}"; do [[ "$tm" == "$team" ]] && count=$((count + 1)); done
+  if (( count != 2 )); then
+    echo "❌ team '$team' has $count seat(s) in this lineup; collusion teams are pairs (exactly 2)." >&2
+    exit 1
+  fi
+done < <(printf '%s\n' "${composed_teams[@]}" | awk 'NF && !seen[$0]++')
+
+# collusion_partner_for <id> — prints "<partner_id> <style> <channel>" when <id>
+# is teamed. Style and channel are read from <id>'s own registry entry (each seat
+# carries its own), defaulting to soft / spectator.
+collusion_partner_for() {
+  local id="$1" i j style channel
+  for ((i = 0; i < ${#composed_ids[@]}; i++)); do
+    [[ "${composed_ids[$i]}" == "$id" && -n "${composed_teams[$i]}" ]] || continue
+    for ((j = 0; j < ${#composed_ids[@]}; j++)); do
+      if (( j != i )) && [[ "${composed_teams[$j]}" == "${composed_teams[$i]}" ]]; then
+        style="$(registry_field "${composed_regnames[$i]}" style)"
+        channel="$(registry_field "${composed_regnames[$i]}" channel)"
+        printf '%s %s %s\n' "${composed_ids[$j]}" "${style:-soft}" "${channel:-spectator}"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# Set to 1 by emit_service when a peer colluder is emitted, so the broker is
+# spun up exactly once and only when Vector B is actually in play.
+needs_broker=0
+for ((idx = 0; idx < ${#composed_ids[@]}; idx++)); do
+  emit_service "${composed_ids[$idx]}" "${composed_regnames[$idx]}"
+done
+if (( needs_broker )); then
+  emit_backchannel_broker
+fi
 
 echo "Lineup (${#players[@]} seat(s)): ${positional[*]}"
 echo "Override file: $OVERRIDE"

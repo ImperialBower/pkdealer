@@ -10,6 +10,9 @@ members = [
     "crates/pkdealer_agent_claude",
     "crates/pkdealer_agent_ollama",
     "crates/pkdealer_costsim",
+    "crates/pkdealer_boss",
+    "crates/pkdealer_agent_boss",
+    "crates/pkdealer_backchannel",
     "crates/pkdealer_pricing",
 ]
 resolver = "2"

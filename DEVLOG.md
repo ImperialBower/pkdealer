@@ -432,3 +432,48 @@ against a silently-stuck seat:
 
 This complements EPIC-20 seat resume: resume recovers a *crashed* agent
 on restart; the self-heal recovers a *live* agent that missed an event.
+
+---
+
+## EPIC-70 — Collusion & Cheat Detection (2026-07-24)
+
+**Status: Phases 0–4 landed on `boss`; Phase 5 harness landed, results pending
+a live run.**
+
+The collusion sim and the blind Boss. Colluders (rules agents) cheat by sharing
+hole cards over one of two channels; the Boss classifies colluding pairs from
+public information alone, behind a typed `RedactedHand` firewall that structurally
+cannot receive a hole card.
+
+- **Phases 0–2** (earlier on branch): the firewall + `redact()` choke point,
+  UUID-keyed `GroundTruthLabels`, `hand_no` plumbing, arena `team` expansion,
+  Vector-A colluders (soft/whipsaw/dump behind the `collusion` feature), and the
+  offline Boss — pairwise public-info signals, a Wald SPRT detector, a card-aware
+  ground-truth scorer, and the `pkdealer_boss` CLI.
+- **Phase 3 — Vector-B backchannel.** The `pkdealer_backchannel` broker crate +
+  `BackchannelClient`/`PeerSource` (landed earlier) are now reachable from a real
+  arena: `arena.toml` gains a per-seat `channel` field (`spectator`|`peer`), and
+  `bin/arena` emits the resolved `--collusion-channel`, auto-adds the broker
+  service + `PKDEALER_BACKCHANNEL` env + `depends_on` when any peer colluder is
+  present (`tests/arena_peer.sh`). A/B equivalence is pinned behaviorally at both
+  the agent tier (`RulesAgent::choose` is channel-blind) and the grading tier
+  (`scorer::score` graded under `Spectator` vs `Peer` labels is identical —
+  `vector_label_does_not_change_the_grade`, verified to fail under an injected
+  vector branch).
+- **Phase 4 — live boss (authored, unvalidated).** New `pkdealer_agent_boss`
+  binary: polls `ExportSession` on the watermark cadence, `redact()`s at ingest,
+  runs the blind SPRT detector, and emits `pkdealer.boss.{pair_llr,flag_hand,
+  false_positive}` over OTel (own `init_otel`, honors `OTEL_SDK_DISABLED`). A
+  `boss` type in `bin/arena` seats it as an observer (`tests/arena_boss.sh`). The
+  pure pieces (`ingest` redact-at-ingest, `evaluate` flag/FP decision) are
+  unit-tested; the poll loop is **not** run against a live arena in this session.
+- **Phase 5 — calibration harness (harness, not results).** `calibrate.rs`:
+  `fit_null` (honest null per signal), `fp_rate_with_ci` (Wilson 95% interval),
+  `win_rate_lift` (pooled bb/100 collusion − control). Fixture-tested. Per the
+  EPIC's honesty rule, **no calibration figures are fabricated** — the write-up
+  (`docs/notes/EPIC-70_calibration.md`) leaves every result table as an explicit
+  `pending live run` placeholder until real K-run data exists.
+
+**Inherited debt:** exit criteria 1/4/5 (replicated chip edge, K-run FP CI, live
+A/B channel equivalence) still need live `docker compose` arena runs — Phases 4/5
+are authored and unit-tested but not validated end-to-end.

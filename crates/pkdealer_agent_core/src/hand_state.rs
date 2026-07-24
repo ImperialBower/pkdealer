@@ -1,6 +1,7 @@
 //! Game state snapshot visible to one agent at its seat.
 
 use pkdealer_proto::dealer::{PlayerState, Street};
+use uuid::Uuid;
 
 /// One seated player's public state within a [`HandState`].
 ///
@@ -20,6 +21,7 @@ use pkdealer_proto::dealer::{PlayerState, Street};
 ///     chips: 9_900,
 ///     bet: 100,
 ///     is_active: true,
+///     player_id: None,
 /// };
 /// assert!(seat.is_active);
 /// assert_eq!(seat.bet, 100);
@@ -38,6 +40,10 @@ pub struct SeatSnapshot {
     /// busted out, or merely seated waiting for the next hand. All-in players
     /// are active (they can still win the pot).
     pub is_active: bool,
+    /// Stable player UUID for this seat (from `SeatInfo.player_id`). `None`
+    /// when the service does not report one. Lets a colluding agent stamp and
+    /// filter peer card-shares by identity (EPIC-70 Phase 3).
+    pub player_id: Option<Uuid>,
 }
 
 /// Returns `true` when a [`PlayerState`] means the player is still contesting
@@ -90,13 +96,14 @@ pub fn seat_state_is_active(state: PlayerState) -> bool {
 ///     to_call: 50,
 ///     my_chips: 9_950,
 ///     stacks: vec![
-///         SeatSnapshot { seat: 0, name: "alice".to_string(), chips: 10_000, bet: 0, is_active: true },
-///         SeatSnapshot { seat: 1, name: "bob".to_string(), chips: 9_950, bet: 50, is_active: true },
+///         SeatSnapshot { seat: 0, name: "alice".to_string(), chips: 10_000, bet: 0, is_active: true, player_id: None },
+///         SeatSnapshot { seat: 1, name: "bob".to_string(), chips: 9_950, bet: 50, is_active: true, player_id: None },
 ///     ],
 ///     big_blind: 100,
 ///     street: "preflop".to_string(),
 ///     action_history: vec![],
 ///     button_seat: Some(0),
+///     hand_no: 12,
 /// };
 /// assert_eq!(state.seat, 1);
 /// assert_eq!(state.to_call, 50);
@@ -128,6 +135,11 @@ pub struct HandState {
     /// table has not assigned a button (e.g. no hand in progress). Drives
     /// position-aware decisions.
     pub button_seat: Option<u8>,
+    /// Monotonic hand number from the dealer (`TableStatus.round_number`,
+    /// 1-based). `0` when unknown — e.g. states built outside a live hand.
+    /// Lets colluding peers and recorders agree on *which* hand an
+    /// observation belongs to (EPIC-70 Phase 0d).
+    pub hand_no: u32,
 }
 
 /// Converts a protobuf [`Street`] variant to a lowercase street name string.
@@ -160,6 +172,7 @@ mod tests {
                     chips: 10_000,
                     bet: 100,
                     is_active: true,
+                    player_id: None,
                 },
                 SeatSnapshot {
                     seat: 2,
@@ -167,13 +180,24 @@ mod tests {
                     chips: 9_700,
                     bet: 0,
                     is_active: true,
+                    player_id: None,
                 },
             ],
             big_blind: 100,
             street: "flop".to_string(),
             action_history: vec!["alice bets 100".to_string()],
             button_seat: Some(0),
+            hand_no: 0,
         }
+    }
+
+    #[test]
+    fn hand_state_carries_hand_no() {
+        let state = HandState {
+            hand_no: 42,
+            ..sample_state()
+        };
+        assert_eq!(state.hand_no, 42);
     }
 
     #[test]
@@ -217,12 +241,27 @@ mod tests {
             chips: 5_000,
             bet: 250,
             is_active: false,
+            player_id: None,
         };
         assert_eq!(s.seat, 3);
         assert_eq!(s.name, "carol");
         assert_eq!(s.chips, 5_000);
         assert_eq!(s.bet, 250);
         assert!(!s.is_active);
+    }
+
+    #[test]
+    fn seat_snapshot_carries_player_id() {
+        let id = uuid::Uuid::from_u128(0x00C0_FFEE);
+        let s = SeatSnapshot {
+            seat: 0,
+            name: "alice".to_string(),
+            chips: 100,
+            bet: 0,
+            is_active: true,
+            player_id: Some(id),
+        };
+        assert_eq!(s.player_id, Some(id));
     }
 
     #[test]

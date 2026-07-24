@@ -16,11 +16,13 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── build ──────────────────────────────────────────────────────────────
 FROM chef AS builder
 ARG BIN_NAME
+# Optional cargo feature list (e.g. "collusion" for EPIC-70 colluding agents).
+ARG FEATURES=""
 RUN test -n "$BIN_NAME" || (echo "BIN_NAME build arg is required" && exit 1)
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --bin "$BIN_NAME" --recipe-path recipe.json
+RUN cargo chef cook --release --bin "$BIN_NAME" ${FEATURES:+--features "$FEATURES"} --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --bin "$BIN_NAME"
+RUN cargo build --release --bin "$BIN_NAME" ${FEATURES:+--features "$FEATURES"}
 RUN cp "/app/target/release/$BIN_NAME" /app/agent_bin
 
 # ── runtime ────────────────────────────────────────────────────────────

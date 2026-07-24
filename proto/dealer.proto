@@ -286,6 +286,10 @@ message SeatInfo {
   // unpriceable (no pricing table, model not priced, or bot). Divide by 1e6 to
   // display. Computed from session tokens + PKDEALER_PRICING / PKDEALER_PRICE_AS.
   uint64 cost_micro_usd = 12;
+  // Stable per-seat player UUID (the server's player token). Public identity,
+  // not a hole card — never redacted. Empty when the seat is unoccupied or the
+  // token is unknown. (EPIC-70 Phase 3.)
+  string player_id = 13;
 }
 
 message GetNextToActRequest {}

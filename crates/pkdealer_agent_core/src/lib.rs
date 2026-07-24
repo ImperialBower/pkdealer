@@ -1,4 +1,7 @@
 #![warn(clippy::pedantic, clippy::unwrap_used, clippy::expect_used)]
+// unwrap/expect are the idiomatic failure report in tests; the ban above is
+// for shipping code only (see CLAUDE.md → Error Handling).
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 //! Shared infrastructure for pkdealer bot agent binaries.
 //!
 //! This crate provides the common building blocks used by all three agent
@@ -52,6 +55,8 @@
 //! ```
 
 pub mod agent;
+#[cfg(feature = "collusion")]
+pub mod backchannel;
 pub mod error;
 pub mod hand_state;
 pub mod runner;

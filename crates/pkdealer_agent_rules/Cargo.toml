@@ -24,3 +24,15 @@ clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 serde_json = "1"
 uuid = { version = "1.22", features = ["v4"] }
+
+[dev-dependencies]
+# The Vector-B adapter test stands up a loopback relay; these tokio features
+# reach the crate transitively today, but the tests depend on them directly.
+tokio = { version = "1", features = ["net", "io-util", "sync", "time"] }
+
+[features]
+# EPIC-70: colluding-agent machinery. Off by default — a default build is
+# byte-for-byte the honest agent.
+# Forwards to agent_core, whose `backchannel` module (Vector B) is gated the
+# same way.
+collusion = ["pkdealer_agent_core/collusion"]

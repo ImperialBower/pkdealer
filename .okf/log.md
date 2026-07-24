@@ -1,5 +1,9 @@
 # Update Log
 
+## 2026-07-23
+* **Creation**: Added the [pkdealer_boss](/crates/pkdealer_boss.md) crate concept — the Boss, blind collusion detection (redacted signals + SPRT + card-aware scorer) for EPIC-70 Phases 0–2.
+* **Update**: [Workspace crates](/crates/index.md) — added a Collusion-detection section for `pkdealer_boss`.
+
 ## 2026-07-22
 * **Update**: [EPIC docs](/references/epic-docs.md) — pkdealer EPIC-46 (collusion) consolidated into EPIC-70 per the cross-repo numbering registry; added the ten-block numbering note.
 * **Creation**: Scaffolded the PKDealer Knowledge Bundle with `okf_init.py`.

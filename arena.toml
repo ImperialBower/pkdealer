@@ -8,11 +8,27 @@
 #
 # The registry is additive: new entries here need no script changes.
 #
-# `type` must be one of: rules | ollama | claude | gemini
+# `type` must be one of: rules | ollama | claude | gemini | boss
 #   rules  — pkdealer_agent_rules,  uses `profile` (a pkcore built-in archetype)
 #   ollama — pkdealer_agent_ollama, uses `model` (talks to host `ollama serve`)
 #   claude — pkdealer_agent_claude, uses `model`  ┐ live LLM, needs an API key
 #   gemini — pkdealer_agent_gemini, uses `model`  ┘
+#   boss   — pkdealer_agent_boss (EPIC-70 Phase 4): the live blind collusion
+#            detector. An observer, not a seat — it takes no profile and never
+#            joins the table; it polls ExportSession under the spectator token
+#            and emits per-pair SPRT verdicts over OTel.
+#
+# `team` (optional, rules-only) — EPIC-70 collusion: the two seats sharing a
+#   team id secretly collude. bin/arena expands membership into explicit
+#   --collude-with / --collusion-channel / --collusion-style flags on each
+#   member (pairs only; a team with ≠2 seats in the lineup is rejected).
+# `style` (optional, teamed seats) — collusion strategy: soft | whipsaw | dump
+#   (default soft).
+# `channel` (optional, teamed seats) — card-leak vector: spectator | peer
+#   (default spectator). `spectator` reads the partner's cards via the dealer's
+#   spectator token (Vector A); `peer` shares them over a `pkdealer_backchannel`
+#   broker service that bin/arena spins up automatically when any peer colluder
+#   is in the lineup (Vector B). Both teammates should set the same channel.
 #
 # ── TODO / availability (EPIC-42 scope) ───────────────────────────────────────
 #   claude  — requires ANTHROPIC_API_KEY in the calling shell (live, billed).
@@ -58,6 +74,40 @@ profile = "short_stack_ninja"
 [players.joker]
 type    = "rules"
 profile = "joker"
+
+# EPIC-70 colluding pair — mallory & trudy secretly share hole cards via the
+# spectator token (Vector A). Seat them with honest bots: ./bin/arena mallory trudy gto lag
+[players.mallory]
+type    = "rules"
+profile = "tight_aggressive"
+team    = "A"
+
+[players.trudy]
+type    = "rules"
+profile = "loose_aggressive"
+team    = "A"
+
+# EPIC-70 colluding pair — carol & dave share hole cards over the peer
+# backchannel broker (Vector B), no spectator token. bin/arena auto-adds the
+# pkdealer_backchannel service: ./bin/arena carol dave gto lag
+[players.carol]
+type    = "rules"
+profile = "tight_aggressive"
+team    = "B"
+style   = "dump"
+channel = "peer"
+
+[players.dave]
+type    = "rules"
+profile = "loose_aggressive"
+team    = "B"
+style   = "dump"
+channel = "peer"
+
+# EPIC-70 Phase 4 — the live blind Boss. Add it to any lineup to watch for
+# collusion in real time: ./bin/arena mallory trudy gto lag boss
+[players.boss]
+type = "boss"
 
 [players.llama]
 type  = "ollama"

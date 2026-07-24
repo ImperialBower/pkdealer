@@ -107,8 +107,37 @@ mod tests {
 - Use full words in variable names (e.g., `cards` instead of `c`, `rank` instead of `r`)
 
 ### Error Handling
-- **Never use `unwrap()`, `expect()`, or `panic!()` in library code**
-- It's acceptable to use these in tests if testing, but not in production code
+
+**`unwrap()` / `expect()` / `panic!()` are forbidden in non-test code, and fine in test code.**
+
+- **Forbidden** in everything that ships: library code, binary `main`/CLI paths,
+  and any helper reachable from them. Return `Result<T, E>` (or `Option<T>`) and
+  propagate with `?`. For a value you can prove is present, prefer a total
+  construct — `unwrap_or`, `unwrap_or_default`, `unwrap_or_else`, `map_or`,
+  `let ... else`, or a `match` — over `unwrap()` with a comment.
+- **Allowed** in `#[cfg(test)]` modules, `tests/` integration tests, test-only
+  fixture/helper modules, benches, and **doc-test examples** (a `///` example
+  that ends in `.unwrap()` is idiomatic and reads better than error plumbing).
+  A panic in a test *is* the failure report.
+- **Encode it, don't just document it.** Crate roots carry
+  `#![warn(clippy::pedantic, clippy::unwrap_used, clippy::expect_used)]`, which
+  also fires inside `#[cfg(test)]` modules and makes
+  `cargo clippy --all-targets` noisy with unactionable test warnings. Pair the
+  warn with a test-scoped allow at the crate root so the lint means what this
+  rule says:
+
+  ```rust
+  #![warn(clippy::pedantic, clippy::unwrap_used, clippy::expect_used)]
+  // unwrap/expect are the idiomatic failure report in tests; the ban above is
+  // for shipping code only.
+  #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+  ```
+
+  Test-only modules that are themselves `#[cfg(test)]` (e.g. `fixtures.rs`) may
+  instead carry a module-level `#![allow(clippy::unwrap_used)]`.
+- The enforced gate is lib+bin (`cargo clippy -p <crate> -- -D warnings`), which
+  does not compile `cfg(test)` code — so a clean gate is not evidence that test
+  code is lint-free. Use `--all-targets` when you want the whole picture.
 - Prefer `Result<T, E>` over `Option<T>` for operations that can fail with meaningful errors
 - Create custom error types for domain-specific errors
 - Implement `std::error::Error` for custom error types
@@ -154,7 +183,7 @@ Before accepting or suggesting code:
 - ✓ Are there unit tests covering happy path, edge cases, and error conditions?
 - ✓ Are there doc tests in the doc comments that compile and run?
 - ✓ Are all error cases handled and documented?
-- ✓ Does the code avoid `unwrap()`, `expect()`, and `panic!()` in library code?
+- ✓ Does **non-test** code avoid `unwrap()`, `expect()`, and `panic!()`? (Tests and doc-test examples may use them freely.)
 - ✓ Are edge cases and boundary conditions covered in tests?
 - ✓ Is the code readable and maintainable?
 - ✓ Are all public APIs documented with examples?
@@ -162,72 +191,6 @@ Before accepting or suggesting code:
 - ✓ Do doc tests pass with `cargo test --doc`?
 - ✓ Does the code follow naming conventions?
 - ✓ Are trait implementations documented if behavior is non-obvious?
-
-## Testing Commands
-
-```bash
-# Run all tests
-cargo test
-
-# Run doc tests only
-cargo test --doc
-
-# Run tests with output
-cargo test -- --nocapture
-
-# Run specific test
-cargo test function_name
-
-# Run tests with specific number of threads
-cargo test -- --test-threads=1
-
-# Run tests matching a pattern
-cargo test function_name
-```
-
-## Common Patterns to Use
-
-### Result Type for Fallible Operations
-```rust
-pub fn operation(param: Type) -> Result<ReturnType, ErrorType> {
-    // implementation
-}
-```
-
-### Option Type for Optional Values
-```rust
-pub fn find_value(key: &str) -> Option<Value> {
-    // implementation
-}
-```
-
-### Custom Error Type
-```rust
-#[derive(Debug)]
-pub enum MyError {
-    InvalidInput(String),
-    NotFound,
-}
-
-impl std::fmt::Display for MyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            MyError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
-            MyError::NotFound => write!(f, "Not found"),
-        }
-    }
-}
-
-impl std::error::Error for MyError {}
-```
-
-## References
-
-- [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
-- [Rust Book - Error Handling](https://doc.rust-lang.org/book/ch09-00-error-handling.html)
-- [Rust by Example: Documentation](https://doc.rust-lang.org/rust-by-example/meta/doc.html)
-- [Writing Unsafe Rust](https://doc.rust-lang.org/book/ch19-01-unsafe-rust.html)
-- [Effective Rust](https://effective-rust.dev/)
 
 ## Observability
 

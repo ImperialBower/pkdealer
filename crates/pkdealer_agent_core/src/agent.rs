@@ -142,6 +142,7 @@ mod tests {
             street: "preflop".to_string(),
             action_history: vec![],
             button_seat: None,
+            hand_no: 0,
         }
     }
 
