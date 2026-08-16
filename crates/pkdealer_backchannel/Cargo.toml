@@ -20,5 +20,9 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 uuid = { version = "1.22", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# Only the `CardShare` doc-test and the unit tests serialize; the broker itself
+# relays raw lines. Keeping this out of [dependencies] keeps cargo-udeps green.
+serde_json = "1"
