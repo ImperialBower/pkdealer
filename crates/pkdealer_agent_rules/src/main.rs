@@ -744,6 +744,13 @@ fn snapshot_with_stats<'a>(
         to_call: state.to_call as usize,
         current_bet: state.to_call as usize,
         min_raise: state.big_blind as usize,
+        // `HandState` carries no per-street raise count, so this is synthesized
+        // like `min_raise` above. pkcore uses it only for the Fixed-Limit raise
+        // cap; reporting 0 means `raise_bounds()` never sees the cap as full, so
+        // a capped-out raise can still be proposed and then rejected by the
+        // table. No effect on No-Limit or Pot-Limit. Carrying the real count on
+        // the proto is tracked separately.
+        raises_this_street: 0,
         my_chips: state.my_chips as usize,
         stacks,
         big_blind: state.big_blind as usize,
