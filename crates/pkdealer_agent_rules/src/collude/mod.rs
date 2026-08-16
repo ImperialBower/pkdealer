@@ -210,7 +210,9 @@ mod ab_equivalence {
         // standing in for the channel, an actual second channel.
         let addr = broker().await;
         let trudy_peer = PeerSource {
-            client: BackchannelClient::connect(&addr).await.expect("trudy connect"),
+            client: BackchannelClient::connect(&addr)
+                .await
+                .expect("trudy connect"),
         };
         let mallory_peer = PeerSource {
             client: BackchannelClient::connect(&addr)
@@ -220,13 +222,7 @@ mod ab_equivalence {
         settle().await;
         // Trudy publishes her (strong) cards over the wire first.
         trudy_peer
-            .partner_hole(
-                state.hand_no,
-                1,
-                trudy_id,
-                &strong_partner_hole,
-                mallory_id,
-            )
+            .partner_hole(state.hand_no, 1, trudy_id, &strong_partner_hole, mallory_id)
             .await;
         settle().await;
         let via_peer = mallory_peer

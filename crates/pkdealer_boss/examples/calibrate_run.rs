@@ -105,7 +105,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("\n== did it pay? (single run, no control) ==");
-    println!("pair pooled bb/100: {:.2}", pooled_bb_per_100(&hands, &pair));
+    println!(
+        "pair pooled bb/100: {:.2}",
+        pooled_bb_per_100(&hands, &pair)
+    );
 
     // Fit the null from THIS run. Caveat printed below: a real null needs
     // honest-only control runs; this pools every pair in one mixed run.

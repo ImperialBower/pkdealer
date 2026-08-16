@@ -18,7 +18,11 @@ use pkdealer_agent_boss::otel::init_otel;
 #[command(name = "pkdealer_agent_boss", version, about)]
 struct Cli {
     /// Dealer service endpoint.
-    #[arg(long, env = "PKDEALER_ENDPOINT", default_value = "http://localhost:50051")]
+    #[arg(
+        long,
+        env = "PKDEALER_ENDPOINT",
+        default_value = "http://localhost:50051"
+    )]
     endpoint: String,
 
     /// Spectator token presented on `ExportSession` (the service gates it).

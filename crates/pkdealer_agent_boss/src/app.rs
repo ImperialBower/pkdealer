@@ -109,8 +109,7 @@ pub struct FlagEvent {
 /// assert!(ingest(&payload).unwrap().is_empty());
 /// ```
 pub fn ingest(payload: &str) -> Result<Vec<RedactedHand>, String> {
-    let collection: HandCollection =
-        serde_json::from_str(payload).map_err(|e| e.to_string())?;
+    let collection: HandCollection = serde_json::from_str(payload).map_err(|e| e.to_string())?;
     Ok(redact(&collection))
 }
 
@@ -148,8 +147,8 @@ pub fn evaluate(
         if !flagged.insert(verdict.pair) {
             continue;
         }
-        let false_positive = labels
-            .is_some_and(|l| !l.is_colluding(verdict.pair.a, verdict.pair.b));
+        let false_positive =
+            labels.is_some_and(|l| !l.is_colluding(verdict.pair.a, verdict.pair.b));
         events.push(FlagEvent {
             pair: verdict.pair,
             hand,
@@ -187,16 +186,19 @@ fn load_labels(config: &RunConfig) -> Result<Option<GroundTruthLabels>, AgentBos
     match &config.labels {
         None => Ok(None),
         Some(path) => {
-            let raw = std::fs::read_to_string(path).map_err(|e| AgentBossError::Io(e.to_string()))?;
-            let labels =
-                GroundTruthLabels::from_yaml(&raw).map_err(|e| AgentBossError::Labels(e.to_string()))?;
+            let raw =
+                std::fs::read_to_string(path).map_err(|e| AgentBossError::Io(e.to_string()))?;
+            let labels = GroundTruthLabels::from_yaml(&raw)
+                .map_err(|e| AgentBossError::Labels(e.to_string()))?;
             Ok(Some(labels))
         }
     }
 }
 
 /// Pulls the current completed-hand count from the service.
-async fn session_hand_count(client: &mut DealerServiceClient<tonic::transport::Channel>) -> Option<u32> {
+async fn session_hand_count(
+    client: &mut DealerServiceClient<tonic::transport::Channel>,
+) -> Option<u32> {
     match client.get_session_info(GetSessionInfoRequest {}).await {
         Ok(resp) => Some(resp.into_inner().hand_count),
         Err(_) => None,
@@ -339,13 +341,20 @@ mod tests {
         let mut flagged = HashSet::new();
         let events = evaluate(&verdicts, Some(&labels), &mut flagged);
         assert_eq!(events.len(), 1);
-        assert!(!events[0].false_positive, "labelled colluders are true positives");
+        assert!(
+            !events[0].false_positive,
+            "labelled colluders are true positives"
+        );
     }
 
     #[test]
     fn evaluate_false_positive_when_labels_disagree() {
         // A flag against a pair the (empty) labels do not list as colluding.
-        let verdicts = [verdict(Uuid::from_u128(0xaa), Uuid::from_u128(0xbb), Some(60))];
+        let verdicts = [verdict(
+            Uuid::from_u128(0xaa),
+            Uuid::from_u128(0xbb),
+            Some(60),
+        )];
         let labels = GroundTruthLabels {
             colluding_pairs: vec![],
         };

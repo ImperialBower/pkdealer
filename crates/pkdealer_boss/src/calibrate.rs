@@ -260,7 +260,14 @@ mod tests {
     #[test]
     fn summarize_empty_is_zero() {
         let s = summarize(&[]);
-        assert_eq!(s, SignalNull { mean: 0.0, std: 0.0, n: 0 });
+        assert_eq!(
+            s,
+            SignalNull {
+                mean: 0.0,
+                std: 0.0,
+                n: 0
+            }
+        );
     }
 
     #[test]
@@ -279,8 +286,14 @@ mod tests {
         // 0 / 100 → rate 0, lower bound 0, upper bound small but positive.
         let (rate, lo, hi) = wilson(0, 100);
         assert!(rate.abs() < f64::EPSILON, "0/100 is a zero rate");
-        assert!(lo.abs() < 1e-12, "lower bound is (floating-point) zero, got {lo}");
-        assert!(hi > 0.0 && hi < 0.05, "one-sided Wilson upper bound is small");
+        assert!(
+            lo.abs() < 1e-12,
+            "lower bound is (floating-point) zero, got {lo}"
+        );
+        assert!(
+            hi > 0.0 && hi < 0.05,
+            "one-sided Wilson upper bound is small"
+        );
     }
 
     #[test]
@@ -300,7 +313,9 @@ mod tests {
         let verdicts = assess(&hands, &SprtParams::default());
         let run = FpRun {
             verdicts,
-            labels: GroundTruthLabels { colluding_pairs: vec![] },
+            labels: GroundTruthLabels {
+                colluding_pairs: vec![],
+            },
         };
         let study = fp_rate_with_ci(&[run]);
         assert!(study.honest_pairs >= 1);
