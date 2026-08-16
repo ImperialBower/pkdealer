@@ -10,12 +10,15 @@ members = [
     "crates/pkdealer_agent_claude",
     "crates/pkdealer_agent_ollama",
     "crates/pkdealer_costsim",
+    "crates/pkdealer_boss",
+    "crates/pkdealer_agent_boss",
+    "crates/pkdealer_backchannel",
     "crates/pkdealer_pricing",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.20"
+version = "0.1.21"
 edition = "2024"
 authors = ["electronicpanopticon <gaoler@electronicpanopticon.com>"]
 license = "MIT OR Apache-2.0"

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# bin/detect — EPIC-70 collusion-detection runner with FIXED blinds.
+#
+# Launches the cheat-detection scenario on a *stable* table: the tournament
+# blind schedule is disabled, so the Boss's chip-flow and bb/100 signals aren't
+# perturbed by escalating blinds or the stack-recycle at the top of the
+# schedule. Everything else is plain `bin/arena` — this wrapper only freezes the
+# blinds and picks a sensible default lineup.
+#
+# Usage:
+#   ./bin/detect                              # default: carol dave gto lag boss
+#   ./bin/detect carol dave gto lag tag boss  # custom lineup, still fixed blinds
+#   ./bin/detect --dry-run                     # inspect the override, no launch
+#
+# The default lineup seats the peer-backchannel colluders (carol + dave, team B)
+# with two honest bots and the live Boss (`agent_boss_1`). Pass your own lineup
+# to change the table; the fixed-blind behavior applies to whatever you run.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+# Freeze the tournament blind schedule for this run only. The base
+# docker-compose.yml reads PKDEALER_BLIND_SCHEDULE_ENABLED via ${...:-true}, so
+# exporting it here overrides the service without touching the shared file.
+export PKDEALER_BLIND_SCHEDULE_ENABLED=false
+
+# Seat the default cheat-detection lineup when no positional players were given
+# (nothing, or flags only such as --dry-run).
+has_player=0
+for arg in "$@"; do
+  [[ "$arg" == -* ]] || { has_player=1; break; }
+done
+if [[ "$has_player" -eq 0 ]]; then
+  set -- "$@" carol dave gto lag boss
+fi
+
+echo "[detect] blinds frozen (PKDEALER_BLIND_SCHEDULE_ENABLED=false) — collusion-detection run"
+echo "[detect] lineup: $*"
+exec ./bin/arena "$@"

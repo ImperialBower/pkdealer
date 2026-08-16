@@ -82,10 +82,15 @@ use tokio::sync::Mutex;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
+#[cfg(feature = "collusion")]
+mod collude;
+#[cfg(feature = "collusion")]
+use collude::{CollusionChannel, CollusionConfig, CollusionStyle};
+
 /// gRPC metadata key carrying the caller's auth/visibility token. Mirrors
 /// `PLAYER_TOKEN_METADATA_KEY` in the service; `ExportSession` requires the
 /// spectator token here because its payload carries every seat's hole cards.
-const PLAYER_TOKEN_METADATA_KEY: &str = "x-player-token";
+pub(crate) const PLAYER_TOKEN_METADATA_KEY: &str = "x-player-token";
 
 /// Rule-based poker bot connected to a pkdealer gRPC service.
 #[derive(Debug, Parser)]
@@ -163,6 +168,31 @@ struct Args {
     /// `spectator`). Ignored when `exploit` resolves to `off`.
     #[arg(long, env = "PKDEALER_SPECTATOR_TOKEN", default_value = "spectator")]
     spectator_token: String,
+
+    /// Collude with the named partner (arena-composed name, e.g. `trudy_1`).
+    /// EPIC-70: enables the cheating wrapper; requires a spectator token for
+    /// the `spectator` channel. Absent ⇒ the agent is fully honest.
+    #[cfg(feature = "collusion")]
+    #[arg(long)]
+    collude_with: Option<String>,
+
+    /// Card-leak channel: `spectator` (Vector A) or `peer` (Vector B).
+    #[cfg(feature = "collusion")]
+    #[arg(long, value_enum, default_value = "spectator")]
+    collusion_channel: CollusionChannelArg,
+
+    /// Backchannel broker address used by the `peer` collusion channel
+    /// (Vector B), e.g. `127.0.0.1:9099` — the pair swap hole cards here, over
+    /// a relay the dealer never sees. Matches the broker's
+    /// `PKDEALER_BACKCHANNEL_BIND`. Ignored by the `spectator` channel.
+    #[cfg(feature = "collusion")]
+    #[arg(long, env = "PKDEALER_BACKCHANNEL", default_value = "127.0.0.1:9099")]
+    backchannel: String,
+
+    /// Collusion strategy: `soft`, `whipsaw`, or `dump`.
+    #[cfg(feature = "collusion")]
+    #[arg(long, value_enum, default_value = "soft")]
+    collusion_style: CollusionStyleArg,
 }
 
 /// CLI mirror of [`EquityMode`] (the `samples` budget comes from `--equity-samples`).
@@ -214,6 +244,119 @@ enum PreflopChartsArg {
     Hup,
     /// Offline-generated GTO charts.
     Solver,
+}
+
+/// CLI mirror of [`CollusionChannel`] (EPIC-70).
+#[cfg(feature = "collusion")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CollusionChannelArg {
+    /// Vector A: partner cards read live via the spectator token.
+    Spectator,
+    /// Vector B: partner cards exchanged over the backchannel broker.
+    Peer,
+}
+
+/// CLI mirror of [`CollusionStyle`] (EPIC-70).
+#[cfg(feature = "collusion")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CollusionStyleArg {
+    /// Never bet/raise into the partner heads-up.
+    Soft,
+    /// Re-raise behind the partner to squeeze third parties.
+    Whipsaw,
+    /// Fold the weaker team hand to the partner.
+    Dump,
+}
+
+/// Resolves and validates the collusion flags into a [`CollusionConfig`].
+///
+/// Mirrors the `--exploit` validation posture: configuration errors are
+/// fatal at startup (a colluder that cannot leak is a broken experiment,
+/// not a degraded bot). Returns `Ok(None)` when `--collude-with` is absent —
+/// the agent is then byte-for-byte the honest bot.
+///
+/// # Errors
+///
+/// Returns a human-readable message when the partner names this agent, when
+/// the `spectator` channel is selected without a `--spectator-token`, or when
+/// the `peer` channel is selected without a `--backchannel` address.
+#[cfg(feature = "collusion")]
+fn validate_collusion(args: &Args) -> Result<Option<CollusionConfig>, String> {
+    let Some(partner) = args.collude_with.clone() else {
+        return Ok(None);
+    };
+    if partner == args.name {
+        return Err("--collude-with must name a different player".to_string());
+    }
+    let channel = match args.collusion_channel {
+        CollusionChannelArg::Spectator => CollusionChannel::Spectator,
+        CollusionChannelArg::Peer => CollusionChannel::Peer,
+    };
+    // Each channel validates only its own endpoint — exhaustively, so a new
+    // channel cannot slip through unvalidated.
+    match channel {
+        CollusionChannel::Spectator => {
+            if args.spectator_token.is_empty() {
+                return Err(
+                    "the spectator collusion channel requires --spectator-token".to_string()
+                );
+            }
+        }
+        CollusionChannel::Peer => {
+            if args.backchannel.is_empty() {
+                return Err(
+                    "the peer collusion channel requires --backchannel (PKDEALER_BACKCHANNEL)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let style = match args.collusion_style {
+        CollusionStyleArg::Soft => CollusionStyle::Soft,
+        CollusionStyleArg::Whipsaw => CollusionStyle::Whipsaw,
+        CollusionStyleArg::Dump => CollusionStyle::Dump,
+    };
+    Ok(Some(CollusionConfig {
+        partner,
+        channel,
+        style,
+    }))
+}
+
+/// Opens the card channel named by a validated [`CollusionConfig`] and boxes it
+/// as the channel-agnostic [`collude::PartnerCardSource`] the decide path uses.
+///
+/// `Spectator` dials the dealer a second time with the spectator token;
+/// `Peer` dials the backchannel broker. Everything downstream of this function
+/// is identical for both — that is the A/B equivalence the Boss relies on.
+///
+/// # Errors
+///
+/// Returns a human-readable message when the channel's endpoint is
+/// unreachable. The caller exits: a colluder that cannot leak is a broken
+/// experiment, not a degraded bot.
+#[cfg(feature = "collusion")]
+async fn connect_partner_source(
+    args: &Args,
+    config: &CollusionConfig,
+) -> Result<Box<dyn collude::PartnerCardSource>, String> {
+    match config.channel {
+        CollusionChannel::Spectator => collude::spectator::SpectatorLeak::connect(
+            args.endpoint.clone(),
+            args.spectator_token.clone(),
+            config.partner.clone(),
+        )
+        .await
+        .map(|leak| Box::new(leak) as Box<dyn collude::PartnerCardSource>),
+        CollusionChannel::Peer => {
+            pkdealer_agent_core::backchannel::BackchannelClient::connect(&args.backchannel)
+                .await
+                .map(|client| {
+                    Box::new(collude::backchannel_source::PeerSource { client })
+                        as Box<dyn collude::PartnerCardSource>
+                })
+        }
+    }
 }
 
 /// Applies any `--equity` / `--ranges` / … CLI overrides onto a loaded
@@ -288,12 +431,88 @@ struct RulesAgent {
     /// wired: the snapshot carries `opponent_stats: None` and the `exploit` knob
     /// is inert (see [`ExploitPuller`]).
     exploit: Option<ExploitPuller>,
+    /// EPIC-70: active collusion runtime — the resolved partner assignment plus
+    /// its card channel. `None` ⇒ the agent is byte-for-byte honest.
+    #[cfg(feature = "collusion")]
+    collusion: Option<Colluder>,
+}
+
+/// A validated collusion assignment bound to its live card channel (EPIC-70).
+#[cfg(feature = "collusion")]
+struct Colluder {
+    /// The resolved partner / channel / style assignment.
+    config: CollusionConfig,
+    /// Live partner-card channel, behind the channel-agnostic trait: Vector A
+    /// (spectator leak) and Vector B (peer backchannel) are indistinguishable
+    /// from here on.
+    source: Box<dyn collude::PartnerCardSource>,
+}
+
+impl RulesAgent {
+    /// Honest constructor — collusion (when compiled in) starts disabled, so a
+    /// `RulesAgent::new(profile, exploit)` is byte-for-byte the pre-EPIC-70 bot.
+    fn new(profile: BotProfile, exploit: Option<ExploitPuller>) -> Self {
+        Self {
+            profile,
+            exploit,
+            #[cfg(feature = "collusion")]
+            collusion: None,
+        }
+    }
+
+    /// The honest decider's base action, then — only when colluding and the
+    /// partner's cards were read this turn — the style adjustment. A failed
+    /// leak read means the turn is decided honestly (best-effort, per
+    /// decision), so a colluder degrades gracefully to its underlying bot.
+    /// Missing seat identities (either side's `player_id`) degrade the same
+    /// way: no leak attempt, honest play.
+    ///
+    /// The `async` signature is stable across builds; with the `collusion`
+    /// feature off there is no partner-card `await`, hence the targeted lint
+    /// allow.
+    #[cfg_attr(not(feature = "collusion"), allow(clippy::unused_async))]
+    async fn choose(&self, state: &HandState, snapshot: &TableSnapshot<'_>) -> PkcoreAction {
+        let base = RuleBasedDecider.decide(&self.profile, snapshot);
+        #[cfg(feature = "collusion")]
+        if let Some(colluder) = &self.collusion {
+            // Both identities come off the same snapshot the dealer just sent,
+            // so the pair agree on who is who without any out-of-band config.
+            if let (Some(partner), Some(me)) = (
+                state
+                    .stacks
+                    .iter()
+                    .find(|s| s.name == colluder.config.partner),
+                state.stacks.iter().find(|s| s.seat == state.seat),
+            ) {
+                if let (Some(partner_id), Some(my_id)) = (partner.player_id, me.player_id) {
+                    let my_cards = Cards::forgiving_from_str(&state.hole_cards);
+                    if let Some(partner_hole) = colluder
+                        .source
+                        .partner_hole(state.hand_no, state.seat, my_id, &my_cards, partner_id)
+                        .await
+                    {
+                        return collude::strategy::apply_style(
+                            colluder.config.style,
+                            base,
+                            snapshot,
+                            partner.seat,
+                            &partner_hole,
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "collusion"))]
+        let _ = state;
+        base
+    }
 }
 
 #[async_trait]
 impl PokerAgent for RulesAgent {
     /// Converts the gRPC-derived [`HandState`] into a pkcore [`TableSnapshot`]
-    /// and delegates the decision to [`RuleBasedDecider`].
+    /// and delegates the decision to [`RuleBasedDecider`] via [`Self::choose`]
+    /// (which applies any EPIC-70 collusion adjustment).
     ///
     /// When an [`ExploitPuller`] is attached, it first refreshes the per-player
     /// [`StatsRegistry`] from the service's completed-hand history (throttled to
@@ -301,14 +520,16 @@ impl PokerAgent for RulesAgent {
     /// derived `seat → player_id` map — onto the snapshot so the decider's
     /// `exploit` path engages against the real opponents.
     async fn decide(&self, state: &HandState) -> Decision {
-        if let Some(puller) = &self.exploit {
+        let action = if let Some(puller) = &self.exploit {
             puller.refresh().await;
             let guard = puller.state.lock().await;
             let snapshot = snapshot_with_stats(state, Some(&guard.registry), &guard.seat_ids);
-            return pkcore_action_to_decision(RuleBasedDecider.decide(&self.profile, &snapshot));
-        }
-        let snapshot = hand_state_to_snapshot(state);
-        pkcore_action_to_decision(RuleBasedDecider.decide(&self.profile, &snapshot))
+            self.choose(state, &snapshot).await
+        } else {
+            let snapshot = hand_state_to_snapshot(state);
+            self.choose(state, &snapshot).await
+        };
+        pkcore_action_to_decision(action)
     }
 }
 
@@ -664,10 +885,35 @@ async fn main() {
     let exploit = connect_exploit_puller(
         &profile,
         args.endpoint.clone(),
-        args.spectator_token,
+        args.spectator_token.clone(),
         &args.name,
     )
     .await;
+
+    // EPIC-70: resolve collusion before `args` fields are moved into the config.
+    // Configuration errors are fatal (a colluder that cannot leak is a broken
+    // experiment); absent flags leave `collusion` None and the agent honest.
+    #[cfg(feature = "collusion")]
+    let collusion = match validate_collusion(&args) {
+        Ok(None) => None,
+        Ok(Some(config)) => match connect_partner_source(&args, &config).await {
+            Ok(source) => {
+                eprintln!(
+                    "[{}] COLLUSION ACTIVE: partner={} channel={:?} style={:?}",
+                    args.name, config.partner, config.channel, config.style
+                );
+                Some(Colluder { config, source })
+            }
+            Err(e) => {
+                eprintln!("[{}] collusion requested but {e}", args.name);
+                process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("[{}] invalid collusion flags: {e}", args.name);
+            process::exit(1);
+        }
+    };
 
     let config = AgentConfig {
         endpoint: args.endpoint,
@@ -677,7 +923,15 @@ async fn main() {
         client_secret: args.client_secret,
     };
 
-    if let Err(e) = run_agent(RulesAgent { profile, exploit }, config).await {
+    #[cfg(feature = "collusion")]
+    let mut agent = RulesAgent::new(profile, exploit);
+    #[cfg(not(feature = "collusion"))]
+    let agent = RulesAgent::new(profile, exploit);
+    #[cfg(feature = "collusion")]
+    {
+        agent.collusion = collusion;
+    }
+    if let Err(e) = run_agent(agent, config).await {
         eprintln!("Agent error: {e}");
         process::exit(1);
     }
@@ -704,6 +958,7 @@ mod tests {
                     chips: 9_900,
                     bet: 100,
                     is_active: true,
+                    player_id: None,
                 },
                 SeatSnapshot {
                     seat: 1,
@@ -711,12 +966,14 @@ mod tests {
                     chips: 10_000,
                     bet: 0,
                     is_active: true,
+                    player_id: None,
                 },
             ],
             big_blind: 100,
             street: "preflop".to_string(),
             action_history: vec![],
             button_seat: Some(0),
+            hand_no: 0,
         }
     }
 
@@ -807,6 +1064,7 @@ mod tests {
                     chips: 9_900,
                     bet: 100,
                     is_active: true,
+                    player_id: None,
                 },
                 SeatSnapshot {
                     seat: 1,
@@ -814,6 +1072,7 @@ mod tests {
                     chips: 10_000,
                     bet: 0,
                     is_active: false,
+                    player_id: None,
                 },
             ],
             ..sample_state()
@@ -838,6 +1097,7 @@ mod tests {
                     chips: 9_000,
                     bet: 0,
                     is_active: true,
+                    player_id: None,
                 },
                 SeatSnapshot {
                     seat: 6,
@@ -845,6 +1105,7 @@ mod tests {
                     chips: 9_000,
                     bet: 0,
                     is_active: true,
+                    player_id: None,
                 },
             ],
             ..sample_state()
@@ -1156,10 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn rules_agent_legal_action_with_to_call() {
-        let agent = RulesAgent {
-            profile: BotProfile::gto(),
-            exploit: None,
-        };
+        let agent = RulesAgent::new(BotProfile::gto(), None);
         let state = sample_state();
         let decision = agent.decide(&state).await;
         assert!(
@@ -1173,10 +1431,7 @@ mod tests {
 
     #[tokio::test]
     async fn rules_agent_legal_action_without_to_call() {
-        let agent = RulesAgent {
-            profile: BotProfile::gto(),
-            exploit: None,
-        };
+        let agent = RulesAgent::new(BotProfile::gto(), None);
         let state = HandState {
             to_call: 0,
             ..sample_state()
@@ -1190,10 +1445,7 @@ mod tests {
 
     #[tokio::test]
     async fn rules_agent_zero_chips_checks() {
-        let agent = RulesAgent {
-            profile: BotProfile::gto(),
-            exploit: None,
-        };
+        let agent = RulesAgent::new(BotProfile::gto(), None);
         let state = HandState {
             my_chips: 0,
             to_call: 0,
@@ -1206,12 +1458,21 @@ mod tests {
     #[tokio::test]
     async fn rules_agent_all_profiles_produce_actions() {
         for profile in BotProfile::default_profiles() {
-            let agent = RulesAgent {
-                profile,
-                exploit: None,
-            };
+            let agent = RulesAgent::new(profile, None);
             let _ = agent.decide(&sample_state()).await;
         }
+    }
+
+    #[cfg(feature = "collusion")]
+    #[tokio::test]
+    async fn rules_agent_without_collusion_behaves_honest() {
+        // The wrapper is strictly additive: no config ⇒ the exact honest path.
+        let agent = RulesAgent::new(BotProfile::gto(), None);
+        let decision = agent.decide(&sample_state()).await;
+        assert!(matches!(
+            decision,
+            Decision::Fold | Decision::Call | Decision::Raise(_) | Decision::AllIn
+        ));
     }
 
     #[test]
@@ -1274,5 +1535,236 @@ mod tests {
             .expect("seat/chips args should parse");
         assert_eq!(args.seat, Some(2));
         assert_eq!(args.chips, 5_000);
+    }
+
+    /// End-to-end wiring of [`Colluder`] through [`RulesAgent::choose`] with a
+    /// stub [`collude::PartnerCardSource`] — the identity resolution and the
+    /// graceful degradation when a seat carries no `player_id`.
+    #[cfg(feature = "collusion")]
+    mod colluder_wiring {
+        use super::super::*;
+        use pkdealer_agent_core::SeatSnapshot;
+
+        /// A source that always leaks, so the test isolates `choose`'s wiring
+        /// rather than any channel's behavior.
+        struct AlwaysLeaks(Cards);
+
+        #[async_trait]
+        impl collude::PartnerCardSource for AlwaysLeaks {
+            async fn partner_hole(
+                &self,
+                _hand_no: u32,
+                _my_seat: u8,
+                _my_id: Uuid,
+                _my_cards: &Cards,
+                _partner_id: Uuid,
+            ) -> Option<Cards> {
+                Some(self.0.clone())
+            }
+        }
+
+        /// Hero (seat 0) holds KK on a full board facing the partner's bet;
+        /// the partner (seat 1) is committed with the stronger AA, so `Dump`
+        /// folds — provided both seats carry identities.
+        fn dump_state(identities: bool) -> HandState {
+            let id = |n: u128| {
+                if identities {
+                    Some(Uuid::from_u128(n))
+                } else {
+                    None
+                }
+            };
+            HandState {
+                seat: 0,
+                hole_cards: "Kh Kd".to_string(),
+                board: "2d 7c 9s Jd 3h".to_string(),
+                pot: 600,
+                to_call: 400,
+                my_chips: 10_000,
+                stacks: vec![
+                    SeatSnapshot {
+                        seat: 0,
+                        name: "mallory_1".to_string(),
+                        chips: 10_000,
+                        bet: 0,
+                        is_active: true,
+                        player_id: id(1),
+                    },
+                    SeatSnapshot {
+                        seat: 1,
+                        name: "trudy_1".to_string(),
+                        chips: 9_000,
+                        bet: 400,
+                        is_active: true,
+                        player_id: id(2),
+                    },
+                ],
+                big_blind: 100,
+                street: "river".to_string(),
+                action_history: vec![],
+                button_seat: Some(0),
+                hand_no: 7,
+            }
+        }
+
+        /// A `Dump` colluder over the given channel, backed by the same
+        /// channel-agnostic `AlwaysLeaks` source regardless of `channel`. Taking
+        /// `channel` as a parameter lets a caller assert that the label alone
+        /// does not move the decision (A/B equivalence).
+        fn colluding_agent(channel: CollusionChannel) -> RulesAgent {
+            let mut agent = RulesAgent::new(BotProfile::gto(), None);
+            agent.collusion = Some(Colluder {
+                config: CollusionConfig {
+                    partner: "trudy_1".to_string(),
+                    channel,
+                    style: CollusionStyle::Dump,
+                },
+                source: Box::new(AlwaysLeaks(Cards::forgiving_from_str("As Ah"))),
+            });
+            agent
+        }
+
+        #[tokio::test]
+        async fn colluder_applies_style_when_both_identities_are_known() {
+            assert_eq!(
+                colluding_agent(CollusionChannel::Peer)
+                    .decide(&dump_state(true))
+                    .await,
+                Decision::Fold
+            );
+        }
+
+        /// A/B equivalence, pinned behaviorally: the *only* difference between
+        /// these two agents is `config.channel`, and the source is identical and
+        /// channel-agnostic. `choose` reads partner cards through the
+        /// `PartnerCardSource` trait object and must never branch on the channel
+        /// label, so both variants must reach the same decision. This is the
+        /// guard the type signature alone cannot give — if someone later wrote
+        /// `if config.channel == Peer { … }` inside `choose`, this test fails
+        /// while every other collusion test (all hardcoded to `Peer`) stays green.
+        #[tokio::test]
+        async fn channel_label_does_not_change_the_decision() {
+            let spectator = colluding_agent(CollusionChannel::Spectator)
+                .decide(&dump_state(true))
+                .await;
+            let peer = colluding_agent(CollusionChannel::Peer)
+                .decide(&dump_state(true))
+                .await;
+            assert_eq!(spectator, peer);
+            // Non-vacuity: both actually collude (Dump folds KK to the partner's
+            // committed AA), so the equality above is over the *colluding* line,
+            // not two identical honest fallbacks.
+            assert_eq!(spectator, Decision::Fold);
+        }
+
+        #[tokio::test]
+        async fn colluder_decides_honestly_without_seat_identities() {
+            // Same table, same always-leaking source — but no `player_id` on
+            // the wire means no peer exchange is possible, so the agent falls
+            // back to the honest decision (never a fabricated identity).
+            let honest = RulesAgent::new(BotProfile::gto(), None)
+                .decide(&dump_state(false))
+                .await;
+            assert_eq!(
+                colluding_agent(CollusionChannel::Peer)
+                    .decide(&dump_state(false))
+                    .await,
+                honest
+            );
+            // Non-vacuity: the honest line is *not* the colluding one, so the
+            // two assertions above genuinely discriminate.
+            assert_ne!(honest, Decision::Fold);
+        }
+    }
+
+    #[cfg(feature = "collusion")]
+    mod collusion_args {
+        use super::super::*;
+
+        #[test]
+        fn args_without_collude_with_yield_no_config() {
+            let args = Args::try_parse_from(["pkdealer_agent_rules"]).expect("parse");
+            assert!(validate_collusion(&args).expect("valid").is_none());
+        }
+
+        #[test]
+        fn args_parse_collusion_flags() {
+            let args = Args::try_parse_from([
+                "pkdealer_agent_rules",
+                "--name",
+                "mallory_1",
+                "--collude-with",
+                "trudy_1",
+                "--collusion-style",
+                "dump",
+            ])
+            .expect("parse");
+            let config = validate_collusion(&args).expect("valid").expect("config");
+            assert_eq!(config.partner, "trudy_1");
+            assert_eq!(config.channel, CollusionChannel::Spectator);
+            assert_eq!(config.style, CollusionStyle::Dump);
+        }
+
+        #[test]
+        fn peer_channel_resolves_to_the_backchannel() {
+            // Phase 3: `peer` is accepted; `main` then dials the broker.
+            let args = Args::try_parse_from([
+                "pkdealer_agent_rules",
+                "--collude-with",
+                "trudy_1",
+                "--collusion-channel",
+                "peer",
+                "--backchannel",
+                "127.0.0.1:9099",
+            ])
+            .expect("parse");
+            let config = validate_collusion(&args).expect("valid").expect("config");
+            assert_eq!(config.channel, CollusionChannel::Peer);
+            assert_eq!(config.partner, "trudy_1");
+        }
+
+        #[test]
+        fn peer_channel_without_broker_address_is_rejected() {
+            let args = Args::try_parse_from([
+                "pkdealer_agent_rules",
+                "--collude-with",
+                "trudy_1",
+                "--collusion-channel",
+                "peer",
+                "--backchannel",
+                "",
+            ])
+            .expect("parse");
+            assert!(validate_collusion(&args).is_err());
+        }
+
+        #[test]
+        fn spectator_channel_ignores_a_missing_broker_address() {
+            // Vector A never touches the broker, so an empty --backchannel is
+            // not an error for it.
+            let args = Args::try_parse_from([
+                "pkdealer_agent_rules",
+                "--collude-with",
+                "trudy_1",
+                "--backchannel",
+                "",
+            ])
+            .expect("parse");
+            let config = validate_collusion(&args).expect("valid").expect("config");
+            assert_eq!(config.channel, CollusionChannel::Spectator);
+        }
+
+        #[test]
+        fn colluding_with_yourself_is_rejected() {
+            let args = Args::try_parse_from([
+                "pkdealer_agent_rules",
+                "--name",
+                "x",
+                "--collude-with",
+                "x",
+            ])
+            .expect("parse");
+            assert!(validate_collusion(&args).is_err());
+        }
     }
 }

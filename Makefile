@@ -10,6 +10,11 @@ COUNT ?= 1
 # Example: make arena PLAYERS="gto gto lag llama"
 PLAYERS ?= gto lag tag llama mistral gemma
 
+# Player line-up for `make detect` (EPIC-70 fixed-blind cheat detection).
+# Empty ⇒ bin/detect's built-in default: carol dave gto lag boss.
+# Example: make detect DETECT_PLAYERS="carol dave gto lag tag boss"
+DETECT_PLAYERS ?=
+
 # Docker compose project name (containers are labelled with this). Override only
 # if you launched with a custom COMPOSE_PROJECT_NAME.
 PROJECT ?= pkdealer
@@ -18,7 +23,7 @@ PROJECT ?= pkdealer
 # Example: make pokerbench-models POKERBENCH_EXAMPLES=20
 POKERBENCH_EXAMPLES ?= 12
 
-.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve ddown arena-down demo demo-audit arena pokerbench-data pokerbench-models
+.PHONY: help build test check fmt clippy doc clean all ci-local install-tools serve ddown arena-down demo demo-audit arena detect pokerbench-data pokerbench-models
 
 # Default target
 default: ayce
@@ -56,6 +61,7 @@ help:
 	@echo "Arena (EPIC-42 dynamic line-ups; see ./bin/arena --help):"
 	@echo "  make arena [PLAYERS=\"gto lag llama\"] - Launch an ad-hoc arena table"
 	@echo "  (or call directly: ./bin/arena gto:2 claude tag)"
+	@echo "  make detect [DETECT_PLAYERS=\"...\"]  - Cheat-detection run, blinds FROZEN (EPIC-70)"
 	@echo "  make arena-down     - Force-tear-down ALL arena containers + volumes"
 	@echo ""
 	@echo "Tools:"
@@ -98,6 +104,13 @@ serve:
 # registry options, call ./bin/arena directly.
 arena:
 	@./bin/arena $(PLAYERS)
+
+# Launch the EPIC-70 collusion-detection scenario with the tournament blind
+# schedule DISABLED (stable table ⇒ clean chip-flow / bb-per-100 signals for the
+# Boss). Empty DETECT_PLAYERS uses bin/detect's default lineup (carol dave gto
+# lag boss). See docs/presentations/epic-70-fixed-blinds-cheat-detection.md.
+detect:
+	@./bin/detect $(DETECT_PLAYERS)
 
 # Tear down the demo stack and drop its named volumes.
 ddown:

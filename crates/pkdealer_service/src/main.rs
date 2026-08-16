@@ -578,10 +578,15 @@ impl DealerService {
     /// - [`CardVisibility::Hidden`] — `cards` is empty for every seat.
     /// - [`CardVisibility::Player`]`(seat)` — `cards` is populated only for `seat`.
     /// - [`CardVisibility::Spectator`] — `cards` is populated for every seat.
+    ///
+    /// `seat_to_token` supplies each seat's stable player UUID for
+    /// [`SeatInfo::player_id`] (EPIC-70 Phase 3). This is public identity, not a
+    /// hole card, so it is populated regardless of `visibility`.
     fn build_table_status(
         session: &PokerSession,
         banked: &std::collections::HashMap<u8, i64>,
         session_tokens: &std::collections::HashMap<u8, SeatTokens>,
+        seat_to_token: &HashMap<u8, Uuid>,
         pricing: &PricingCtx<'_>,
         visibility: CardVisibility,
         round_number: u64,
@@ -626,6 +631,13 @@ impl DealerService {
                             pkdealer_pricing::cost_micro_usd(price, t.input, t.output)
                         })
                     }),
+                    // EPIC-70 Phase 3: stable per-seat player UUID. Public identity,
+                    // not a hole card — populated for every seat regardless of
+                    // `visibility`. Empty when the seat's token is unknown.
+                    player_id: seat_to_token
+                        .get(&i)
+                        .map(std::string::ToString::to_string)
+                        .unwrap_or_default(),
                 });
             }
         }
@@ -736,6 +748,7 @@ impl DealerService {
             &state.session,
             &state.banked_profit,
             &state.session_tokens,
+            &state.seat_to_token,
             pricing,
             CardVisibility::Spectator,
             state.round_number,
@@ -913,6 +926,7 @@ impl DealerService {
             &state.session,
             &state.banked_profit,
             &state.session_tokens,
+            &state.seat_to_token,
             &self.pricing_ctx(),
             CardVisibility::Spectator,
             state.round_number,
@@ -1003,6 +1017,7 @@ impl DealerService {
             &state.session,
             &state.banked_profit,
             &state.session_tokens,
+            &state.seat_to_token,
             &self.pricing_ctx(),
             CardVisibility::Spectator,
             state.round_number,
@@ -1347,6 +1362,7 @@ impl DealerServiceTrait for DealerService {
                             &guard.session,
                             &guard.banked_profit,
                             &guard.session_tokens,
+                            &guard.seat_to_token,
                             &self.pricing_ctx(),
                             CardVisibility::Spectator,
                             guard.round_number,
@@ -1519,6 +1535,7 @@ impl DealerServiceTrait for DealerService {
                 &guard.session,
                 &guard.banked_profit,
                 &guard.session_tokens,
+                &guard.seat_to_token,
                 &self.pricing_ctx(),
                 CardVisibility::Spectator,
                 guard.round_number,
@@ -1637,6 +1654,7 @@ impl DealerServiceTrait for DealerService {
                         &guard.session,
                         &guard.banked_profit,
                         &guard.session_tokens,
+                        &guard.seat_to_token,
                         &self.pricing_ctx(),
                         CardVisibility::Spectator,
                         guard.round_number,
@@ -1887,6 +1905,7 @@ impl DealerServiceTrait for DealerService {
                     &guard.session,
                     &guard.banked_profit,
                     &guard.session_tokens,
+                    &guard.seat_to_token,
                     &self.pricing_ctx(),
                     CardVisibility::Spectator,
                     guard.round_number,
@@ -1942,6 +1961,7 @@ impl DealerServiceTrait for DealerService {
                                 &guard.session,
                                 &guard.banked_profit,
                                 &guard.session_tokens,
+                                &guard.seat_to_token,
                                 &self.pricing_ctx(),
                                 CardVisibility::Spectator,
                                 guard.round_number,
@@ -2141,6 +2161,7 @@ impl DealerServiceTrait for DealerService {
                                         &guard.session,
                                         &guard.banked_profit,
                                         &guard.session_tokens,
+                                        &guard.seat_to_token,
                                         &self.pricing_ctx(),
                                         CardVisibility::Spectator,
                                         guard.round_number,
@@ -2286,6 +2307,7 @@ impl DealerServiceTrait for DealerService {
             &guard.session,
             &guard.banked_profit,
             &guard.session_tokens,
+            &guard.seat_to_token,
             &self.pricing_ctx(),
             visibility,
             guard.round_number,
@@ -2589,6 +2611,7 @@ impl DealerServiceTrait for DealerService {
                 &guard.session,
                 &guard.banked_profit,
                 &guard.session_tokens,
+                &guard.seat_to_token,
                 &self.pricing_ctx(),
                 CardVisibility::Spectator,
                 guard.round_number,
@@ -3384,6 +3407,34 @@ mod tests {
             .expect("status should be present");
         assert!(status.seats.is_empty());
         assert!(!status.hand_in_progress);
+        Ok(())
+    }
+
+    // EPIC-70 Phase 3: a seated player's `SeatInfo.player_id` carries its
+    // server-issued token — public identity, not a hole card, so it is
+    // populated regardless of card visibility (no player-token metadata here).
+    #[tokio::test]
+    async fn dealer_service_get_status_player_id_matches_seat_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let service = make_service();
+        let tokens = seat_two_players(&service).await?;
+
+        let status = service
+            .get_status(Request::new(GetStatusRequest {}))
+            .await?
+            .into_inner()
+            .status
+            .expect("status should be present");
+
+        assert_eq!(status.seats.len(), 2);
+        for seat in &status.seats {
+            let expected_token = tokens
+                .get(&(seat.seat_number as u8))
+                .expect("seated seat should have a token in seat_to_token");
+            assert!(!seat.player_id.is_empty());
+            assert!(Uuid::parse_str(&seat.player_id).is_ok());
+            assert_eq!(&seat.player_id, expected_token);
+        }
         Ok(())
     }
 

@@ -33,6 +33,7 @@ fn seat_snapshot(s: &ProtoSeatInfo) -> Option<SeatSnapshot> {
         chips: s.chips,
         bet: s.bet,
         is_active: seat_state_is_active(state),
+        player_id: s.player_id.parse().ok(),
     })
 }
 
@@ -303,6 +304,7 @@ async fn decide_and_act<A: PokerAgent>(
         street: street_str.to_string(),
         action_history: action_history.to_vec(),
         button_seat,
+        hand_no: status.round_number,
     };
 
     let (intended, mut fidelity) = agent.decide_with_fidelity(&hand_state).await;
@@ -576,6 +578,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             cost_micro_usd: 0,
+            player_id: String::new(),
         }
     }
 
@@ -590,6 +593,7 @@ mod tests {
                 chips: 9_500,
                 bet: 250,
                 is_active: true,
+                player_id: None,
             })
         );
     }

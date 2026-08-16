@@ -19,3 +19,7 @@ Cost accounting:
 
 * [pkdealer_pricing](pkdealer_pricing.md) - notional per-model token pricing shared by service and offline analysis
 * [pkdealer_costsim](pkdealer_costsim.md) - offline token-accounting and cost analysis over recorded arena sessions
+
+Collusion detection:
+
+* [pkdealer_boss](pkdealer_boss.md) - the Boss: blind collusion detection (redacted signals + SPRT) over recorded arena sessions (EPIC-70)

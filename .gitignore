@@ -17,3 +17,5 @@ Cargo.lock
 
 # Generated Modelfiles from `make pokerbench-models`
 /build/pokerbench-models/
+
+out/

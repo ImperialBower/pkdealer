@@ -23,11 +23,12 @@ use pkdealer_agent_core::HandState;
 ///     pot: 200,
 ///     to_call: 100,
 ///     my_chips: 9_900,
-///     stacks: vec![SeatSnapshot { seat: 0, name: "alice".to_string(), chips: 9_900, bet: 100, is_active: true }],
+///     stacks: vec![SeatSnapshot { seat: 0, name: "alice".to_string(), chips: 9_900, bet: 100, is_active: true, player_id: None }],
 ///     big_blind: 100,
 ///     street: "preflop".to_string(),
 ///     action_history: vec![],
 ///     button_seat: Some(0),
+///     hand_no: 7,
 /// };
 /// let prompt = build_prompt(&state);
 /// assert!(prompt.contains("Ah Kd"));
@@ -101,6 +102,7 @@ pub fn build_prompt(state: &HandState) -> String {
 ///     street: "flop".to_string(),
 ///     action_history: vec![],
 ///     button_seat: None,
+///     hand_no: 7,
 /// };
 /// let odds = pot_odds(&state);
 /// assert!((odds - 0.25).abs() < 1e-9);
@@ -138,6 +140,7 @@ mod tests {
                     chips: 10_000,
                     bet: 100,
                     is_active: true,
+                    player_id: None,
                 },
                 SeatSnapshot {
                     seat: 1,
@@ -145,12 +148,14 @@ mod tests {
                     chips: 9_700,
                     bet: 0,
                     is_active: true,
+                    player_id: None,
                 },
             ],
             big_blind: 100,
             street: "flop".to_string(),
             action_history: vec!["alice bets 100".to_string()],
             button_seat: Some(0),
+            hand_no: 0,
         }
     }
 
