@@ -741,6 +741,12 @@ fn snapshot_with_stats<'a>(
         board: Cards::forgiving_from_str(&state.board),
         hole_cards: Cards::forgiving_from_str(&state.hole_cards),
         pot: state.pot as usize,
+        // `HandState` does not carry the Rule 54-B pot (the real pot plus any
+        // blind money owed but never posted), so the real pot stands in. It is
+        // correct from the flop onward, where the two are equal by definition,
+        // and can only understate the pre-flop pot-limit ceiling — an
+        // over-large raise would be rejected by the table anyway.
+        pot_limit_pot: state.pot as usize,
         to_call: state.to_call as usize,
         current_bet: state.to_call as usize,
         min_raise: state.big_blind as usize,
@@ -751,6 +757,11 @@ fn snapshot_with_stats<'a>(
         // table. No effect on No-Limit or Pot-Limit. Carrying the real count on
         // the proto is tracked separately.
         raises_this_street: 0,
+        // Rule 47-A's gate needs per-seat action history that the proto does
+        // not carry. Reporting `false` means a gated seat can still propose a
+        // raise, which the table then rejects — the same fail-open choice as
+        // `raises_this_street` above.
+        reopen_gated: false,
         my_chips: state.my_chips as usize,
         stacks,
         big_blind: state.big_blind as usize,

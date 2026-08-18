@@ -18,7 +18,7 @@ name = "pkdealer_costsim"
 path = "src/main.rs"
 
 [dependencies]
-pkcore = "0.4.0"
+pkcore = "0.5.0"
 pkdealer_pricing = { version = "0.1.16", path = "../pkdealer_pricing" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
