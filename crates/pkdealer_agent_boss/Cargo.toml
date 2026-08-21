@@ -18,7 +18,7 @@ name = "pkdealer_agent_boss"
 path = "src/main.rs"
 
 [dependencies]
-pkcore = { version = "0.5.0", features = ["bot-profiles"] }
+pkcore = { version = "0.6.0", features = ["bot-profiles"] }
 pkdealer_boss = { path = "../pkdealer_boss" }
 pkdealer_proto = { path = "../pkdealer_proto" }
 clap = { version = "4", features = ["derive", "env"] }

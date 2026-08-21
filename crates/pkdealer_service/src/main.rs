@@ -2276,6 +2276,44 @@ impl DealerServiceTrait for DealerService {
                             }
                             break;
                         }
+                        // pkcore 0.6.0 / DEFECT_019: dealing or chip
+                        // collection failed mid-hand. There is no showdown to
+                        // resolve, so `end_hand()` would return
+                        // `ActionIsntFinished` and strand the pot. Unwind
+                        // instead: `abort_hand()` refunds every committed chip,
+                        // logs `TableAction::HandAborted`, and runs the same
+                        // chip audit `end_hand()` does.
+                        SessionStep::Failed(err) => {
+                            tracing::error!(
+                                error = %err,
+                                hand_number = guard.session.hand_number,
+                                "hand failed mid-stream; aborting and refunding"
+                            );
+                            let refunded = guard.session.abort_hand();
+                            guard.current_street_span = None;
+                            guard.current_hand_span = None;
+                            guard.hand_event_log_start = guard.session.table.event_log.len();
+                            hand_complete = true;
+                            let status = Self::build_table_status(
+                                &guard.session,
+                                &guard.banked_profit,
+                                &guard.session_tokens,
+                                &guard.seat_to_token,
+                                &self.pricing_ctx(),
+                                CardVisibility::Spectator,
+                                guard.round_number,
+                            );
+                            let desc = match refunded {
+                                Ok(chips) => {
+                                    format!("Hand aborted: {err}. {chips} chips refunded.")
+                                }
+                                Err(audit) => {
+                                    format!("Hand aborted: {err}. Refund audit failed: {audit}.")
+                                }
+                            };
+                            self.emit_event(EventType::HandEnded, desc, status);
+                            break;
+                        }
                     }
                 }
 

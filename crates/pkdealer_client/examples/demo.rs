@@ -237,6 +237,19 @@ fn main() {
 
                     break;
                 }
+
+                // pkcore 0.6.0 / DEFECT_019: the deal or a chip collection
+                // failed mid-hand. `end_hand()` cannot resolve a hand that
+                // never reached showdown, so unwind with `abort_hand()`, which
+                // returns every committed chip to the stack it came from.
+                SessionStep::Failed(err) => {
+                    println!("  !! hand aborted: {err}");
+                    match session.abort_hand() {
+                        Ok(chips) => println!("  refunded {chips} chips"),
+                        Err(audit) => println!("  refund audit failed: {audit}"),
+                    }
+                    break;
+                }
             }
         }
 
