@@ -4,6 +4,12 @@
 //! real HTTP/2 connection and that the server enforces seat ownership across
 //! separate client connections.
 
+// The helpers below deliberately mirror the generated gRPC signature
+// (`Result<Response<T>, tonic::Status>`) so they read like the API under test.
+// `tonic::Status` is 176 bytes, so `result_large_err` fires; boxing the error
+// here would only make the helpers diverge from the calls they wrap.
+#![allow(clippy::result_large_err)]
+
 use std::{
     io,
     net::TcpListener,

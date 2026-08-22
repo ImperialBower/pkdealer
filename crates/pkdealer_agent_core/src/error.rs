@@ -19,7 +19,12 @@ pub enum AgentError {
     /// The service rejected the seat request.
     Seat(String),
     /// A gRPC RPC call returned a non-OK status.
-    Rpc(tonic::Status),
+    ///
+    /// Boxed because `tonic::Status` is 176 bytes — inlining it would make
+    /// every `Result<T, AgentError>` in this crate that wide on the success
+    /// path too (`clippy::result_large_err`). Use `?` and the
+    /// `From<tonic::Status>` impl below; the box is invisible at call sites.
+    Rpc(Box<tonic::Status>),
     /// A player token could not be parsed as gRPC metadata.
     InvalidMetadata(tonic::metadata::errors::InvalidMetadataValue),
 }
@@ -53,7 +58,7 @@ impl From<tonic::transport::Error> for AgentError {
 
 impl From<tonic::Status> for AgentError {
     fn from(s: tonic::Status) -> Self {
-        Self::Rpc(s)
+        Self::Rpc(Box::new(s))
     }
 }
 
@@ -76,7 +81,7 @@ mod tests {
     #[test]
     fn agent_error_rpc_display() {
         let status = tonic::Status::not_found("table not found");
-        let e = AgentError::Rpc(status);
+        let e = AgentError::Rpc(Box::new(status));
         assert!(e.to_string().contains("gRPC error"));
     }
 
@@ -101,7 +106,7 @@ mod tests {
 
     #[test]
     fn error_source_rpc_is_none() {
-        let e = AgentError::Rpc(tonic::Status::ok(""));
+        let e = AgentError::Rpc(Box::new(tonic::Status::ok("")));
         assert!(std::error::Error::source(&e).is_none());
     }
 }
