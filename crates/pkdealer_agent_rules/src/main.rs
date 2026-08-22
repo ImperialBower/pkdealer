@@ -469,8 +469,13 @@ impl RulesAgent {
     ///
     /// The `async` signature is stable across builds; with the `collusion`
     /// feature off there is no partner-card `await`, hence the targeted lint
-    /// allow.
-    #[cfg_attr(not(feature = "collusion"), allow(clippy::unused_async))]
+    /// allow. Clippy 1.98 split this out into `unused_async_trait_impl`, so
+    /// both names are listed; `unknown_lints` keeps older toolchains, which
+    /// have never heard of the new name, quiet about it.
+    #[cfg_attr(
+        not(feature = "collusion"),
+        allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn choose(&self, state: &HandState, snapshot: &TableSnapshot<'_>) -> PkcoreAction {
         let base = RuleBasedDecider.decide(&self.profile, snapshot);
         #[cfg(feature = "collusion")]

@@ -15,6 +15,14 @@ pub const DEALER_FILE_DESCRIPTOR_SET: &[u8] =
 
 /// Generated protobuf messages and gRPC definitions for the dealer API.
 pub mod dealer {
+    // `tonic::include_proto!` is an `include!` of build-script output, so every
+    // item below is generated code we cannot reshape. Newer clippy releases lint
+    // it: `result_large_err` fires on all 18 client/server methods because
+    // `tonic::Status` is 176 bytes, and the suggested fix (box the error) is not
+    // ours to make. Scope the allow to this module so the workspace `-D warnings`
+    // gate stays meaningful for hand-written code.
+    #![allow(clippy::result_large_err)]
+
     tonic::include_proto!("pkdealer.dealer.v1");
 }
 
