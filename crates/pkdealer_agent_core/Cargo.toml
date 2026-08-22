@@ -12,7 +12,7 @@ rust-version = "1.85"
 
 [dependencies]
 pkdealer_proto = { path = "../pkdealer_proto", version = "0.1.11" }
-pkcore = { version = "0.6.0" }
+pkcore = { version = "0.7.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "sync"] }
 tonic = { version = "0.12", features = ["transport"] }
 async-trait = "0.1"
