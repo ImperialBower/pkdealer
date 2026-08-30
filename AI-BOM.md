@@ -1,6 +1,6 @@
 # AI Bill of Materials — pkdealer
 
-_Last updated: 2026-08-30 · pkdealer workspace v0.1.25 · pkcore v0.7.0_
+_Last updated: 2026-08-30 · pkdealer workspace v0.1.26 · pkcore v0.11.0_
 
 An inventory of every AI component in this repository — the development tools
 used to build it, the machine-readable context it ships, the algorithms
