@@ -20,6 +20,8 @@ Cost accounting:
 * [pkdealer_pricing](pkdealer_pricing.md) - notional per-model token pricing shared by service and offline analysis
 * [pkdealer_costsim](pkdealer_costsim.md) - offline token-accounting and cost analysis over recorded arena sessions
 
-Collusion detection:
+Collusion detection and simulation:
 
 * [pkdealer_boss](pkdealer_boss.md) - the Boss: blind collusion detection (redacted signals + SPRT) over recorded arena sessions (EPIC-70)
+* [pkdealer_agent_boss](pkdealer_agent_boss.md) - the live Boss: polls ExportSession, redacts at ingest, emits per-pair verdicts over OTel (EPIC-70)
+* [pkdealer_backchannel](pkdealer_backchannel.md) - Vector-B backchannel broker that relays CardShares between colluding agents (EPIC-70)

@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.26] - 2026-08-30
+
+### Changed
+
+- Upgraded to `pkcore` 0.11.0 (from 0.7.0). None of the four releases'
+  breaking changes reach pkdealer, which consumes `hand_history`, `bot`,
+  `cards` and `casino::equity` and nothing else:
+  - 0.8.0 removed the `TableCelled` family and re-based `Dealer` on
+    `casino::table::Table` — pkdealer never used either.
+  - 0.10.0 added Pluribus-format export; additive.
+  - 0.11.0 dropped `store` and `terminal` from the default features, moved the
+    combinatorics signatures to `impl Iterator`, removed
+    `FIVE_CARD_COMBOS`/`Deck::to_par_iter`, and deprecated
+    `TableManager`/`TableEvent` — pkdealer requests none of those features and
+    calls none of those items. (`pkdealer`'s own `TableEvent` is the proto
+    type, unrelated.)
+  - 0.11.0 also cut the `EquityOptions::max_samples` default from 100,000 to
+    25,000. Silent for most consumers, but not for pkdealer:
+    `pkdealer_agent_rules` always passes an explicit `--equity-samples`
+    budget (default 2,000), so behaviour is unchanged.
+
+  No code changes were required; `cargo check --all-targets`,
+  `cargo clippy --all-targets -- -D warnings`, and the full test suite stayed
+  green on the manifest bump alone.
+
+- `AI-BOM.md` header now records pkcore v0.11.0.
+
 ## [0.1.25] - 2026-08-22
 
 ### Changed
